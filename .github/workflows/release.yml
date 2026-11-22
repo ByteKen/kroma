@@ -252,25 +252,8 @@ jobs:
           node-version: "22"
 
       - name: Extract Markdown release notes from CHANGELOG.md
-        env:
-          VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          node scripts/release-check.mjs --extract-changelog "$VERSION" > release-notes.md
-          cat <<EOF >> release-notes.md
-
-          ---
-
-          ### Downloads by Operating System
-
-          | Operating System | Format | File |
-          | :--- | :--- | :--- |
-          | **Windows (64-bit \`x86_64\`)** | Setup Installer (Recommended) | \`Kroma-${VERSION}_Windows_x64-setup.exe\` |
-          | **Windows (64-bit \`x86_64\`)** | MSI Installer | \`Kroma-${VERSION}_Windows_x64.msi\` |
-          | **Windows (64-bit \`x86_64\`)** | Portable ZIP (No install required) | \`Kroma-${VERSION}_Windows_x86_64.zip\` |
-          | **macOS (Apple Silicon \`arm64\`)** | Disk Image Installer (Recommended) | \`Kroma-${VERSION}_MacOS_arm64.dmg\` |
-          | **macOS (Apple Silicon \`arm64\`)** | Portable App Bundle (\`.zip\`) | \`Kroma-${VERSION}_MacOS_arm64.zip\` |
-          | **macOS (Apple Silicon \`arm64\`)** | Portable App Bundle (\`.tar.gz\`) | \`Kroma-${VERSION}_MacOS_arm64.tar.gz\` |
-          EOF
+          node scripts/release-check.mjs --extract-changelog "${{ needs.verify.outputs.version }}" > release-notes.md
           cat release-notes.md
 
       - name: Download all platform installer artifacts
@@ -285,6 +268,22 @@ jobs:
           cd release-artifacts
           sha256sum *.exe *.msi *.dmg *.zip *.tar.gz | sort -k2 > SHA256SUMS.txt
           cat SHA256SUMS.txt
+
+      - name: Remove stale assets if release already exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Cleaning existing assets on release $TAG before uploading fresh artifacts..."
+            gh release view "$TAG" --json assets --jq '.assets[].name' | while IFS= read -r asset; do
+              if [ -n "$asset" ]; then
+                echo "Deleting old asset: $asset"
+                gh release delete-asset "$TAG" "$asset" --yes || true
+              fi
+            done
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

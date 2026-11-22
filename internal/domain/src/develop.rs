@@ -760,6 +760,21 @@ impl DevelopRecipe {
         self.masks.iter().any(MaskLayer::is_effective) || self.background_removal.is_active()
     }
 
+    /// Returns `true` when the recipe includes effects that cannot be represented by the
+    /// lightweight per-channel SVG `<feComponentTransfer>` thumbnail LUT (e.g. AI background
+    /// cutout, local masks, 3D `.cube` LUTs, HSL/Calibration shifts, crops, or 90-degree turns).
+    pub fn has_non_svg_thumbnail_effects(&self) -> bool {
+        self.background_removal.is_active()
+            || self.masks.iter().any(MaskLayer::is_effective)
+            || self.lut_3d.as_ref().is_some_and(|l| l.intensity > 1e-4)
+            || !self.hsl_mixer.is_neutral()
+            || !self.camera_calibration.is_neutral()
+            || self.crop_transform.flip_horizontal
+            || self.crop_transform.flip_vertical
+            || !self.crop_transform.quarter_turns.is_multiple_of(4)
+            || !self.crop_transform.rect.is_full_frame()
+    }
+
     pub fn clamp_all_invariants(&mut self) {
         self.white_balance.temperature_kelvin = self
             .white_balance

@@ -1,10 +1,19 @@
+import { invoke } from '@tauri-apps/api/core';
+import { open as openNativeDialog } from '@tauri-apps/plugin-dialog';
 import { AnimatePresence, motion } from 'framer-motion';
-import { memo, useMemo, useState } from 'react';
+import { memo, useMemo, useRef, useState } from 'react';
+import { isTauriDesktopEnvironment } from '../../adapters/gateways/tauriStudioGateway';
+import {
+  loadCustomLutsFromStorage,
+  saveCustomLutsToStorage,
+  type CustomCubeLutEntry,
+} from '../../adapters/storage/customLutsStorage';
 import {
   loadCustomPresetsFromStorage,
   saveCustomPresetsToStorage,
 } from '../../adapters/storage/customPresetsStorage';
 import type { LiveRgbHistogram } from '../../application/ports/studioGateway';
+import { cacheParsedCubeLut3D, parseCubeLut3D } from '../../domain/cubeLut3d';
 import {
   computeAutoToneFromHistogram,
   createDefaultCameraCalibration,
@@ -262,6 +271,11 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
   const [customPresets, setCustomPresets] = useState<readonly DevelopPreset[]>(() =>
     loadCustomPresetsFromStorage(),
   );
+  const [customLuts, setCustomLuts] = useState<readonly CustomCubeLutEntry[]>(() =>
+    loadCustomLutsFromStorage(),
+  );
+  const [lutImportError, setLutImportError] = useState<string | null>(null);
+  const lutFileInputRef = useRef<HTMLInputElement>(null);
   const [newPresetName, setNewPresetName] = useState('');
   const [showNewPresetForm, setShowNewPresetForm] = useState(false);
 
@@ -354,6 +368,101 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
     saveCustomPresetsToStorage(next);
   };
 
+  const handleImportCubeLut = async () => {
+    setLutImportError(null);
+    if (isTauriDesktopEnvironment()) {
+      try {
+        const selected = await openNativeDialog({
+          directory: false,
+          multiple: false,
+          title: 'Import 3D .cube LUT Profile',
+          filters: [{ name: '3D Cube LUT (.cube)', extensions: ['cube'] }],
+        });
+        if (!selected || Array.isArray(selected)) return;
+        const imported = await invoke<{
+          name: string;
+          cubePath: string;
+          gridSize: number;
+          content: string;
+        }>('import_cube_lut_file', { sourcePath: selected });
+        const parsed = parseCubeLut3D(imported.content);
+        cacheParsedCubeLut3D(imported.cubePath, parsed);
+
+        const entry: CustomCubeLutEntry = {
+          id: `lut-${Date.now()}`,
+          name: imported.name,
+          cubePath: imported.cubePath,
+          gridSize: imported.gridSize,
+        };
+        const deduped = customLuts.filter(
+          (l) => l.cubePath !== entry.cubePath && l.name !== entry.name,
+        );
+        const next = [entry, ...deduped];
+        setCustomLuts(next);
+        saveCustomLutsToStorage(next);
+        onChangeRecipe(
+          {
+            ...recipe,
+            lut3d: { name: entry.name, cubePath: entry.cubePath, intensity: 75 },
+          },
+          `LUT ${entry.name}`,
+          false,
+        );
+      } catch (err) {
+        setLutImportError(err instanceof Error ? err.message : String(err));
+      }
+      return;
+    }
+
+    lutFileInputRef.current?.click();
+  };
+
+  const handleBrowserLutFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setLutImportError(null);
+    try {
+      const content = await file.text();
+      const parsed = parseCubeLut3D(content);
+      const cubePath = `custom-luts/${file.name}`;
+      cacheParsedCubeLut3D(cubePath, parsed);
+
+      const entry: CustomCubeLutEntry = {
+        id: `lut-${Date.now()}`,
+        name: file.name,
+        cubePath,
+        gridSize: parsed.size,
+        inlineContent: content,
+      };
+      const deduped = customLuts.filter(
+        (l) => l.cubePath !== entry.cubePath && l.name !== entry.name,
+      );
+      const next = [entry, ...deduped];
+      setCustomLuts(next);
+      saveCustomLutsToStorage(next);
+      onChangeRecipe(
+        {
+          ...recipe,
+          lut3d: { name: entry.name, cubePath: entry.cubePath, intensity: 75 },
+        },
+        `LUT ${entry.name}`,
+        false,
+      );
+    } catch (err) {
+      setLutImportError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleDeleteCustomLut = (lutId: string, cubePath: string) => {
+    const next = customLuts.filter((l) => l.id !== lutId);
+    setCustomLuts(next);
+    saveCustomLutsToStorage(next);
+    if (recipe.lut3d?.cubePath === cubePath) {
+      onChangeRecipe({ ...recipe, lut3d: null }, 'Clear LUT', false);
+    }
+  };
+
   const matchedWbPresetId =
     WHITE_BALANCE_PRESETS.find(
       (p) =>
@@ -369,8 +478,7 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
     recipe.detailOptics.colorNoiseReduction !== 0;
   const effectsModified =
     recipe.detailOptics.vignetteAmount !== 0 ||
-    recipe.detailOptics.grainAmount !== 0 ||
-    recipe.lut3d !== null;
+    recipe.detailOptics.grainAmount !== 0;
 
   return (
     <aside
@@ -958,9 +1066,9 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
                 />
               </AccordionSection>
 
-              {/* Effects & LUT (Vignette, Grain, 3D LUT) */}
+              {/* Effects (Vignette & Film Grain) */}
               <AccordionSection
-                title="Effects & LUT"
+                title="Effects"
                 open={openSections.effects}
                 onToggle={() => toggleSection('effects')}
                 modified={effectsModified}
@@ -968,7 +1076,6 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
                   onChangeRecipe(
                     {
                       ...recipe,
-                      lut3d: null,
                       detailOptics: {
                         ...recipe.detailOptics,
                         vignetteAmount: 0,
@@ -1071,65 +1178,6 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
                     )
                   }
                 />
-
-                <div className="h-px bg-hairline/70 my-0.5" />
-
-                <span className="tabular-nums-mono text-[9.5px] uppercase tracking-wider text-ink-telemetry">
-                  3D .cube LUT Profile
-                </span>
-                <div className="flex flex-col gap-1">
-                  {STUDIO_LUTS.map((entry) => {
-                    const isSelected =
-                      (entry.lut === null && recipe.lut3d === null) ||
-                      (entry.lut !== null && recipe.lut3d?.name === entry.lut.name);
-
-                    return (
-                      <button
-                        key={entry.label}
-                        type="button"
-                        onClick={() =>
-                          onChangeRecipe(
-                            {
-                              ...recipe,
-                              lut3d: entry.lut ? { ...entry.lut } : null,
-                            },
-                            entry.lut ? `LUT ${entry.lut.name}` : 'Clear LUT',
-                            false,
-                          )
-                        }
-                        className={`px-2.5 py-1.5 rounded-md border text-left tabular-nums-mono text-[10.5px] flex items-center justify-between transition-colors cursor-pointer ${
-                          isSelected
-                            ? 'bg-surface-active border-amber-core/60 text-amber-soft font-medium'
-                            : 'bg-canvas border-hairline text-ink-secondary hover:text-ink-primary'
-                        }`}
-                      >
-                        <span className="truncate">{entry.label}</span>
-                        {isSelected && (
-                          <span className="material-symbols-outlined text-[13px] text-amber-core shrink-0">
-                            check
-                          </span>
-                        )}
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {recipe.lut3d && (
-                  <DarkroomScrubber
-                    label="LUT Intensity"
-                    value={recipe.lut3d.intensity}
-                    min={0}
-                    max={100}
-                    defaultValue={65}
-                    formatValue={(v) => `${v}%`}
-                    onChange={(intensity) =>
-                      onChangeRecipe({
-                        ...recipe,
-                        lut3d: recipe.lut3d ? { ...recipe.lut3d, intensity } : null,
-                      })
-                    }
-                  />
-                )}
               </AccordionSection>
 
               {/* Camera Calibration */}
@@ -1650,6 +1698,149 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
                       </span>
                     </button>
                   ))}
+                </div>
+              </section>
+
+              {/* 3D .cube LUT Profiles (Custom Uploads + Built-In Studio LUTs) */}
+              <section className="p-3 rounded-lg bg-surface border border-hairline flex flex-col gap-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="tabular-nums-mono text-[10px] uppercase tracking-wider text-ink-telemetry font-semibold">
+                    3D .cube LUT Profile
+                  </span>
+                  <DarkroomButton
+                    variant="subtle"
+                    size="xs"
+                    icon="upload_file"
+                    onClick={() => void handleImportCubeLut()}
+                    title="Import a custom 3D .cube LUT file from disk"
+                  >
+                    Import .cube…
+                  </DarkroomButton>
+                </div>
+
+                <input
+                  ref={lutFileInputRef}
+                  type="file"
+                  accept=".cube"
+                  onChange={(e) => void handleBrowserLutFileSelected(e)}
+                  className="hidden"
+                />
+
+                {lutImportError && (
+                  <div className="px-2.5 py-1.5 rounded-md bg-crimson-clip/10 border border-crimson-clip/40 text-[10.5px] text-crimson-clip">
+                    {lutImportError}
+                  </div>
+                )}
+
+                {recipe.lut3d && (
+                  <div className="pb-1">
+                    <DarkroomScrubber
+                      label="LUT Intensity"
+                      value={recipe.lut3d.intensity}
+                      min={0}
+                      max={100}
+                      defaultValue={65}
+                      formatValue={(v) => `${v}%`}
+                      onChange={(intensity) =>
+                        onChangeRecipe(
+                          {
+                            ...recipe,
+                            lut3d: { ...recipe.lut3d!, intensity },
+                          },
+                          'LUT Intensity',
+                        )
+                      }
+                    />
+                  </div>
+                )}
+
+                <div className="flex flex-col gap-1">
+                  {STUDIO_LUTS.map((entry) => {
+                    const isSelected =
+                      (entry.lut === null && recipe.lut3d === null) ||
+                      (entry.lut !== null && recipe.lut3d?.cubePath === entry.lut.cubePath);
+
+                    return (
+                      <button
+                        key={entry.label}
+                        type="button"
+                        onClick={() =>
+                          onChangeRecipe(
+                            {
+                              ...recipe,
+                              lut3d: entry.lut ? { ...entry.lut } : null,
+                            },
+                            entry.lut ? `LUT ${entry.lut.name}` : 'Clear LUT',
+                            false,
+                          )
+                        }
+                        className={`px-2.5 py-1.5 rounded-md border text-left tabular-nums-mono text-[10.5px] flex items-center justify-between transition-colors cursor-pointer ${
+                          isSelected
+                            ? 'bg-surface-active border-amber-core/60 text-amber-soft font-medium'
+                            : 'bg-canvas border-hairline text-ink-secondary hover:text-ink-primary'
+                        }`}
+                      >
+                        <span className="truncate">{entry.label}</span>
+                        {isSelected && (
+                          <span className="material-symbols-outlined text-[13px] text-amber-core shrink-0">
+                            check
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+
+                  {customLuts.map((custom) => {
+                    const isSelected = recipe.lut3d?.cubePath === custom.cubePath;
+                    return (
+                      <div
+                        key={custom.id}
+                        className={`px-2.5 py-1.5 rounded-md border tabular-nums-mono text-[10.5px] flex items-center justify-between gap-2 transition-colors ${
+                          isSelected
+                            ? 'bg-surface-active border-amber-core/60 text-amber-soft font-medium'
+                            : 'bg-canvas border-hairline text-ink-secondary hover:text-ink-primary'
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onChangeRecipe(
+                              {
+                                ...recipe,
+                                lut3d: {
+                                  name: custom.name,
+                                  cubePath: custom.cubePath,
+                                  intensity: recipe.lut3d?.intensity ?? 75,
+                                },
+                              },
+                              `LUT ${custom.name}`,
+                              false,
+                            )
+                          }
+                          className="flex-1 min-w-0 text-left flex items-center justify-between gap-2 cursor-pointer"
+                        >
+                          <span className="truncate">{custom.name}</span>
+                          <span className="text-[9px] text-ink-telemetry shrink-0">
+                            {custom.gridSize}³
+                          </span>
+                        </button>
+                        {isSelected && (
+                          <span className="material-symbols-outlined text-[13px] text-amber-core shrink-0">
+                            check
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteCustomLut(custom.id, custom.cubePath)}
+                          title={`Remove ${custom.name}`}
+                          aria-label={`Remove LUT ${custom.name}`}
+                          className="text-ink-telemetry hover:text-crimson-clip cursor-pointer shrink-0 flex items-center"
+                        >
+                          <span className="material-symbols-outlined text-[13px]">delete</span>
+                        </button>
+                      </div>
+                    );
+                  })}
                 </div>
               </section>
             </motion.div>

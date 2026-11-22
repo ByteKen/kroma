@@ -23,6 +23,106 @@ impl CubeLut3D {
         Self::parse(&content)
     }
 
+    /// Loads a `.cube` 3D LUT from disk, or synthesizes one of Kroma's 4 built-in Studio `.cube`
+    /// profiles (`Kodak_Portra_400.cube`, `Fuji_Pro_400H.cube`, `Kroma_Studio_Neutral.cube`,
+    /// `Ilford_HP5_Mono.cube`) when referenced by built-in virtual path.
+    pub fn load_or_builtin(path_or_id: &str) -> Result<Self, AppError> {
+        let p = Path::new(path_or_id);
+        if p.is_file() {
+            return Self::from_file(p);
+        }
+        if let Some(builtin) = Self::builtin_by_name(path_or_id) {
+            return Ok(builtin);
+        }
+        Self::from_file(p)
+    }
+
+    pub fn builtin_by_name(name_or_path: &str) -> Option<Self> {
+        let lower = name_or_path.trim().to_ascii_lowercase();
+        let kind = if lower.contains("kodak_portra_400") {
+            1
+        } else if lower.contains("fuji_pro_400h") {
+            2
+        } else if lower.contains("kroma_studio_neutral") {
+            3
+        } else if lower.contains("ilford_hp5_mono") {
+            4
+        } else {
+            return None;
+        };
+
+        let size = 17usize;
+        let max_idx = (size - 1) as f32;
+        let mut table = Vec::with_capacity(size * size * size);
+
+        for b_idx in 0..size {
+            let b = b_idx as f32 / max_idx;
+            for g_idx in 0..size {
+                let g = g_idx as f32 / max_idx;
+                for r_idx in 0..size {
+                    let r = r_idx as f32 / max_idx;
+                    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    let mapped = match kind {
+                        // 1: Kodak Portra 400 — warm golden skin tones, gentle toe lift, creamy highlights
+                        1 => {
+                            let lift = |x: f32| {
+                                let s = x * x * (3.0 - 2.0 * x);
+                                (x * 0.35 + s * 0.65) * 0.96 + 0.025
+                            };
+                            let mr = (lift(r) * 1.035 + 0.012 * (1.0 - luma)).clamp(0.0, 1.0);
+                            let mg = (lift(g) * 1.005 + 0.004 * luma).clamp(0.0, 1.0);
+                            let mb = (lift(b) * 0.945 + 0.015 * (1.0 - luma)).clamp(0.0, 1.0);
+                            [mr, mg, mb]
+                        }
+                        // 2: Fuji Pro 400H — airy pastel cyan-green shadows, clean neutral-warm highlights
+                        2 => {
+                            let lift = |x: f32| {
+                                let s = x * x * (3.0 - 2.0 * x);
+                                (x * 0.42 + s * 0.58) * 0.97 + 0.02
+                            };
+                            let shd = (1.0 - luma).powi(2);
+                            let mr = (lift(r) * 0.985 + 0.008 * luma).clamp(0.0, 1.0);
+                            let mg = (lift(g) * 1.018 + 0.012 * shd).clamp(0.0, 1.0);
+                            let mb = (lift(b) * 1.015 + 0.018 * shd).clamp(0.0, 1.0);
+                            [mr, mg, mb]
+                        }
+                        // 3: Kroma Studio Neutral — subtle studio contrast S-curve with natural saturation
+                        3 => {
+                            let s_curve = |x: f32| {
+                                let s = x * x * (3.0 - 2.0 * x);
+                                x * 0.45 + s * 0.55
+                            };
+                            let sr = s_curve(r);
+                            let sg = s_curve(g);
+                            let sb = s_curve(b);
+                            let sl = 0.2126 * sr + 0.7152 * sg + 0.0722 * sb;
+                            [
+                                (sl + (sr - sl) * 1.06).clamp(0.0, 1.0),
+                                (sl + (sg - sl) * 1.06).clamp(0.0, 1.0),
+                                (sl + (sb - sl) * 1.06).clamp(0.0, 1.0),
+                            ]
+                        }
+                        // 4: Ilford HP5 Mono — punchy silver-halide panchromatic B&W film curve
+                        _ => {
+                            let pan = (0.26 * r + 0.64 * g + 0.10 * b).clamp(0.0, 1.0);
+                            let s = pan * pan * (3.0 - 2.0 * pan);
+                            let film = (pan * 0.28 + s * 0.72) * 0.95 + 0.025;
+                            [film, film, film]
+                        }
+                    };
+                    table.push(mapped);
+                }
+            }
+        }
+
+        Some(Self {
+            size,
+            domain_min: [0.0, 0.0, 0.0],
+            domain_max: [1.0, 1.0, 1.0],
+            table,
+        })
+    }
+
     pub fn parse(content: &str) -> Result<Self, AppError> {
         let mut size: Option<usize> = None;
         let mut domain_min = [0.0_f32; 3];

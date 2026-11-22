@@ -3,8 +3,8 @@ use crate::dto::{
     ClearCacheResultDto, ClusterDto, ClusterSlateOcrResultDto, DevelopRecipeDto,
     DevelopSyncMaskDto, DirectorySummaryDto, EstimateExportSizeRequestDto,
     EstimateExportSizeResponseDto, ExportShootRequestDto, ExportShootResultDto, GeneratedAiMaskDto,
-    HistogramDto, ModelDownloadOutcomeDto, ModelInspectionDto, ModelManifestStatusDto,
-    OcrTextLineDto, PhotoDto, PhotoOcrResultDto,
+    HistogramDto, ImportedCubeLutDto, ModelDownloadOutcomeDto, ModelInspectionDto,
+    ModelManifestStatusDto, OcrTextLineDto, PhotoDto, PhotoOcrResultDto,
     PhotoRecipeSaveItemDto, PreviewPatchDto, PreviewsReadyBatchDto, RelativeDevelopDeltaDto,
     RuntimeStatusDto, ScanProgressDto, ShootSessionDto, SlateRenameApplyItemDto,
     StorageCacheSummaryDto, ThumbnailRenderProgressDto, VirtualFolderDto, WhiteBalanceDto,
@@ -45,6 +45,7 @@ use kroma_domain::identity::{
 };
 use kroma_domain::organization::OutputNamingTemplate;
 use kroma_domain::photo::PhotoId;
+use kroma_infra::develop::cube_lut::CubeLut3D;
 use kroma_infra::develop::image_decoder::{
     decode_develop_buffer, decode_fast_preview_max_dim, decode_high_bit_depth_working_buffer,
     decode_kr16_downscaled_rgb32f, downscale_rgb32f_unclamped, encode_kr16_rgba16f,
@@ -79,7 +80,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 const SCAN_PROGRESS_EVENT: &str = "kroma://scan-progress";
 const PREVIEWS_READY_EVENT: &str = "kroma://previews-ready";
@@ -224,6 +225,83 @@ pub fn reveal_main_window(window: tauri::WebviewWindow) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+#[tauri::command]
+pub async fn import_cube_lut_file(
+    source_path: String,
+    app: AppHandle,
+) -> Result<ImportedCubeLutDto, String> {
+    let luts_dir = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("kroma_app_data"))
+        .join("luts");
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let src = Path::new(source_path.trim());
+        if !src.is_file() {
+            return Err(format!("LUT file '{}' not found", src.display()));
+        }
+        let content =
+            fs::read_to_string(src).map_err(|err| format!("Failed to read .cube file: {err}"))?;
+        let parsed = CubeLut3D::parse(&content).map_err(|err| err.to_string())?;
+
+        let raw_name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Custom_LUT.cube")
+            .trim();
+        let safe_file_name: String = raw_name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ' ') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let final_file_name = if safe_file_name.to_ascii_lowercase().ends_with(".cube") {
+            safe_file_name
+        } else {
+            format!("{safe_file_name}.cube")
+        };
+
+        fs::create_dir_all(&luts_dir)
+            .map_err(|err| format!("Failed to create LUT library directory: {err}"))?;
+        let dest = luts_dir.join(&final_file_name);
+        fs::write(&dest, &content)
+            .map_err(|err| format!("Failed to save LUT to library: {err}"))?;
+
+        Ok(ImportedCubeLutDto {
+            name: final_file_name,
+            cube_path: dest.to_string_lossy().to_string(),
+            grid_size: parsed.size(),
+            content,
+        })
+    })
+    .await
+    .map_err(|err| format!("import .cube LUT worker failed: {err}"))?
+}
+
+#[tauri::command]
+pub async fn read_cube_lut_file(cube_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = Path::new(cube_path.trim());
+        if !p.is_file() {
+            return Err(format!("LUT file '{}' not found", p.display()));
+        }
+        if p.extension()
+            .and_then(|e| e.to_str())
+            .is_none_or(|ext| !ext.eq_ignore_ascii_case("cube"))
+        {
+            return Err("Only .cube 3D LUT files can be loaded".to_string());
+        }
+        fs::read_to_string(p).map_err(|err| format!("Failed to read .cube file: {err}"))
+    })
+    .await
+    .map_err(|err| format!("read .cube LUT worker failed: {err}"))?
 }
 
 fn build_runtime_status_dto(state: &AppState) -> RuntimeStatusDto {
@@ -2118,13 +2196,20 @@ fn should_render_32bit_thumbnail(
 ) -> bool {
     match mode {
         ThumbnailPreviewRenderMode::Fast => false,
-        ThumbnailPreviewRenderMode::Edited32Bit => recipe.is_modified(),
-        ThumbnailPreviewRenderMode::All32Bit => {
-            if recipe.is_modified() {
-                return true;
+        ThumbnailPreviewRenderMode::Edited32Bit => {
+            if !recipe.is_modified() {
+                return false;
             }
             let p = Path::new(source_path);
-            is_raw_photo_path(p) || is_tiff_photo_path(p) || is_16bit_png_path(p)
+            let is_high_bit_depth =
+                is_raw_photo_path(p) || is_tiff_photo_path(p) || is_16bit_png_path(p);
+            is_high_bit_depth || recipe.has_non_svg_thumbnail_effects()
+        }
+        ThumbnailPreviewRenderMode::All32Bit => {
+            let p = Path::new(source_path);
+            let is_high_bit_depth =
+                is_raw_photo_path(p) || is_tiff_photo_path(p) || is_16bit_png_path(p);
+            is_high_bit_depth || recipe.has_non_svg_thumbnail_effects()
         }
     }
 }
@@ -4188,10 +4273,24 @@ mod tests {
             "IMG_0001.JPG",
             &default_recipe
         ));
-        assert!(should_render_32bit_thumbnail(
+        // 8-bit JPG/PNG with only basic tone/WB sliders uses the 0ms GPU/SVG LUT instead of queuing CPU re-decodes
+        assert!(!should_render_32bit_thumbnail(
+            ThumbnailPreviewRenderMode::Edited32Bit,
+            "IMG_0001.JPG",
+            &edited_recipe
+        ));
+        assert!(!should_render_32bit_thumbnail(
             ThumbnailPreviewRenderMode::All32Bit,
             "IMG_0001.JPG",
             &edited_recipe
+        ));
+        // 8-bit JPG/PNG with non-SVG effects (HSL, masks, AI backdrop, crop) renders a baked thumbnail
+        let mut hsl_recipe = edited_recipe.clone();
+        hsl_recipe.hsl_mixer.red.saturation = 25;
+        assert!(should_render_32bit_thumbnail(
+            ThumbnailPreviewRenderMode::Edited32Bit,
+            "IMG_0001.JPG",
+            &hsl_recipe
         ));
 
         let h_default = compute_32bit_thumbnail_hash("DSC0001.ARW", 24_000_000, &default_recipe);

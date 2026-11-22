@@ -5,6 +5,11 @@ import presentWgsl from '../../../../shaders/develop/present.wgsl?raw';
 import spatialPassWgsl from '../../../../shaders/develop/spatial_pass.wgsl?raw';
 import type { DevelopRecipe } from '../../domain/develop';
 import {
+  ensureCubeLut3DLoaded,
+  getCachedCubeLut3D,
+  type ParsedCubeLut3D,
+} from '../../domain/cubeLut3d';
+import {
   buildToneCurveLutRgba32F,
   compileDevelopShaderUniforms,
   compressRec2020ToLinearSrgb,
@@ -335,6 +340,9 @@ interface CanvasGpuResources {
   lastFinalTex: GPUTexture | null;
   bgMatteTex: GPUTexture | null;
   bgMatteSig: string;
+  lut3dBuf: GPUBuffer | null;
+  lut3dPath: string;
+  lut3dParsed: ParsedCubeLut3D | null;
   readonly spatialMaskCache: Map<string, CachedSpatialMaskGpu>;
   maskUboPool: GPUBuffer[];
 }
@@ -397,6 +405,27 @@ function ensureBgMatteTextureGpu(
   res.bgMatteTex = tex;
   res.bgMatteSig = sig;
   return true;
+}
+
+function ensureLut3dBufferGpu(
+  res: CanvasGpuResources,
+  cubePath: string,
+  parsed: ParsedCubeLut3D,
+): GPUBuffer {
+  if (res.lut3dBuf && res.lut3dPath === cubePath && res.lut3dParsed === parsed) {
+    return res.lut3dBuf;
+  }
+  res.lut3dBuf?.destroy();
+  const buf = res.core.device.createBuffer({
+    label: `kroma-lut3d-${cubePath}`,
+    size: parsed.rgbaTable.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  res.core.queue.writeBuffer(buf, 0, parsed.rgbaTable as Float32Array<ArrayBuffer>);
+  res.lut3dBuf = buf;
+  res.lut3dPath = cubePath;
+  res.lut3dParsed = parsed;
+  return buf;
 }
 
 function getOrUploadSpatialMaskGpu(
@@ -582,6 +611,34 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
       );
     }
 
+    let activeLutBuf = core.dummyLut3dBuf;
+    let activeLutMeta: {
+      readonly size: number;
+      readonly intensity: number;
+      readonly domainMin: readonly [number, number, number];
+      readonly domainMax: readonly [number, number, number];
+    } | null = null;
+
+    if (curRecipe.lut3d && curRecipe.lut3d.intensity > 0) {
+      const cubePath = curRecipe.lut3d.cubePath;
+      const cachedLut = getCachedCubeLut3D(cubePath);
+      if (cachedLut) {
+        activeLutBuf = ensureLut3dBufferGpu(res, cubePath, cachedLut);
+        activeLutMeta = {
+          size: cachedLut.size,
+          intensity: curRecipe.lut3d.intensity / 100,
+          domainMin: cachedLut.domainMin,
+          domainMax: cachedLut.domainMax,
+        };
+      } else {
+        void ensureCubeLut3DLoaded(cubePath).then((loaded) => {
+          if (loaded && resRef.current) {
+            renderFrame();
+          }
+        });
+      }
+    }
+
     const gradeData = packGradeUniforms({
       outWidth: workW,
       outHeight: workH,
@@ -592,6 +649,7 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
       recipe: curRecipe,
       includeFineRotation: false,
       bgMatteReady: bgReady,
+      lut3d: activeLutMeta,
     });
     queue.writeBuffer(res.gradeUbo, 0, gradeData as Float32Array<ArrayBuffer>);
 
@@ -614,7 +672,7 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
         { binding: 1, resource: srcView },
         { binding: 2, resource: toneView },
         { binding: 3, resource: bgMatteView },
-        { binding: 4, resource: { buffer: core.dummyLut3dBuf } },
+        { binding: 4, resource: { buffer: activeLutBuf } },
         { binding: 5, resource: viewA },
       ],
     });
@@ -1026,6 +1084,9 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
         lastFinalTex: null,
         bgMatteTex: null,
         bgMatteSig: '',
+        lut3dBuf: null,
+        lut3dPath: '',
+        lut3dParsed: null,
         spatialMaskCache: new Map(),
         maskUboPool: [],
       };
@@ -1046,6 +1107,7 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
         res.workTexA?.destroy();
         res.workTexB?.destroy();
         res.bgMatteTex?.destroy();
+        res.lut3dBuf?.destroy();
         res.toneLutTex.destroy();
         res.gradeUbo.destroy();
         res.spatialUbo.destroy();

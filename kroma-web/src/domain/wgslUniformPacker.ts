@@ -23,6 +23,13 @@ export function detectWebGpuAvailable(): boolean {
   return typeof navigator !== 'undefined' && 'gpu' in navigator && Boolean(navigator.gpu);
 }
 
+export interface PackGradeLut3DInput {
+  readonly size: number;
+  readonly intensity: number;
+  readonly domainMin: readonly [number, number, number];
+  readonly domainMax: readonly [number, number, number];
+}
+
 export interface PackGradeUniformsInput {
   readonly outWidth: number;
   readonly outHeight: number;
@@ -34,6 +41,7 @@ export interface PackGradeUniformsInput {
   readonly recipe: DevelopRecipe;
   readonly includeFineRotation?: boolean;
   readonly bgMatteReady: boolean;
+  readonly lut3d?: PackGradeLut3DInput | null;
 }
 
 /**
@@ -169,16 +177,18 @@ export function packGradeUniforms(input: PackGradeUniformsInput): Float32Array {
   out[i++] = 0.0;
 
   // [24] lutMeta: (lutSize, lutIntensity, domainMinR, domainMinG)
-  out[i++] = 0.0;
-  out[i++] = 0.0;
-  out[i++] = 0.0;
-  out[i++] = 0.0;
+  const activeLut =
+    input.lut3d && input.lut3d.size >= 2 && input.lut3d.intensity > 1e-6 ? input.lut3d : null;
+  out[i++] = activeLut ? activeLut.size : 0.0;
+  out[i++] = activeLut ? Math.min(1.0, Math.max(0.0, activeLut.intensity)) : 0.0;
+  out[i++] = activeLut ? activeLut.domainMin[0] : 0.0;
+  out[i++] = activeLut ? activeLut.domainMin[1] : 0.0;
 
   // [25] lutDomain: (domainMinB, domainMaxR, domainMaxG, domainMaxB)
-  out[i++] = 0.0;
-  out[i++] = 1.0;
-  out[i++] = 1.0;
-  out[i++] = 1.0;
+  out[i++] = activeLut ? activeLut.domainMin[2] : 0.0;
+  out[i++] = activeLut ? activeLut.domainMax[0] : 1.0;
+  out[i++] = activeLut ? activeLut.domainMax[1] : 1.0;
+  out[i++] = activeLut ? activeLut.domainMax[2] : 1.0;
 
   // [26] bgColor1: (r, g, b, bgMode)
   out[i++] = (bg?.colorRgb[0] ?? 255) / 255;

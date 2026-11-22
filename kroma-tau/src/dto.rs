@@ -162,6 +162,15 @@ pub struct AppUpdateDownloadProgressDto {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ImportedCubeLutDto {
+    pub name: String,
+    pub cube_path: String,
+    pub grid_size: usize,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GeneratedAiMaskDto {
     pub kind: String,
     pub matte_width: u16,

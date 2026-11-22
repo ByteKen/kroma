@@ -80,7 +80,7 @@ impl RayonImageDevelopEngine {
     ) -> Result<(Rgb32FImage, Option<Vec<f32>>), AppError> {
         let loaded_lut = match &recipe.lut_3d {
             Some(lut_ref) if lut_ref.intensity > f32::EPSILON => {
-                Some(CubeLut3D::from_file(&lut_ref.cube_path)?)
+                Some(CubeLut3D::load_or_builtin(&lut_ref.cube_path)?)
             }
             _ => None,
         };
@@ -107,7 +107,7 @@ impl RayonImageDevelopEngine {
     ) -> Result<(Rgb32FImage, Option<Vec<f32>>), AppError> {
         let loaded_lut = match &recipe.lut_3d {
             Some(lut_ref) if lut_ref.intensity > f32::EPSILON => {
-                Some(CubeLut3D::from_file(&lut_ref.cube_path)?)
+                Some(CubeLut3D::load_or_builtin(&lut_ref.cube_path)?)
             }
             _ => None,
         };

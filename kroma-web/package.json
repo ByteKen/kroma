@@ -1,8 +1,8 @@
 {
   "name": "kroma-web",
   "private": true,
-  "version": "0.1.1",
-  "license": "Apache-2.0",
+  "version": "0.1.2",
+  "license": "GPL-3.0-only",
   "type": "module",
   "scripts": {
     "dev": "vite",

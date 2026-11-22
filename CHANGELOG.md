@@ -4,6 +4,19 @@ All notable changes to **Kroma** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-11-23
+
+### Added
+- **Custom 3D `.cube` LUT File Import:** Import arbitrary `.cube` 3D look-up tables directly from disk via native file dialog. Custom LUTs are parsed, stored in local storage, and bound dynamically to WebGPU compute storage buffers and WebGL2 3D textures.
+- **Relocated 3D LUT Controls to Presets Tab:** Moved the 3D `.cube` LUT profile selector to the Presets (`P`) inspector tab alongside built-in film emulations (Kodak Portra 400, Fuji Pro 400H, Kroma Studio Neutral, Ilford HP5 Mono) and user-imported custom LUTs.
+
+### Changed
+- **Showcase & Workflow Documentation:** Added before/after 32-bit linear RAW grading comparisons, AI background masking, face clustering, identity review, and slate OCR previews with sample photo credits.
+
+### Fixed
+- **Thumbnail Rendering for Non-RAW Shoots:** Prevented unnecessary 32-bit CPU background rendering passes when viewing folders containing only 8-bit image formats (JPEG, PNG).
+- **Release Body Cleanup:** Removed redundant operating system table from the automated GitHub release workflow.
+
 ## [0.1.1] - 2026-11-22
 
 ### Added

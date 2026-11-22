@@ -2353,14 +2353,14 @@ dependencies = [
 
 [[package]]
 name = "kroma-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "kroma-domain",
 ]
 
 [[package]]
 name = "kroma-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "kroma-app",
  "kroma-domain",
@@ -2369,11 +2369,11 @@ dependencies = [
 
 [[package]]
 name = "kroma-domain"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "kroma-infra"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytemuck",
  "image",
@@ -2390,7 +2390,7 @@ dependencies = [
 
 [[package]]
 name = "kroma-tau"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hex",
  "image",

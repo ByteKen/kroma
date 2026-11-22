@@ -42,6 +42,8 @@ pub fn run() {
             commands::open_external_url,
             commands::download_and_install_app_update,
             commands::reveal_main_window,
+            commands::import_cube_lut_file,
+            commands::read_cube_lut_file,
             commands::check_runtime_status,
             commands::check_models_manifest,
             commands::download_missing_models,
