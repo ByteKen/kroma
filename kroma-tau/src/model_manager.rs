@@ -331,6 +331,19 @@ where
     Ok((written, actual_sha))
 }
 
+fn build_download_agent() -> ureq::Agent {
+    let tls_config = ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::NativeTls)
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build();
+    let config = ureq::Agent::config_builder()
+        .tls_config(tls_config)
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_recv_body(Some(Duration::from_secs(600)))
+        .build();
+    config.into()
+}
+
 /// Downloads all missing or outdated models defined by `manifest` into `managed_models_dir`,
 /// streaming progress updates via `on_progress` and verifying SHA-256 before finalizing.
 pub fn download_pending_models<F>(
@@ -377,11 +390,7 @@ where
     fs::create_dir_all(managed_models_dir)
         .map_err(|err| format!("failed to prepare models directory: {err}"))?;
 
-    let config = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(15)))
-        .timeout_recv_body(Some(Duration::from_secs(600)))
-        .build();
-    let agent: ureq::Agent = config.into();
+    let agent = build_download_agent();
 
     let mut installed_index = load_installed_index(managed_models_dir);
     let overall_total_bytes: u64 = pending.iter().map(|e| e.size_bytes).sum();
@@ -521,6 +530,17 @@ mod tests {
             }],
         };
         (manifest, sha)
+    }
+
+    #[test]
+    fn download_agent_uses_native_tls_with_platform_roots() {
+        let agent = build_download_agent();
+        let tls = agent.config().tls_config();
+        assert_eq!(tls.provider(), ureq::tls::TlsProvider::NativeTls);
+        assert!(matches!(
+            tls.root_certs(),
+            ureq::tls::RootCerts::PlatformVerifier
+        ));
     }
 
     #[test]
