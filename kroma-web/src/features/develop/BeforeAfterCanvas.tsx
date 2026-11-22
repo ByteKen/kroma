@@ -26,7 +26,7 @@ export type CompareViewportMode = 'single' | 'split' | 'before_after';
 export type ViewportZoomLevel = 1 | 2 | 3;
 
 const NEUTRAL_DEVELOP_RECIPE = createDefaultDevelopRecipe();
-const DEVELOP_WORKING_MAX_DIM = 1600;
+export const DEVELOP_WORKING_MAX_DIM = 1600;
 
 interface BeforeAfterCanvasProps {
   readonly photo: PhotoAsset;
@@ -91,7 +91,13 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
   floatingOverlay,
   focusMode = false,
 }: BeforeAfterCanvasProps) {
-  const { isDesktopRuntime, preferences, loadDevelopWorkingBuffer } = useStudio();
+  const {
+    isDesktopRuntime,
+    preferences,
+    peekDevelopWorkingBuffer,
+    loadDevelopWorkingBuffer,
+    setDevelopViewportStatus,
+  } = useStudio();
   const workingMaxDim = preferences.studioPreviewMaxDim ?? DEVELOP_WORKING_MAX_DIM;
   const stageBackdropStyle = {
     backgroundColor: resolveCanvasBackdropHex(preferences.canvasBackdropTone),
@@ -112,8 +118,7 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
   const handleBackendChange = useCallback((backend: ActiveViewportBackend) => {
     setViewportBackend(backend);
   }, []);
-  const requestedPrecision: WorkingBufferPrecision =
-    viewportBackend === 'webgpu' ? 'f32' : 'f16';
+  const requestedPrecision: WorkingBufferPrecision = 'f16';
   const stageRef = useRef<HTMLDivElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
 
@@ -136,6 +141,9 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
 
   const shouldProbe = isDesktopRuntime && shouldProbeHighBitDepthBuffer(photo.fileName);
   const isRawSource = isRawFileName(photo.fileName);
+  const syncCachedBuffer = shouldProbe
+    ? peekDevelopWorkingBuffer(photo.id, workingMaxDim, requestedPrecision)
+    : null;
 
   // Reset pan cleanly when returning to Fit zoom or switching photo
   useEffect(() => {
@@ -147,6 +155,16 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
   useEffect(() => {
     if (!shouldProbe) {
       setDecodingRawPhotoId(null);
+      return;
+    }
+
+    if (syncCachedBuffer) {
+      setDecodingRawPhotoId((prev) => (prev === photo.id ? null : prev));
+      setLoadedWorking((prev) =>
+        prev?.photoId === photo.id && prev.buffer === syncCachedBuffer
+          ? prev
+          : { photoId: photo.id, buffer: syncCachedBuffer },
+      );
       return;
     }
 
@@ -172,10 +190,19 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
     return () => {
       cancelled = true;
     };
-  }, [photo.id, shouldProbe, isRawSource, workingMaxDim, requestedPrecision, loadDevelopWorkingBuffer]);
+  }, [
+    photo.id,
+    shouldProbe,
+    isRawSource,
+    workingMaxDim,
+    requestedPrecision,
+    syncCachedBuffer,
+    loadDevelopWorkingBuffer,
+  ]);
 
   const activeWorkingBuffer =
-    loadedWorking && loadedWorking.photoId === photo.id ? loadedWorking.buffer : null;
+    syncCachedBuffer ??
+    (loadedWorking && loadedWorking.photoId === photo.id ? loadedWorking.buffer : null);
   const isDecodingRaw = decodingRawPhotoId === photo.id && !activeWorkingBuffer;
 
   const rotation = photo.developRecipe.cropTransform.rotationDeg;
@@ -239,30 +266,46 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
     }
   };
 
-  const backendTag = viewportBackend === 'webgpu' ? 'WEBGPU' : 'WEBGL2';
-  const precisionBadge = activeWorkingBuffer ? (
-    <div className="absolute bottom-2.5 right-2.5 z-10 pointer-events-none">
-      <TelemetryPill
-        tone={activeWorkingBuffer.isRawDemosaic ? 'emerald' : 'amber'}
-        dot
-        className="bg-surface-lowest/85 backdrop-blur"
-      >
-        {activeWorkingBuffer.precision === 'f32'
-          ? activeWorkingBuffer.isRawDemosaic
-            ? `32-BIT SCENE-LINEAR RAW • ${backendTag} (${activeWorkingBuffer.width}×${activeWorkingBuffer.height})`
-            : `32-BIT FLOAT • ${backendTag} (${activeWorkingBuffer.width}×${activeWorkingBuffer.height})`
-          : activeWorkingBuffer.isRawDemosaic
-            ? `16-BIT LINEAR RAW • ${backendTag} (${activeWorkingBuffer.width}×${activeWorkingBuffer.height})`
-            : `16-BIT FLOAT • ${backendTag} (${activeWorkingBuffer.width}×${activeWorkingBuffer.height})`}
-      </TelemetryPill>
-    </div>
-  ) : isDecodingRaw ? (
-    <div className="absolute bottom-2.5 right-2.5 z-10 pointer-events-none">
-      <TelemetryPill tone="neutral" className="bg-surface-lowest/85 backdrop-blur">
-        {requestedPrecision === 'f32' ? 'Decoding 32-bit RAW…' : 'Decoding 16-bit RAW…'}
-      </TelemetryPill>
-    </div>
-  ) : null;
+  const swapNatural = (photo.developRecipe.cropTransform.quarterTurns ?? 0) % 2 === 1;
+
+  // Report live 32-bit/16-bit RAW decode & active GPU buffer telemetry to the bottom status bar
+  // so the photo canvas stays completely unobstructed.
+  useEffect(() => {
+    if (activeWorkingBuffer) {
+      const displayWidth = swapNatural ? activeWorkingBuffer.height : activeWorkingBuffer.width;
+      const displayHeight = swapNatural ? activeWorkingBuffer.width : activeWorkingBuffer.height;
+      setDevelopViewportStatus({
+        state: 'ready',
+        precision: viewportBackend === 'webgpu' ? 'f32' : activeWorkingBuffer.precision,
+        isRawDemosaic: activeWorkingBuffer.isRawDemosaic,
+        backend: viewportBackend,
+        width: displayWidth,
+        height: displayHeight,
+      });
+    } else if (isDecodingRaw) {
+      setDevelopViewportStatus({
+        state: 'decoding',
+        precision: viewportBackend === 'webgpu' ? 'f32' : requestedPrecision,
+        isRawDemosaic: true,
+        backend: viewportBackend,
+      });
+    } else {
+      setDevelopViewportStatus(null);
+    }
+  }, [
+    activeWorkingBuffer,
+    isDecodingRaw,
+    viewportBackend,
+    requestedPrecision,
+    swapNatural,
+    setDevelopViewportStatus,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      setDevelopViewportStatus(null);
+    };
+  }, [setDevelopViewportStatus]);
 
   const toolHintBadge = colorPickActive ? (
     <div className="absolute top-2.5 left-1/2 -translate-x-1/2 z-20 pointer-events-none">
@@ -278,7 +321,6 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
     </div>
   ) : null;
 
-  const swapNatural = (photo.developRecipe.cropTransform.quarterTurns ?? 0) % 2 === 1;
   const orientedNaturalAspect = swapNatural
     ? naturalSize.h / Math.max(1, naturalSize.w)
     : naturalSize.w / Math.max(1, naturalSize.h);
@@ -393,7 +435,6 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
               EDITED
             </TelemetryPill>
           </div>
-          {!focusMode && precisionBadge}
         </div>
       </div>
     );
@@ -545,8 +586,6 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
             </TelemetryPill>
           </div>
         )}
-
-        {!cropModeActive && !focusMode && precisionBadge}
       </div>
     </div>
   );

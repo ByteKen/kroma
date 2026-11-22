@@ -70,6 +70,7 @@ pub fn run() {
             commands::redo_organization_action,
             commands::auto_level_cluster_eyes,
             commands::load_develop_working_buffer,
+            commands::render_32bit_thumbnails,
             commands::generate_ai_mask,
             commands::save_photo_develop_recipe,
             commands::save_photo_develop_recipes_batch,

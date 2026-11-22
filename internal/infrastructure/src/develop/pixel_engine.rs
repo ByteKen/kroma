@@ -197,6 +197,72 @@ impl RayonImageDevelopEngine {
         let graded_f32 = self.process_buffer_to_f32(&decoded, recipe)?;
         encode_graded_bytes(graded_f32, format)
     }
+
+    /// Renders a 32-bit graded JPEG thumbnail directly from a pre-decoded `DecodedDevelopBuffer`
+    /// using the exact same 32-bit WGSL `wgpu` / Rayon pipeline (tone, curves, HSL, 3-way wheels,
+    /// camera calibration, 3D LUT, AI backdrops, local masks, spatial detail, crop/rotation) as
+    /// full-resolution export, writing atomically via a sibling temporary file so concurrent readers
+    /// never observe partially encoded JPEGs.
+    pub fn render_buffer_to_jpeg(
+        &self,
+        buffer: &image_decoder::DecodedDevelopBuffer,
+        recipe: &DevelopRecipe,
+        output_path: &Path,
+        quality: u8,
+    ) -> Result<(), AppError> {
+        let graded_f32 = self.process_buffer_to_f32(buffer, recipe)?;
+        let rgb8 = finalize_rgb8(graded_f32);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                AppError::ImageProcessingFailure(format!(
+                    "failed to create thumbnail directory '{}': {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let unique_suffix = format!(
+            "{:?}.{}.tmp",
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
+        .replace(|c: char| !c.is_ascii_alphanumeric() && c != '.', "_");
+        let tmp_path = output_path.with_extension(format!("jpg.{unique_suffix}"));
+        {
+            let file = File::create(&tmp_path).map_err(|err| {
+                AppError::ImageProcessingFailure(format!(
+                    "failed to create thumbnail '{}': {err}",
+                    tmp_path.display()
+                ))
+            })?;
+            let writer = BufWriter::new(file);
+            let mut encoder = JpegEncoder::new_with_quality(writer, quality.clamp(50, 100));
+            encoder.encode_image(&rgb8).map_err(|err| {
+                AppError::ImageProcessingFailure(format!(
+                    "failed to encode 32-bit thumbnail '{}': {err}",
+                    output_path.display()
+                ))
+            })?;
+        }
+        if let Err(_rename_err) = fs::rename(&tmp_path, output_path) {
+            // On Windows, rename fails if another thread already materialized the same immutable hash file.
+            if output_path.exists() {
+                let _ = fs::remove_file(&tmp_path);
+            } else {
+                fs::copy(&tmp_path, output_path).map_err(|err| {
+                    let _ = fs::remove_file(&tmp_path);
+                    AppError::ImageProcessingFailure(format!(
+                        "failed to finalize 32-bit thumbnail '{}': {err}",
+                        output_path.display()
+                    ))
+                })?;
+                let _ = fs::remove_file(&tmp_path);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ImageDevelopPort for RayonImageDevelopEngine {

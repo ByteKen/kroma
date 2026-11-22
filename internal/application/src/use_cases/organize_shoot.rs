@@ -464,7 +464,52 @@ fn build_delivery_plan(input: &OrganizeShootInput) -> Vec<PlannedDeliveryItem> {
         items.retain(|item| selected.contains(&item.photo_id));
     }
 
+    disambiguate_delivery_paths(&mut items);
+
     items
+}
+
+/// Ensures no two delivery items ever write to the same output file path (case-insensitively on
+/// Windows/macOS), e.g. when a subject folder contains both `DSC05928.ARW` and `DSC05928.jpg`
+/// exported to `.jpg` with `[Original_Name]`, or duplicate filenames from different source folders.
+/// Colliding paths receive `_2`, `_3`, etc. before their extension (`DSC05928_2.jpg`).
+fn disambiguate_delivery_paths(items: &mut [PlannedDeliveryItem]) {
+    let mut used_primary: HashSet<String> = HashSet::with_capacity(items.len());
+    let mut used_raw: HashSet<String> = HashSet::with_capacity(items.len());
+
+    for item in items.iter_mut() {
+        item.destination_path = allocate_unique_output_path(&item.destination_path, &mut used_primary);
+        if let Some(ref raw_dest) = item.raw_companion_destination_path {
+            item.raw_companion_destination_path =
+                Some(allocate_unique_output_path(raw_dest, &mut used_raw));
+        }
+    }
+}
+
+fn allocate_unique_output_path(candidate: &str, used_lower: &mut HashSet<String>) -> String {
+    let key = candidate.to_ascii_lowercase();
+    if used_lower.insert(key) {
+        return candidate.to_string();
+    }
+
+    let (dir_prefix, file_name) = match candidate.rsplit_once('/') {
+        Some((dir, file)) => (format!("{dir}/"), file),
+        None => (String::new(), candidate),
+    };
+    let (stem, ext_suffix) = match file_name.rsplit_once('.') {
+        Some((s, ext)) if !s.is_empty() => (s, format!(".{ext}")),
+        _ => (file_name, String::new()),
+    };
+
+    let mut suffix = 2_usize;
+    loop {
+        let next_candidate = format!("{dir_prefix}{stem}_{suffix}{ext_suffix}");
+        let next_key = next_candidate.to_ascii_lowercase();
+        if used_lower.insert(next_key) {
+            return next_candidate;
+        }
+        suffix += 1;
+    }
 }
 
 fn sanitized_folder_prefix(segments: &[String]) -> String {
@@ -1211,5 +1256,102 @@ mod tests {
             .collect();
         assert_eq!(paths, vec!["/deliveries/Santos__Maria_001/IMG_002.jpg"]);
         assert!(out.manifest_path.is_none());
+    }
+
+    #[test]
+    fn disambiguates_colliding_filenames_when_arw_and_jpg_share_same_stem() {
+        let mut detections = HashMap::new();
+        let mut embeddings = HashMap::new();
+        for path in [
+            "/shoot/DSC05928.ARW",
+            "/shoot/DSC05927.ARW",
+            "/shoot/DSC05928.jpg",
+            "/shoot/DSC05929.ARW",
+        ] {
+            detections.insert(
+                path.to_string(),
+                vec![RawFaceDetection {
+                    bounding_box: face_box(0.45),
+                    landmarks: sample_landmarks(),
+                    detection_confidence: 0.99,
+                }],
+            );
+            embeddings.insert(path.to_string(), vec![basis_embedding(0, 1, 0.0)]);
+        }
+
+        let vision = StubVision {
+            detections,
+            embeddings,
+            slates: HashMap::new(),
+        };
+        let cluster_uc = ClusterShootFacesUseCase::new(&vision, &vision, None);
+        let mut clustered = cluster_uc
+            .execute(ClusterShootInput::with_defaults(vec![
+                PhotoScanTarget {
+                    photo_id: PhotoId::new("DSC05928").unwrap(),
+                    source_path: "/shoot/DSC05928.ARW".to_string(),
+                    capture_timestamp_epoch_sec: 100,
+                    exact_capture_timestamp_epoch_sec: None,
+                },
+                PhotoScanTarget {
+                    photo_id: PhotoId::new("DSC05927").unwrap(),
+                    source_path: "/shoot/DSC05927.ARW".to_string(),
+                    capture_timestamp_epoch_sec: 101,
+                    exact_capture_timestamp_epoch_sec: None,
+                },
+                PhotoScanTarget {
+                    photo_id: PhotoId::new("DSC05928_2").unwrap(),
+                    source_path: "/shoot/DSC05928.jpg".to_string(),
+                    capture_timestamp_epoch_sec: 102,
+                    exact_capture_timestamp_epoch_sec: None,
+                },
+                PhotoScanTarget {
+                    photo_id: PhotoId::new("DSC05929").unwrap(),
+                    source_path: "/shoot/DSC05929.ARW".to_string(),
+                    capture_timestamp_epoch_sec: 103,
+                    exact_capture_timestamp_epoch_sec: None,
+                },
+            ]))
+            .unwrap();
+        clustered.plan.clusters[0].rename("SALVE, A-JAY A.").unwrap();
+
+        let organizer = RecordingOrganizer::default();
+        let org_uc = OrganizeShootFoldersUseCase::new(&organizer);
+        let out = org_uc
+            .execute_with_optional_develop(
+                OrganizeShootInput {
+                    plan: clustered.plan,
+                    output_root: "/deliveries".to_string(),
+                    naming_template: OutputNamingTemplate::new(
+                        "/[Slate_Name]/[Original_Name].jpg",
+                        false,
+                    )
+                    .unwrap(),
+                    execution_mode: OrganizeExecutionMode::DevelopAndExport {
+                        format: OutputImageFormat::Jpeg { quality: 94 },
+                    },
+                    archive_excluded_slates: false,
+                    write_manifest_json: false,
+                    selected_photo_ids: None,
+                },
+                Some(&DummyEngine),
+                Some(&EmptyStore),
+            )
+            .unwrap();
+
+        let paths: Vec<&str> = out
+            .organized_files
+            .iter()
+            .map(|f| f.destination_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/deliveries/SALVE__A-JAY_A/DSC05928.jpg",
+                "/deliveries/SALVE__A-JAY_A/DSC05927.jpg",
+                "/deliveries/SALVE__A-JAY_A/DSC05928_2.jpg",
+                "/deliveries/SALVE__A-JAY_A/DSC05929.jpg",
+            ]
+        );
     }
 }

@@ -708,6 +708,58 @@ pub struct RelativeDevelopDelta {
 }
 
 impl DevelopRecipe {
+    /// Returns `true` when any Develop module differs from factory defaults
+    /// (matches `isRecipeModified` in `kroma-web/src/domain/develop.ts`).
+    pub fn is_modified(&self) -> bool {
+        let def = Self::default();
+        let wb_modified = self.white_balance.temperature_kelvin != def.white_balance.temperature_kelvin
+            || self.white_balance.tint != def.white_balance.tint;
+        if wb_modified {
+            return true;
+        }
+        let bt = &self.basic_tone;
+        let bt_modified = bt.black_and_white
+            || bt.exposure_ev.abs() > 1e-4
+            || bt.contrast != 0
+            || bt.highlights != 0
+            || bt.shadows != 0
+            || bt.whites != 0
+            || bt.blacks != 0
+            || bt.texture != 0
+            || bt.clarity != 0
+            || bt.dehaze != 0
+            || bt.vibrance != 0
+            || bt.saturation != 0;
+        if bt_modified {
+            return true;
+        }
+        if !self.tone_curve.is_neutral()
+            || !self.hsl_mixer.is_neutral()
+            || !self.color_grading.is_neutral()
+            || !self.camera_calibration.is_neutral()
+            || self.lut_3d.is_some()
+        {
+            return true;
+        }
+        let d = &self.detail_optics;
+        if d.sharpening_amount != 0
+            || d.luminance_noise_reduction != 0
+            || d.color_noise_reduction != 0
+            || d.vignette_amount != 0
+            || d.grain_amount != 0
+        {
+            return true;
+        }
+        let c = &self.crop_transform;
+        if !c.is_identity()
+            || c.aspect_ratio != CropAspectRatio::Original
+            || c.auto_eye_level_locked
+        {
+            return true;
+        }
+        self.masks.iter().any(MaskLayer::is_effective) || self.background_removal.is_active()
+    }
+
     pub fn clamp_all_invariants(&mut self) {
         self.white_balance.temperature_kelvin = self
             .white_balance

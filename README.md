@@ -31,42 +31,9 @@ Kroma is a **local-first desktop RAW photo editor and portrait workflow studio**
 - **Selective Batch Export:** Export full shoots, specific folders, or selected frames as graded JPEG, PNG, or 16-bit TIFF with optional original RAW pairing, custom naming patterns, automatic slate exclusion/archiving, and real-time output size estimation
 - **Offline-First & Configurable AI:** Zero cloud uploads and zero subscriptions; hardware-accelerated via DirectML (Windows) and CoreML (macOS), with custom `.onnx` model inspection/swapping and configurable cache directories
 
-## System Requirements
-
-### Windows
-
-- **Minimum:**
-  - **OS:** Windows 10 (64-bit)
-  - **CPU:** Intel Core i5 (8th Gen) or AMD Ryzen 5 2600
-  - **RAM:** 8 GB
-  - **GPU:** Integrated graphics (Intel Iris Xe / AMD Radeon) or NVIDIA GeForce GTX 1050 / AMD Radeon RX 560
-  - **Storage:** 1 GB free space *(includes ~350 MB for local AI models)*
-- **Recommended:**
-  - **OS:** Windows 11 (64-bit)
-  - **CPU:** Intel Core i5-12400 / Core i7 or AMD Ryzen 5 5600 / Ryzen 7
-  - **RAM:** 16 GB or more
-  - **GPU:** NVIDIA GeForce GTX 1660 / RTX 2060 (6 GB+ VRAM) or AMD Radeon RX 6600
-  - **Storage:** 5 GB+ free space on an SSD *(for fast RAW preview cache)*
-
-### macOS
-
-- **Minimum:**
-  - **OS:** macOS 12 Monterey or newer
-  - **Chip:** Apple Silicon (M1 or newer)
-  - **RAM:** 8 GB
-  - **Storage:** 1 GB free space *(includes ~350 MB for local AI models)*
-- **Recommended:**
-  - **OS:** macOS 14 Sonoma or newer
-  - **Chip:** Apple M1 Pro / M2 / M3 / M4
-  - **RAM:** 16 GB or more
-  - **Storage:** 5 GB+ free space on an SSD
-
-> [!NOTE]
-> An internet connection is only needed once on first launch to download the local AI models (~350 MB) and optionally check for updates. After that, Kroma works 100% offline.
-
 ## Installation
 
-Download the latest installer for Windows or macOS from the [Releases](https://github.com/ByteKen/kroma/releases) page.
+Download the latest installer for Windows (64-bit) or macOS (Apple Silicon) from the [Releases](https://github.com/ByteKen/kroma/releases) page.
 
 ## Development
 

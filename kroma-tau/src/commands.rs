@@ -7,7 +7,7 @@ use crate::dto::{
     OcrTextLineDto, PhotoDto, PhotoOcrResultDto,
     PhotoRecipeSaveItemDto, PreviewPatchDto, PreviewsReadyBatchDto, RelativeDevelopDeltaDto,
     RuntimeStatusDto, ScanProgressDto, ShootSessionDto, SlateRenameApplyItemDto,
-    StorageCacheSummaryDto, VirtualFolderDto, WhiteBalanceDto,
+    StorageCacheSummaryDto, ThumbnailRenderProgressDto, VirtualFolderDto, WhiteBalanceDto,
 };
 use crate::face_cache;
 use crate::model_manager::{
@@ -46,9 +46,10 @@ use kroma_domain::identity::{
 use kroma_domain::organization::OutputNamingTemplate;
 use kroma_domain::photo::PhotoId;
 use kroma_infra::develop::image_decoder::{
-    decode_fast_preview_max_dim, decode_high_bit_depth_working_buffer, downscale_rgb32f_unclamped,
-    encode_kr16_rgba16f, encode_kr32_rgba32f, extract_exif_capture_timestamp_epoch_sec,
-    is_raw_photo_path, is_supported_photo_path, is_web_native_image_path,
+    decode_develop_buffer, decode_fast_preview_max_dim, decode_high_bit_depth_working_buffer,
+    decode_kr16_downscaled_rgb32f, downscale_rgb32f_unclamped, encode_kr16_rgba16f,
+    encode_kr32_rgba32f, extract_exif_capture_timestamp_epoch_sec, is_16bit_png_path,
+    is_raw_photo_path, is_supported_photo_path, is_tiff_photo_path, is_web_native_image_path,
     supported_raw_extensions, DecodedDevelopBuffer,
 };
 use kroma_infra::develop::pixel_engine::RayonImageDevelopEngine;
@@ -82,7 +83,12 @@ use tauri::{AppHandle, Emitter, State};
 
 const SCAN_PROGRESS_EVENT: &str = "kroma://scan-progress";
 const PREVIEWS_READY_EVENT: &str = "kroma://previews-ready";
+const THUMBNAIL_RENDER_PROGRESS_EVENT: &str = "kroma://thumbnail-render-progress";
 const PREVIEW_MAX_DIM: u32 = 1024;
+const THUMBNAIL_32BIT_MAX_DIM: u32 = 640;
+const THUMBNAIL_32BIT_JPEG_QUALITY: u8 = 86;
+const THUMBNAIL_32BIT_BATCH_SIZE: usize = 6;
+const MAX_DISK_WORK_CACHE_FILES: usize = 24;
 const OCR_HIGH_RES_RETRY_CONFIDENCE: f32 = 0.85;
 const INITIAL_SYNC_RAW_PREVIEWS: usize = 36;
 const BACKGROUND_PREVIEW_BATCH_SIZE: usize = 32;
@@ -267,7 +273,7 @@ pub fn set_gpu_acceleration(enabled: bool, state: State<'_, AppState>) -> Runtim
 }
 
 fn is_preview_cache_file(file_name: &str) -> bool {
-    file_name.ends_with("_preview.jpg")
+    file_name.ends_with("_preview.jpg") || file_name.ends_with("_preview.kr16")
 }
 
 fn is_face_cache_file(file_name: &str) -> bool {
@@ -363,7 +369,13 @@ pub async fn set_storage_cache_dir(
         .map(PathBuf::from);
     let resolved = state.set_custom_cache_dir(next_path)?;
     let is_custom = state.is_custom_cache_dir();
+    state.thumbnail_render_generation.fetch_add(1, Ordering::SeqCst);
     state.clear_develop_buffer_cache();
+    if let Ok(mut guard) = state.active_shoot.lock()
+        && let Some(ctx) = guard.as_mut()
+    {
+        ctx.rendered_preview_paths.clear();
+    }
     tauri::async_runtime::spawn_blocking(move || summarize_cache_dir(&resolved, is_custom))
         .await
         .map_err(|err| format!("set cache dir worker failed: {err}"))
@@ -380,7 +392,13 @@ pub async fn clear_storage_cache(
     }
 
     if normalized == "previews" || normalized == "all" {
+        state.thumbnail_render_generation.fetch_add(1, Ordering::SeqCst);
         state.clear_develop_buffer_cache();
+        if let Ok(mut guard) = state.active_shoot.lock()
+            && let Some(ctx) = guard.as_mut()
+        {
+            ctx.rendered_preview_paths.clear();
+        }
     }
     if (normalized == "face_cache" || normalized == "all")
         && let Ok(mut guard) = state.active_shoot.lock()
@@ -527,6 +545,7 @@ pub async fn load_shoot_folder(
     state: State<'_, AppState>,
 ) -> Result<ShootSessionDto, String> {
     state.clear_develop_buffer_cache();
+    state.thumbnail_render_generation.fetch_add(1, Ordering::SeqCst);
     let preview_cache_dir = state.resolve_cache_dir();
     let active_shoot = state.active_shoot.clone();
     let load_generation = state.load_generation.clone();
@@ -1739,11 +1758,91 @@ pub async fn auto_level_cluster_eyes(
     .map_err(|err| format!("auto-level worker failed: {err}"))?
 }
 
+fn compute_working_buffer_cache_path(
+    cache_dir: &Path,
+    source_path: &str,
+    file_size_bytes: u64,
+    max_dim: u32,
+) -> PathBuf {
+    let mut h1 = DefaultHasher::new();
+    "kroma-work-kr16-v1-a".hash(&mut h1);
+    source_path.hash(&mut h1);
+    file_size_bytes.hash(&mut h1);
+    max_dim.hash(&mut h1);
+
+    let mut h2 = DefaultHasher::new();
+    "kroma-work-kr16-v1-b".hash(&mut h2);
+    max_dim.hash(&mut h2);
+    file_size_bytes.hash(&mut h2);
+    source_path.hash(&mut h2);
+
+    cache_dir.join(format!(
+        "v1_work_{:016x}{:016x}_preview.kr16",
+        h1.finish(),
+        h2.finish()
+    ))
+}
+
+fn persist_working_kr16_cache_bounded(cache_dir: &Path, dest: &Path, bytes: &[u8]) {
+    if dest.is_file() {
+        return;
+    }
+    if fs::create_dir_all(cache_dir).is_err() {
+        return;
+    }
+    let unique_suffix = format!(
+        "kr16.{:?}.{}.tmp",
+        std::thread::current().id(),
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
+    .replace(|c: char| !c.is_ascii_alphanumeric() && c != '.', "_");
+    let tmp = dest.with_extension(unique_suffix);
+    if fs::write(&tmp, bytes).is_ok() {
+        if fs::rename(&tmp, dest).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = fs::remove_file(&tmp);
+    }
+
+    // Keep disk usage strictly bounded (at most MAX_DISK_WORK_CACHE_FILES recent working buffers)
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    let mut work_files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            if !name.to_string_lossy().ends_with("_preview.kr16") {
+                return None;
+            }
+            let modified = e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(UNIX_EPOCH);
+            Some((modified, e.path()))
+        })
+        .collect();
+    if work_files.len() > MAX_DISK_WORK_CACHE_FILES {
+        work_files.sort_by_key(|(mtime, _)| *mtime);
+        let to_evict = work_files.len() - MAX_DISK_WORK_CACHE_FILES;
+        for (_, path) in work_files.into_iter().take(to_evict) {
+            if path != dest {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
 /// Decodes the active Camera RAW / 16-bit TIFF / 16-bit PNG directly into a screen-sized
-/// 32-bit float `KR32` (`RGBA32F` Linear Rec.2020 for WebGPU) or 16-bit half-float `KR16`
-/// (`RGBA16F` for WebGL2 fallback) binary buffer for Studio Develop editing.
-/// Returns an empty binary payload immediately for standard 8-bit PNG/JPEG/WebP files so
-/// WebView keeps its zero-latency native texture path.
+/// 16-bit half-float `KR16` (`RGBA16F` Linear Rec.2020 — lossless for 12/14-bit camera sensors,
+/// 2× faster IPC & GPU upload, fed straight into 32-bit `rgba32float` WGSL compute shaders)
+/// or 32-bit float `KR32` binary buffer for Studio Develop editing.
+/// Checks in-memory LRU first, then bounded SSD cache (~10ms), falling back to full parallel RAW demosaic.
 #[tauri::command]
 pub async fn load_develop_working_buffer(
     photo_id: String,
@@ -1751,7 +1850,7 @@ pub async fn load_develop_working_buffer(
     precision: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
-    let source_path = {
+    let (source_path, file_size_bytes) = {
         let guard = state
             .active_shoot
             .lock()
@@ -1759,14 +1858,17 @@ pub async fn load_develop_working_buffer(
         let ctx = guard
             .as_ref()
             .ok_or_else(|| "no active shoot loaded".to_string())?;
-        ctx.photo_sources
+        let src = ctx
+            .photo_sources
             .get(&photo_id)
             .cloned()
-            .ok_or_else(|| format!("photo '{photo_id}' not found in active shoot"))?
+            .ok_or_else(|| format!("photo '{photo_id}' not found in active shoot"))?;
+        let size = ctx.photo_file_sizes.get(&photo_id).copied().unwrap_or(0);
+        (src, size)
     };
 
     let use_f32 = matches!(precision.as_deref(), Some("f32"));
-    let clamped_max_dim = max_dim.unwrap_or(1600).clamp(256, 2048);
+    let clamped_max_dim = max_dim.unwrap_or(1600).clamp(256, 2560);
     let cache_key = format!(
         "{source_path}@{clamped_max_dim}@{}",
         if use_f32 { "f32" } else { "f16" }
@@ -1775,13 +1877,45 @@ pub async fn load_develop_working_buffer(
         return Ok(tauri::ipc::Response::new((*cached_bytes).clone()));
     }
 
+    let cache_dir = state.resolve_cache_dir();
+    let disk_cache_path = if !use_f32 {
+        Some(compute_working_buffer_cache_path(
+            &cache_dir,
+            &source_path,
+            file_size_bytes,
+            clamped_max_dim,
+        ))
+    } else {
+        None
+    };
+
     let source_for_worker = source_path.clone();
     let decoded_result = tauri::async_runtime::spawn_blocking(move || {
+        // Fast SSD cache hit for compact KR16 working buffers (~10ms instead of 250-600ms RAW demosaic)
+        if let Some(ref disk_path) = disk_cache_path
+            && disk_path.is_file()
+            && let Ok(cached_kr16) = fs::read(disk_path)
+            && let Some(thumb_buffer) =
+                decode_kr16_downscaled_rgb32f(&cached_kr16, THUMBNAIL_32BIT_MAX_DIM)
+        {
+            let hist_image = downscale_rgb32f_unclamped(&thumb_buffer.image, 384);
+            let hist_buffer = DecodedDevelopBuffer {
+                image: hist_image,
+                is_linear: thumb_buffer.is_linear,
+                is_wide_gamut: thumb_buffer.is_wide_gamut,
+                bit_depth: thumb_buffer.bit_depth,
+                is_raw_demosaic: thumb_buffer.is_raw_demosaic,
+            };
+            return Ok::<Option<(Vec<u8>, DecodedDevelopBuffer, DecodedDevelopBuffer)>, String>(
+                Some((cached_kr16, hist_buffer, thumb_buffer)),
+            );
+        }
+
         let Some(decoded) =
             decode_high_bit_depth_working_buffer(&source_for_worker, clamped_max_dim)
                 .map_err(|e| e.to_string())?
         else {
-            return Ok::<Option<(Vec<u8>, DecodedDevelopBuffer)>, String>(None);
+            return Ok(None);
         };
 
         let wire_bytes = if use_f32 {
@@ -1789,7 +1923,12 @@ pub async fn load_develop_working_buffer(
         } else {
             encode_kr16_rgba16f(&decoded)
         };
-        let hist_image = downscale_rgb32f_unclamped(&decoded.image, 384);
+        if let Some(ref disk_path) = disk_cache_path {
+            persist_working_kr16_cache_bounded(&cache_dir, disk_path, &wire_bytes);
+        }
+
+        let thumb_image = downscale_rgb32f_unclamped(&decoded.image, THUMBNAIL_32BIT_MAX_DIM);
+        let hist_image = downscale_rgb32f_unclamped(&thumb_image, 384);
         let hist_buffer = DecodedDevelopBuffer {
             image: hist_image,
             is_linear: decoded.is_linear,
@@ -1797,12 +1936,19 @@ pub async fn load_develop_working_buffer(
             bit_depth: decoded.bit_depth,
             is_raw_demosaic: decoded.is_raw_demosaic,
         };
-        Ok(Some((wire_bytes, hist_buffer)))
+        let thumb_buffer = DecodedDevelopBuffer {
+            image: thumb_image,
+            is_linear: decoded.is_linear,
+            is_wide_gamut: decoded.is_wide_gamut,
+            bit_depth: decoded.bit_depth,
+            is_raw_demosaic: decoded.is_raw_demosaic,
+        };
+        Ok(Some((wire_bytes, hist_buffer, thumb_buffer)))
     })
     .await
     .map_err(|err| format!("high-bit-depth develop decode worker failed: {err}"))??;
 
-    let Some((wire_bytes, hist_buffer)) = decoded_result else {
+    let Some((wire_bytes, hist_buffer, thumb_buffer)) = decoded_result else {
         return Ok(tauri::ipc::Response::new(Vec::new()));
     };
 
@@ -1813,9 +1959,427 @@ pub async fn load_develop_working_buffer(
         source_path,
         kr16_bytes: shared_bytes,
         hist_buffer: Arc::new(hist_buffer),
+        thumb_buffer: Arc::new(thumb_buffer),
     });
 
     Ok(tauri::ipc::Response::new(response_bytes))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThumbnailPreviewRenderMode {
+    Fast,
+    Edited32Bit,
+    All32Bit,
+}
+
+impl ThumbnailPreviewRenderMode {
+    fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "fast" => Self::Fast,
+            "all_32bit" | "all" => Self::All32Bit,
+            _ => Self::Edited32Bit,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Edited32Bit => "edited_32bit",
+            Self::All32Bit => "all_32bit",
+        }
+    }
+}
+
+fn compute_32bit_thumbnail_hash(
+    source_path: &str,
+    file_size_bytes: u64,
+    recipe: &DevelopRecipe,
+) -> (u64, u64) {
+    let recipe_json = serde_json::to_string(&DevelopRecipeDto::from(recipe)).unwrap_or_default();
+    let mut h1 = DefaultHasher::new();
+    "kroma-32bit-thumb-v1-a".hash(&mut h1);
+    THUMBNAIL_32BIT_MAX_DIM.hash(&mut h1);
+    source_path.hash(&mut h1);
+    file_size_bytes.hash(&mut h1);
+    recipe_json.hash(&mut h1);
+
+    let mut h2 = DefaultHasher::new();
+    "kroma-32bit-thumb-v1-b".hash(&mut h2);
+    recipe_json.hash(&mut h2);
+    file_size_bytes.hash(&mut h2);
+    source_path.hash(&mut h2);
+
+    (h1.finish(), h2.finish())
+}
+
+fn should_render_32bit_thumbnail(
+    mode: ThumbnailPreviewRenderMode,
+    source_path: &str,
+    recipe: &DevelopRecipe,
+) -> bool {
+    match mode {
+        ThumbnailPreviewRenderMode::Fast => false,
+        ThumbnailPreviewRenderMode::Edited32Bit => recipe.is_modified(),
+        ThumbnailPreviewRenderMode::All32Bit => {
+            if recipe.is_modified() {
+                return true;
+            }
+            let p = Path::new(source_path);
+            is_raw_photo_path(p) || is_tiff_photo_path(p) || is_16bit_png_path(p)
+        }
+    }
+}
+
+/// Renders compact 640px 32-bit linear-developed JPEG thumbnails in the background for Face
+/// Organizer, Filmstrip, Lightbox, and Export previews so edited cards & RAW grids match
+/// Studio's 32-bit WebGPU / `wgpu` color, backdrops, masks, HSL, and LUTs 1:1 without consuming
+/// extra WebGPU contexts or VRAM.
+#[tauri::command]
+pub fn render_32bit_thumbnails(
+    mode: String,
+    photo_ids: Option<Vec<String>>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let parsed_mode = ThumbnailPreviewRenderMode::parse(&mode);
+    let mode_str = parsed_mode.as_str().to_string();
+
+    if parsed_mode == ThumbnailPreviewRenderMode::Fast {
+        state
+            .thumbnail_render_generation
+            .fetch_add(1, Ordering::SeqCst);
+        let cleared_ids: Vec<String> = {
+            let mut guard = state
+                .active_shoot
+                .lock()
+                .map_err(|_| "active_shoot state mutex poisoned".to_string())?;
+            if let Some(ctx) = guard.as_mut() {
+                ctx.rendered_preview_paths
+                    .drain()
+                    .map(|(pid, _)| pid)
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        if !cleared_ids.is_empty() {
+            let total = cleared_ids.len();
+            let updates = cleared_ids
+                .into_iter()
+                .map(|photo_id| PreviewPatchDto {
+                    photo_id,
+                    preview_path: None,
+                    rendered_preview_path: None,
+                    clear_rendered_preview: true,
+                    captured_at_epoch_sec: None,
+                    captured_at_label: None,
+                })
+                .collect();
+            let _ = app.emit(
+                PREVIEWS_READY_EVENT,
+                PreviewsReadyBatchDto {
+                    updates,
+                    completed: total,
+                    total,
+                },
+            );
+        }
+        let _ = app.emit(
+            THUMBNAIL_RENDER_PROGRESS_EVENT,
+            ThumbnailRenderProgressDto {
+                active: false,
+                completed: 0,
+                total: 0,
+                mode: mode_str,
+            },
+        );
+        return Ok(());
+    }
+
+    let is_full_pass = photo_ids.as_ref().is_none_or(|ids| ids.is_empty());
+    let expected_thumb_gen = if is_full_pass {
+        state
+            .thumbnail_render_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
+    } else {
+        state.thumbnail_render_generation.load(Ordering::SeqCst)
+    };
+    let expected_load_gen = state.load_generation.load(Ordering::SeqCst);
+    let preview_cache_dir = state.resolve_cache_dir();
+
+    struct ThumbRenderJob {
+        photo_id: String,
+        source_path: String,
+        recipe: DevelopRecipe,
+        hash: (u64, u64),
+        dest_path: PathBuf,
+    }
+
+    let (cached_hits, needs_render, cleared_ids) = {
+        let mut guard = state
+            .active_shoot
+            .lock()
+            .map_err(|_| "active_shoot state mutex poisoned".to_string())?;
+        let Some(ctx) = guard.as_mut() else {
+            return Ok(());
+        };
+        let default_recipe = DevelopRecipe::default();
+        let target_ids: Vec<String> = match photo_ids {
+            Some(ids) if !ids.is_empty() => ids,
+            _ => ctx
+                .scan_targets
+                .iter()
+                .map(|t| t.photo_id.as_str().to_string())
+                .collect(),
+        };
+
+        let mut cached_hits: Vec<(String, String)> = Vec::new();
+        let mut needs_render: Vec<ThumbRenderJob> = Vec::new();
+        let mut cleared_ids: Vec<String> = Vec::new();
+        let mut seen = HashSet::with_capacity(target_ids.len());
+
+        for pid in target_ids {
+            if !seen.insert(pid.clone()) {
+                continue;
+            }
+            let Some(source_path) = ctx.photo_sources.get(&pid).cloned() else {
+                continue;
+            };
+            let recipe = ctx.recipes.get(&pid).cloned().unwrap_or_else(|| default_recipe.clone());
+            if !should_render_32bit_thumbnail(parsed_mode, &source_path, &recipe) {
+                if ctx.rendered_preview_paths.remove(&pid).is_some() {
+                    cleared_ids.push(pid);
+                }
+                continue;
+            }
+            let file_size_bytes = ctx.photo_file_sizes.get(&pid).copied().unwrap_or(0);
+            let hash = compute_32bit_thumbnail_hash(&source_path, file_size_bytes, &recipe);
+            let dest_path = preview_cache_dir
+                .join(format!("v1_32bit_{:016x}{:016x}_preview.jpg", hash.0, hash.1));
+            let dest_str = dest_path.to_string_lossy().to_string();
+
+            if dest_path.is_file() {
+                if ctx.rendered_preview_paths.get(&pid).map(String::as_str) != Some(dest_str.as_str())
+                {
+                    ctx.rendered_preview_paths.insert(pid.clone(), dest_str.clone());
+                    cached_hits.push((pid, dest_str));
+                }
+            } else {
+                needs_render.push(ThumbRenderJob {
+                    photo_id: pid,
+                    source_path,
+                    recipe,
+                    hash,
+                    dest_path,
+                });
+            }
+        }
+
+        (cached_hits, needs_render, cleared_ids)
+    };
+
+    if !cleared_ids.is_empty() || !cached_hits.is_empty() {
+        let mut updates = Vec::with_capacity(cleared_ids.len() + cached_hits.len());
+        for photo_id in cleared_ids {
+            updates.push(PreviewPatchDto {
+                photo_id,
+                preview_path: None,
+                rendered_preview_path: None,
+                clear_rendered_preview: true,
+                captured_at_epoch_sec: None,
+                captured_at_label: None,
+            });
+        }
+        for (photo_id, rendered_path) in cached_hits {
+            updates.push(PreviewPatchDto {
+                photo_id,
+                preview_path: None,
+                rendered_preview_path: Some(rendered_path),
+                clear_rendered_preview: false,
+                captured_at_epoch_sec: None,
+                captured_at_label: None,
+            });
+        }
+        let count = updates.len();
+        let _ = app.emit(
+            PREVIEWS_READY_EVENT,
+            PreviewsReadyBatchDto {
+                updates,
+                completed: count,
+                total: count,
+            },
+        );
+    }
+
+    if needs_render.is_empty() {
+        if is_full_pass {
+            let _ = app.emit(
+                THUMBNAIL_RENDER_PROGRESS_EVENT,
+                ThumbnailRenderProgressDto {
+                    active: false,
+                    completed: 0,
+                    total: 0,
+                    mode: mode_str,
+                },
+            );
+        }
+        return Ok(());
+    }
+
+    let active_shoot = state.active_shoot.clone();
+    let load_generation = state.load_generation.clone();
+    let thumb_generation = state.thumbnail_render_generation.clone();
+    let develop_buffer_cache = state.develop_buffer_cache.clone();
+
+    std::thread::spawn(move || {
+        let _ = fs::create_dir_all(&preview_cache_dir);
+        let engine = RayonImageDevelopEngine::new();
+        let total = needs_render.len();
+        let mut completed = 0usize;
+
+        let is_still_valid = || {
+            load_generation.load(Ordering::SeqCst) == expected_load_gen
+                && thumb_generation.load(Ordering::SeqCst) == expected_thumb_gen
+        };
+
+        if !is_still_valid() {
+            return;
+        }
+
+        let _ = app.emit(
+            THUMBNAIL_RENDER_PROGRESS_EVENT,
+            ThumbnailRenderProgressDto {
+                active: true,
+                completed: 0,
+                total,
+                mode: mode_str.clone(),
+            },
+        );
+
+        for chunk in needs_render.chunks(THUMBNAIL_32BIT_BATCH_SIZE) {
+            if !is_still_valid() {
+                return;
+            }
+
+            let rendered: Vec<(String, String, (u64, u64))> = chunk
+                .par_iter()
+                .filter_map(|job| {
+                    if !is_still_valid() {
+                        return None;
+                    }
+                    if !job.dest_path.is_file() {
+                        let cached_buf = develop_buffer_cache
+                            .lock()
+                            .ok()
+                            .and_then(|guard| {
+                                guard
+                                    .iter()
+                                    .rev()
+                                    .find(|entry| entry.source_path == job.source_path)
+                                    .map(|entry| Arc::clone(&entry.thumb_buffer))
+                            });
+                        let render_result = if let Some(hot_buf) = cached_buf {
+                            engine.render_buffer_to_jpeg(
+                                &hot_buf,
+                                &job.recipe,
+                                &job.dest_path,
+                                THUMBNAIL_32BIT_JPEG_QUALITY,
+                            )
+                        } else {
+                            decode_develop_buffer(&job.source_path, THUMBNAIL_32BIT_MAX_DIM)
+                                .and_then(|decoded| {
+                                    engine.render_buffer_to_jpeg(
+                                        &decoded,
+                                        &job.recipe,
+                                        &job.dest_path,
+                                        THUMBNAIL_32BIT_JPEG_QUALITY,
+                                    )
+                                })
+                        };
+                        if render_result.is_err() || !job.dest_path.is_file() {
+                            return None;
+                        }
+                    }
+                    Some((
+                        job.photo_id.clone(),
+                        job.dest_path.to_string_lossy().to_string(),
+                        job.hash,
+                    ))
+                })
+                .collect();
+
+            if !is_still_valid() {
+                return;
+            }
+
+            completed += chunk.len();
+            let mut patches = Vec::with_capacity(rendered.len());
+
+            if let Ok(mut guard) = active_shoot.lock()
+                && let Some(ctx) = guard.as_mut()
+            {
+                let default_recipe = DevelopRecipe::default();
+                for (pid, rendered_path, expected_hash) in rendered {
+                    let Some(source_path) = ctx.photo_sources.get(&pid) else {
+                        continue;
+                    };
+                    let current_size = ctx.photo_file_sizes.get(&pid).copied().unwrap_or(0);
+                    let current_recipe = ctx.recipes.get(&pid).unwrap_or(&default_recipe);
+                    let current_hash =
+                        compute_32bit_thumbnail_hash(source_path, current_size, current_recipe);
+                    if current_hash != expected_hash {
+                        continue;
+                    }
+                    ctx.rendered_preview_paths
+                        .insert(pid.clone(), rendered_path.clone());
+                    patches.push(PreviewPatchDto {
+                        photo_id: pid,
+                        preview_path: None,
+                        rendered_preview_path: Some(rendered_path),
+                        clear_rendered_preview: false,
+                        captured_at_epoch_sec: None,
+                        captured_at_label: None,
+                    });
+                }
+            }
+
+            if !patches.is_empty() {
+                let _ = app.emit(
+                    PREVIEWS_READY_EVENT,
+                    PreviewsReadyBatchDto {
+                        updates: patches,
+                        completed,
+                        total,
+                    },
+                );
+            }
+
+            let _ = app.emit(
+                THUMBNAIL_RENDER_PROGRESS_EVENT,
+                ThumbnailRenderProgressDto {
+                    active: completed < total,
+                    completed,
+                    total,
+                    mode: mode_str.clone(),
+                },
+            );
+        }
+
+        if is_still_valid() {
+            let _ = app.emit(
+                THUMBNAIL_RENDER_PROGRESS_EVENT,
+                ThumbnailRenderProgressDto {
+                    active: false,
+                    completed: total,
+                    total,
+                    mode: mode_str,
+                },
+            );
+        }
+    });
+
+    Ok(())
 }
 
 /// Generates a non-destructive AI alpha matte (`subject`, `background`, `face_skin`, `sky`)
@@ -2752,14 +3316,19 @@ fn run_instant_folder_load(
     let mut scan_targets = Vec::with_capacity(indexed.len());
     let mut immediate_raw_jobs: Vec<BackgroundPreviewJob> = Vec::new();
     let mut background_raw_jobs: Vec<BackgroundPreviewJob> = Vec::new();
+    let mut used_safe_sidecar_ids: HashSet<String> = HashSet::with_capacity(indexed.len());
 
     for item in indexed {
-        let mut unique_id = item.raw_id;
+        let base_id = item.raw_id;
+        let mut unique_id = base_id.clone();
         let mut suffix = 2_usize;
-        while photo_sources.contains_key(&unique_id) {
-            unique_id = format!("{unique_id}_{suffix}");
+        while photo_sources.contains_key(&unique_id)
+            || used_safe_sidecar_ids.contains(&JsonSidecarRecipeStore::sanitize_photo_id(&unique_id))
+        {
+            unique_id = format!("{base_id}_{suffix}");
             suffix += 1;
         }
+        used_safe_sidecar_ids.insert(JsonSidecarRecipeStore::sanitize_photo_id(&unique_id));
         let dir_id = format!(
             "dir-{}",
             item.dir_name.to_ascii_lowercase().replace(['/', ' '], "-")
@@ -2852,7 +3421,7 @@ fn run_instant_folder_load(
         .collect();
 
     let sidecars_dir = root.join(".kroma_sidecars");
-    let recipes = load_existing_recipes_once(&sidecars_dir);
+    let recipes = load_existing_recipes_once(&sidecars_dir, &scan_targets);
 
     let discovered_pairs: Vec<(PhotoId, String)> = scan_targets
         .iter()
@@ -2950,6 +3519,7 @@ fn run_instant_folder_load(
         photo_sources,
         photo_file_sizes,
         preview_paths,
+        rendered_preview_paths: HashMap::new(),
         source_to_preview,
         photo_directories,
         photo_capture_timestamps,
@@ -3022,7 +3592,9 @@ fn spawn_background_preview_worker(
                     }
                     patches.push(PreviewPatchDto {
                         photo_id: pid,
-                        preview_path: preview,
+                        preview_path: Some(preview),
+                        rendered_preview_path: None,
+                        clear_rendered_preview: false,
                         captured_at_epoch_sec: ts,
                         captured_at_label: format_capture_time_label(ts),
                     });
@@ -3045,19 +3617,35 @@ fn spawn_background_preview_worker(
 
 /// Loads ONLY `.kroma.json` sidecar files that actually exist in `sidecars_dir` once on folder open,
 /// eliminating 2,000+ redundant `fs::stat` calls on every UI mutation.
-fn load_existing_recipes_once(sidecars_dir: &Path) -> HashMap<String, DevelopRecipe> {
+/// Maps each sanitized `.kroma.json` filename back to its original `PhotoId` (which may contain
+/// spaces, commas, or periods when photos are inside nested subfolders like `2 PINNING 01/AJIAS, ...`).
+fn load_existing_recipes_once(
+    sidecars_dir: &Path,
+    scan_targets: &[PhotoScanTarget],
+) -> HashMap<String, DevelopRecipe> {
     let mut map = HashMap::new();
     let Ok(entries) = fs::read_dir(sidecars_dir) else {
         return map;
     };
-    let store = JsonSidecarRecipeStore::new(sidecars_dir);
+    let mut existing_safe_stems = HashSet::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(stem) = name.strip_suffix(".kroma.json")
-            && let Ok(pid) = PhotoId::new(stem)
-            && let Ok(Some(recipe)) = store.load_recipe(&pid)
+        if let Some(stem) = name.strip_suffix(".kroma.json") {
+            existing_safe_stems.insert(stem.to_string());
+        }
+    }
+    if existing_safe_stems.is_empty() {
+        return map;
+    }
+
+    let store = JsonSidecarRecipeStore::new(sidecars_dir);
+    for target in scan_targets {
+        let pid_str = target.photo_id.as_str();
+        let safe_id = JsonSidecarRecipeStore::sanitize_photo_id(pid_str);
+        if existing_safe_stems.contains(&safe_id)
+            && let Ok(Some(recipe)) = store.load_recipe(&target.photo_id)
         {
-            map.insert(stem.to_string(), recipe);
+            map.insert(pid_str.to_string(), recipe);
         }
     }
     map
@@ -3165,6 +3753,7 @@ fn build_session_dto(ctx: &ActiveShootContext) -> ShootSessionDto {
                             .map(|f| f.as_str().to_string()),
                         source_path: entry.source_path.clone(),
                         preview_path,
+                        rendered_preview_path: ctx.rendered_preview_paths.get(pid_str).cloned(),
                         file_size_bytes: ctx.photo_file_sizes.get(pid_str).copied().unwrap_or(0),
                         is_slate_anchor: entry.is_slate_photo,
                         cluster_id: Some(cluster.id.as_str().to_string()),
@@ -3232,6 +3821,7 @@ fn build_session_dto(ctx: &ActiveShootContext) -> ShootSessionDto {
                         .get(pid)
                         .cloned()
                         .unwrap_or_else(|| g.source_path.clone()),
+                    rendered_preview_path: ctx.rendered_preview_paths.get(pid).cloned(),
                     file_size_bytes: ctx.photo_file_sizes.get(pid).copied().unwrap_or(0),
                     is_slate_anchor: false,
                     cluster_id: Some("_group_photos".to_string()),
@@ -3297,6 +3887,7 @@ fn build_session_dto(ctx: &ActiveShootContext) -> ShootSessionDto {
                         .get(pid)
                         .cloned()
                         .unwrap_or_else(|| nf.source_path.clone()),
+                    rendered_preview_path: ctx.rendered_preview_paths.get(pid).cloned(),
                     file_size_bytes: ctx.photo_file_sizes.get(pid).copied().unwrap_or(0),
                     is_slate_anchor: false,
                     cluster_id: Some("_no_face_photos".to_string()),
@@ -3460,6 +4051,88 @@ mod tests {
         assert_eq!(cleared_faces.removed_files, 1);
         assert_eq!(cleared_faces.freed_bytes, 64);
         assert!(dir.join("keep_me.txt").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thumbnail_32bit_mode_selection_and_hash_invalidation_behave_accurately() {
+        let default_recipe = DevelopRecipe::default();
+        let mut edited_recipe = DevelopRecipe::default();
+        edited_recipe.basic_tone.exposure_ev = 0.75;
+
+        assert!(!default_recipe.is_modified());
+        assert!(edited_recipe.is_modified());
+
+        assert!(!should_render_32bit_thumbnail(
+            ThumbnailPreviewRenderMode::Fast,
+            "DSC0001.ARW",
+            &edited_recipe
+        ));
+        assert!(!should_render_32bit_thumbnail(
+            ThumbnailPreviewRenderMode::Edited32Bit,
+            "DSC0001.ARW",
+            &default_recipe
+        ));
+        assert!(should_render_32bit_thumbnail(
+            ThumbnailPreviewRenderMode::Edited32Bit,
+            "DSC0001.ARW",
+            &edited_recipe
+        ));
+        assert!(should_render_32bit_thumbnail(
+            ThumbnailPreviewRenderMode::All32Bit,
+            "DSC0001.ARW",
+            &default_recipe
+        ));
+        assert!(!should_render_32bit_thumbnail(
+            ThumbnailPreviewRenderMode::All32Bit,
+            "IMG_0001.JPG",
+            &default_recipe
+        ));
+        assert!(should_render_32bit_thumbnail(
+            ThumbnailPreviewRenderMode::All32Bit,
+            "IMG_0001.JPG",
+            &edited_recipe
+        ));
+
+        let h_default = compute_32bit_thumbnail_hash("DSC0001.ARW", 24_000_000, &default_recipe);
+        let h_edited = compute_32bit_thumbnail_hash("DSC0001.ARW", 24_000_000, &edited_recipe);
+        assert_ne!(h_default, h_edited);
+    }
+
+    #[test]
+    fn load_existing_recipes_once_restores_sidecars_for_subfolders_with_spaces_and_commas() {
+        let dir = std::env::temp_dir().join(format!(
+            "kroma_sidecar_restore_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let store = JsonSidecarRecipeStore::new(&dir);
+
+        // Subfolder PhotoId containing spaces, commas, and periods (e.g. "2 PINNING 01_AJIAS, RICHMOND D._DSC06182")
+        let subfolder_pid =
+            PhotoId::new("2 PINNING 01_AJIAS, RICHMOND D._DSC06182").expect("valid photo id");
+        let mut recipe = DevelopRecipe::default();
+        recipe.basic_tone.exposure_ev = 1.25;
+        recipe.white_balance.temperature_kelvin = 6100;
+        store.save_recipe(&subfolder_pid, &recipe).expect("saved sidecar");
+
+        let targets = vec![PhotoScanTarget {
+            photo_id: subfolder_pid.clone(),
+            source_path: "D:/Shoot/2 PINNING 01/AJIAS, RICHMOND D./DSC06182.ARW".to_string(),
+            capture_timestamp_epoch_sec: 100,
+            exact_capture_timestamp_epoch_sec: Some(100),
+        }];
+
+        let restored = load_existing_recipes_once(&dir, &targets);
+        let loaded = restored
+            .get(subfolder_pid.as_str())
+            .expect("must map sanitized .kroma.json filename back to original subfolder PhotoId");
+        assert_eq!(loaded.basic_tone.exposure_ev, 1.25);
+        assert_eq!(loaded.white_balance.temperature_kelvin, 6100);
 
         let _ = fs::remove_dir_all(&dir);
     }

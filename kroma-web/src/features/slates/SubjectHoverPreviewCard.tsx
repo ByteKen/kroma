@@ -191,6 +191,7 @@ export function SubjectHoverPreviewCard({
             {heroPhoto ? (
               <GradedThumbnailImg
                 src={heroPhoto.imageUrl}
+                renderedSrc={heroPhoto.renderedThumbnailUrl}
                 alt={cluster.anchor.subjectName}
                 recipe={heroPhoto.developRecipe}
                 loading="eager"
@@ -227,6 +228,7 @@ export function SubjectHoverPreviewCard({
                   >
                     <GradedThumbnailImg
                       src={photo.imageUrl}
+                      renderedSrc={photo.renderedThumbnailUrl}
                       alt={photo.fileName}
                       recipe={photo.developRecipe}
                       decoding="async"

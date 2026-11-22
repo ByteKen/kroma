@@ -24,7 +24,9 @@ pub struct ScanProgressDto {
 #[serde(rename_all = "camelCase")]
 pub struct PreviewPatchDto {
     pub photo_id: String,
-    pub preview_path: String,
+    pub preview_path: Option<String>,
+    pub rendered_preview_path: Option<String>,
+    pub clear_rendered_preview: bool,
     pub captured_at_epoch_sec: Option<i64>,
     pub captured_at_label: Option<String>,
 }
@@ -35,6 +37,15 @@ pub struct PreviewsReadyBatchDto {
     pub updates: Vec<PreviewPatchDto>,
     pub completed: usize,
     pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThumbnailRenderProgressDto {
+    pub active: bool,
+    pub completed: usize,
+    pub total: usize,
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -769,6 +780,7 @@ pub struct PhotoDto {
     pub virtual_folder_id: Option<String>,
     pub source_path: String,
     pub preview_path: String,
+    pub rendered_preview_path: Option<String>,
     pub file_size_bytes: u64,
     pub is_slate_anchor: bool,
     pub cluster_id: Option<String>,

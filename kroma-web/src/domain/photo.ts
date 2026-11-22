@@ -33,6 +33,8 @@ export interface PhotoAsset {
   readonly directoryId: string;
   readonly virtualFolderId?: string | null;
   readonly imageUrl: string;
+  /** Optional 32-bit Rust/wgpu rendered JPEG thumbnail matching `developRecipe` 1:1. */
+  readonly renderedThumbnailUrl?: string | null;
   readonly fileSizeBytes?: number;
   readonly isSlateAnchor: boolean;
   readonly clusterId: string | null;

@@ -3,7 +3,7 @@ export const KROMA_GITHUB_URL = `https://github.com/${KROMA_GITHUB_REPO}`;
 export const KROMA_RELEASES_URL = `${KROMA_GITHUB_URL}/releases`;
 export const KROMA_RELEASES_API_URL = `https://api.github.com/repos/${KROMA_GITHUB_REPO}/releases?per_page=15`;
 export const KROMA_RAW_CONTENT_BASE_URL = `https://raw.githubusercontent.com/${KROMA_GITHUB_REPO}`;
-export const KROMA_FALLBACK_VERSION = '0.1.0';
+export const KROMA_FALLBACK_VERSION = '0.1.1';
 export const DEFAULT_UPDATE_CHECK_TIMEOUT_MS = 4500;
 
 export type ChangelogSource = 'release_body' | 'changelog_file';

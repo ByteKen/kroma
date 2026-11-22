@@ -14,6 +14,7 @@ import {
 } from '../../domain/exportEstimate';
 import { isFaceOnlySlateCode } from '../../domain/identity';
 import {
+  allocateUniqueExportPath,
   buildSimpleExportPattern,
   formatExportPreviewPath,
   inferSimpleExportNaming,
@@ -240,6 +241,8 @@ export function BatchExportWorkspace() {
   const exportPlan = useMemo(() => {
     const clusters = session?.clusters ?? [];
     const uniqueExportNames = resolveUniqueExportSubjectNames(clusters, outputRule.pattern);
+    const usedFinalPaths = new Set<string>();
+    const usedRawCompanionPaths = new Set<string>();
     let totalPhotos = 0;
     let totalOutputFiles = 0;
     let totalExcludedSlates = 0;
@@ -291,15 +294,15 @@ export function BatchExportWorkspace() {
           const dual = splitPreviewIntoEditedAndRaw(baseFinalPath, photo.fileName);
           return {
             photo,
-            finalPath: dual.editedPath,
-            rawCompanionPath: dual.rawPath,
+            finalPath: allocateUniqueExportPath(dual.editedPath, usedFinalPaths),
+            rawCompanionPath: allocateUniqueExportPath(dual.rawPath, usedRawCompanionPaths),
             graded,
           };
         }
 
         return {
           photo,
-          finalPath: baseFinalPath,
+          finalPath: allocateUniqueExportPath(baseFinalPath, usedFinalPaths),
           rawCompanionPath: null as string | null,
           graded,
         };
@@ -542,7 +545,7 @@ export function BatchExportWorkspace() {
   const destinationLeafName =
     resolvedDestinationPath.split(/[\\/]/).filter(Boolean).pop() ?? exportRootFolderName;
   const { mode: namingMode, subfolderPerSubject } = inferSimpleExportNaming(outputRule.pattern);
-  const moreOptionsSummary = `${namingMode === 'sequential' ? 'Sequential' : 'Original names'}${subfolderPerSubject ? '' : ' • Flat'}`;
+  const moreOptionsSummary = `${namingMode === 'sequential' ? 'Sequential' : 'Original names'}${subfolderPerSubject ? '' : ' • Flat'} • ${outputRule.excludeSlateFromClientPack ? 'Skip slates' : 'Include slates'}`;
 
   return (
     <div className="flex-1 flex min-w-0 min-h-0 overflow-hidden bg-canvas">
@@ -1279,6 +1282,7 @@ export function BatchExportWorkspace() {
                               {rendersEdited ? (
                                 <GradedThumbnailImg
                                   src={photo.imageUrl}
+                                  renderedSrc={photo.renderedThumbnailUrl}
                                   alt={photo.fileName}
                                   recipe={photo.developRecipe}
                                   loading="lazy"

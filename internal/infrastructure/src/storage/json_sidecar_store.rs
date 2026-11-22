@@ -20,9 +20,9 @@ impl JsonSidecarRecipeStore {
         }
     }
 
-    fn sidecar_path(&self, photo_id: &PhotoId) -> PathBuf {
-        let safe_id: String = photo_id
-            .as_str()
+    /// Maps a `PhotoId` string to its canonical filesystem-safe sidecar stem (`{safe_id}.kroma.json`).
+    pub fn sanitize_photo_id(raw_id: &str) -> String {
+        raw_id
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -31,7 +31,11 @@ impl JsonSidecarRecipeStore {
                     '_'
                 }
             })
-            .collect();
+            .collect()
+    }
+
+    fn sidecar_path(&self, photo_id: &PhotoId) -> PathBuf {
+        let safe_id = Self::sanitize_photo_id(photo_id.as_str());
         self.root_dir.join(format!("{safe_id}.kroma.json"))
     }
 }
@@ -64,7 +68,16 @@ impl DevelopRecipeStorePort for JsonSidecarRecipeStore {
         })?;
 
         let target = self.sidecar_path(photo_id);
-        let temp = target.with_extension("kroma.json.tmp");
+        let unique_suffix = format!(
+            "kroma.json.{:?}.{}.tmp",
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
+        .replace(|c: char| !c.is_ascii_alphanumeric() && c != '.', "_");
+        let temp = target.with_extension(unique_suffix);
         let dto = RecipeSidecarDto::from(recipe);
         let payload = serde_json::to_string_pretty(&dto).map_err(|err| {
             AppError::StorageFailure(format!("failed to serialize recipe sidecar: {err}"))
@@ -76,12 +89,16 @@ impl DevelopRecipeStorePort for JsonSidecarRecipeStore {
                 temp.display()
             ))
         })?;
-        fs::rename(&temp, &target).map_err(|err| {
-            AppError::StorageFailure(format!(
-                "failed to commit sidecar '{}': {err}",
-                target.display()
-            ))
-        })?;
+        if let Err(_rename_err) = fs::rename(&temp, &target) {
+            fs::copy(&temp, &target).map_err(|err| {
+                let _ = fs::remove_file(&temp);
+                AppError::StorageFailure(format!(
+                    "failed to commit sidecar '{}': {err}",
+                    target.display()
+                ))
+            })?;
+            let _ = fs::remove_file(&temp);
+        }
         Ok(())
     }
 

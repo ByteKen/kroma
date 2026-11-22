@@ -4,6 +4,7 @@ import { DEFAULT_OUTPUT_NAMING_RULE } from './organization';
 
 export type DefaultOpenWorkspace = 'develop' | 'culling';
 export type StudioPreviewMaxDim = 1600 | 2048 | 2560;
+export type ThumbnailPreviewMode = 'fast' | 'edited_32bit' | 'all_32bit';
 export type DefaultSubjectSortMode = 'capture_time' | 'confidence' | 'exposures';
 export type CanvasBackdropTone = 'obsidian' | 'charcoal' | 'neutral_gray';
 export type InterfaceScalePct = 90 | 100 | 110;
@@ -35,6 +36,7 @@ export interface StudioPreferences {
   readonly reduceMotion: boolean;
   readonly enableGpuAcceleration: boolean;
   readonly studioPreviewMaxDim: StudioPreviewMaxDim;
+  readonly thumbnailPreviewMode: ThumbnailPreviewMode;
   readonly customCacheDir: string | null;
   readonly customDetectorModelPath: string | null;
   readonly customRecognizerModelPath: string | null;
@@ -64,6 +66,7 @@ export const DEFAULT_STUDIO_PREFERENCES: StudioPreferences = {
   reduceMotion: false,
   enableGpuAcceleration: true,
   studioPreviewMaxDim: 2048,
+  thumbnailPreviewMode: 'edited_32bit',
   customCacheDir: null,
   customDetectorModelPath: null,
   customRecognizerModelPath: null,
@@ -217,6 +220,12 @@ export function normalizeStudioPreferences(raw: unknown): StudioPreferences {
       obj.studioPreviewMaxDim === 2560
         ? obj.studioPreviewMaxDim
         : DEFAULT_STUDIO_PREFERENCES.studioPreviewMaxDim,
+    thumbnailPreviewMode:
+      obj.thumbnailPreviewMode === 'fast' ||
+      obj.thumbnailPreviewMode === 'edited_32bit' ||
+      obj.thumbnailPreviewMode === 'all_32bit'
+        ? obj.thumbnailPreviewMode
+        : DEFAULT_STUDIO_PREFERENCES.thumbnailPreviewMode,
     customCacheDir,
     customDetectorModelPath,
     customRecognizerModelPath,
@@ -263,6 +272,7 @@ const PREFERENCE_KEYS: readonly (keyof StudioPreferences)[] = [
   'reduceMotion',
   'enableGpuAcceleration',
   'studioPreviewMaxDim',
+  'thumbnailPreviewMode',
   'customCacheDir',
   'customDetectorModelPath',
   'customRecognizerModelPath',

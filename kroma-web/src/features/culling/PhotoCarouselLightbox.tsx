@@ -176,7 +176,7 @@ function CarouselSlideItem({
           transition={isZoomed ? { type: 'spring', stiffness: 420, damping: 38 } : CAROUSEL_SPRING}
           className="relative w-full h-full"
         >
-          {isActive && edited ? (
+          {isActive && edited && !photo.renderedThumbnailUrl ? (
             <WebGlDevelopCanvas
               src={photo.imageUrl}
               alt={photo.fileName}
@@ -190,6 +190,7 @@ function CarouselSlideItem({
           ) : (
             <GradedThumbnailImg
               src={photo.imageUrl}
+              renderedSrc={photo.renderedThumbnailUrl}
               alt={photo.fileName}
               recipe={photo.developRecipe}
               draggable={false}
@@ -202,7 +203,8 @@ function CarouselSlideItem({
                 }
               }}
               style={{
-                transform: rotation !== 0 ? `rotate(${rotation}deg)` : undefined,
+                transform:
+                  !photo.renderedThumbnailUrl && rotation !== 0 ? `rotate(${rotation}deg)` : undefined,
               }}
               className="w-full h-full object-contain select-none"
             />
@@ -928,6 +930,7 @@ export function PhotoCarouselLightbox({
                   >
                     <GradedThumbnailImg
                       src={photo.imageUrl}
+                      renderedSrc={photo.renderedThumbnailUrl}
                       alt={photo.fileName}
                       recipe={photo.developRecipe}
                       loading="lazy"

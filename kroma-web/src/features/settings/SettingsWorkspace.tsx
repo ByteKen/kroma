@@ -28,6 +28,7 @@ import {
   type InterfaceScalePct,
   type StudioPreferences,
   type StudioPreviewMaxDim,
+  type ThumbnailPreviewMode,
 } from '../../domain/preferences';
 import {
   DarkroomButton,
@@ -90,6 +91,24 @@ const PREVIEW_QUALITY_OPTIONS: readonly SegmentedOption<`${StudioPreviewMaxDim}`
   { id: '1600', label: '1600px', title: 'Fastest RAW loading on laptops and large shoots' },
   { id: '2048', label: '2048px', title: 'Balanced sharpness and speed (Recommended)' },
   { id: '2560', label: '2560px', title: 'Extra detail for 4K / HiDPI studio monitors' },
+];
+
+const THUMBNAIL_PREVIEW_MODE_OPTIONS: readonly SegmentedOption<ThumbnailPreviewMode>[] = [
+  {
+    id: 'fast',
+    label: 'Fast',
+    title: 'Instant camera embedded previews with lightweight CSS approximation (lowest CPU/GPU usage)',
+  },
+  {
+    id: 'edited_32bit',
+    label: 'Edited 32-Bit',
+    title: 'Render exact 32-bit Studio color, AI backdrops, masks & LUTs for edited cards in the background (Recommended)',
+  },
+  {
+    id: 'all_32bit',
+    label: 'All 32-Bit',
+    title: 'Render all RAW & edited thumbnails through the 32-bit scene-linear pipeline in the background',
+  },
 ];
 
 interface ShortcutEntry {
@@ -906,7 +925,6 @@ export function SettingsWorkspace() {
                           <SettingRow
                             title="Studio RAW Preview Resolution"
                             description="Controls the working resolution when editing RAW photos in Studio. Final exports always render at full camera resolution."
-                            last
                             control={
                               <SegmentedControl
                                 layoutId="settings-preview-quality"
@@ -915,6 +933,24 @@ export function SettingsWorkspace() {
                                 onChange={(val) =>
                                   patchDraft({
                                     studioPreviewMaxDim: Number(val) as StudioPreviewMaxDim,
+                                  })
+                                }
+                              />
+                            }
+                          />
+
+                          <SettingRow
+                            title="Grid & Filmstrip Previews"
+                            description="Choose whether Face Organizer, filmstrip, and lightbox cards use fast camera previews or background 32-bit rendered thumbnails matching Studio."
+                            last
+                            control={
+                              <SegmentedControl
+                                layoutId="settings-thumbnail-preview-mode"
+                                options={THUMBNAIL_PREVIEW_MODE_OPTIONS}
+                                value={draft.thumbnailPreviewMode}
+                                onChange={(val) =>
+                                  patchDraft({
+                                    thumbnailPreviewMode: val,
                                   })
                                 }
                               />

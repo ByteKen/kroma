@@ -12,6 +12,7 @@ import type { SubjectCluster } from '../../domain/identity';
 import type { AiMaskKind, GeneratedAiMaskResult } from '../../domain/masking';
 import type { OutputNamingRule } from '../../domain/organization';
 import type { PhotoAsset } from '../../domain/photo';
+import type { ThumbnailPreviewMode } from '../../domain/preferences';
 import type {
   ClusterSlateOcrResult,
   PhotoOcrResult,
@@ -168,7 +169,9 @@ export interface ScanProgressUpdate {
 
 export interface PreviewPatchItem {
   readonly photoId: string;
-  readonly imageUrl: string;
+  readonly imageUrl?: string | null;
+  readonly renderedThumbnailUrl?: string | null;
+  readonly clearRenderedThumbnail?: boolean;
   readonly capturedAtEpochSec: number | null;
   readonly capturedAtLabel: string | null;
 }
@@ -177,6 +180,13 @@ export interface PreviewsReadyBatch {
   readonly updates: readonly PreviewPatchItem[];
   readonly completed: number;
   readonly total: number;
+}
+
+export interface ThumbnailRenderProgress {
+  readonly active: boolean;
+  readonly completed: number;
+  readonly total: number;
+  readonly mode: ThumbnailPreviewMode;
 }
 
 export interface PendingAmbiguousEntry {
@@ -250,6 +260,9 @@ export interface StudioGateway {
   isDesktopRuntime(): boolean;
   subscribeScanProgress(listener: (progress: ScanProgressUpdate) => void): () => void;
   subscribePreviewsReady?(listener: (batch: PreviewsReadyBatch) => void): () => void;
+  subscribeThumbnailRenderProgress?(
+    listener: (progress: ThumbnailRenderProgress) => void,
+  ): () => void;
   subscribeModelDownloadProgress?(listener: (progress: ModelDownloadProgress) => void): () => void;
   checkRuntimeInfo(): Promise<RuntimeInfo | null>;
   checkModelsManifest?(): Promise<ModelManifestStatus | null>;
@@ -308,11 +321,20 @@ export interface StudioGateway {
     folderId: string | null,
   ): Promise<StudioSessionSnapshot | null>;
   autoLevelClusterEyes(clusterId: string): Promise<StudioSessionSnapshot | null>;
+  peekDevelopWorkingBuffer?(
+    photoId: string,
+    maxDim?: number,
+    precision?: WorkingBufferPrecision,
+  ): DevelopWorkingBuffer | null;
   loadDevelopWorkingBuffer?(
     photoId: string,
     maxDim?: number,
     precision?: WorkingBufferPrecision,
   ): Promise<DevelopWorkingBuffer | null>;
+  render32BitThumbnails?(
+    mode: ThumbnailPreviewMode,
+    photoIds?: readonly string[],
+  ): Promise<void>;
   generateAiMask?(photoId: string, kind: AiMaskKind): Promise<GeneratedAiMaskResult | null>;
   savePhotoDevelopRecipe(photoId: string, recipe: DevelopRecipe): Promise<LiveRgbHistogram | null>;
   savePhotoDevelopRecipesBatch?(

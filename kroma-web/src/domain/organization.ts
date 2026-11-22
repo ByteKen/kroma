@@ -157,3 +157,37 @@ export function formatExportPreviewPath(
 
   return rendered.replace(/\/{2,}/g, '/');
 }
+
+/**
+ * Deduplicates colliding relative output paths case-insensitively (e.g. when a subject cluster
+ * contains both `DSC05928.ARW` and `DSC05928.jpg` and exports both as `.jpg` with `[Original_Name]`).
+ * Appends `_2`, `_3`, etc. before the file extension so every photo is preserved on disk.
+ */
+export function allocateUniqueExportPath(
+  candidatePath: string,
+  usedLowerPaths: Set<string>,
+): string {
+  const key = candidatePath.toLowerCase();
+  if (!usedLowerPaths.has(key)) {
+    usedLowerPaths.add(key);
+    return candidatePath;
+  }
+
+  const slashIdx = candidatePath.lastIndexOf('/');
+  const dirPrefix = slashIdx >= 0 ? candidatePath.slice(0, slashIdx + 1) : '';
+  const fileName = slashIdx >= 0 ? candidatePath.slice(slashIdx + 1) : candidatePath;
+  const dotIdx = fileName.lastIndexOf('.');
+  const stem = dotIdx > 0 ? fileName.slice(0, dotIdx) : fileName;
+  const extSuffix = dotIdx > 0 ? fileName.slice(dotIdx) : '';
+
+  let suffix = 2;
+  while (true) {
+    const nextCandidate = `${dirPrefix}${stem}_${suffix}${extSuffix}`;
+    const nextKey = nextCandidate.toLowerCase();
+    if (!usedLowerPaths.has(nextKey)) {
+      usedLowerPaths.add(nextKey);
+      return nextCandidate;
+    }
+    suffix += 1;
+  }
+}

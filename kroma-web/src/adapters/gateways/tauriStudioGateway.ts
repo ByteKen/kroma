@@ -22,6 +22,7 @@ import type {
   StorageCacheSummary,
   StudioGateway,
   StudioSessionSnapshot,
+  ThumbnailRenderProgress,
 } from '../../application/ports/studioGateway';
 import {
   createDefaultDevelopRecipe,
@@ -40,6 +41,7 @@ import type { SubjectCluster } from '../../domain/identity';
 import type { AiMaskKind, GeneratedAiMaskResult } from '../../domain/masking';
 import { DEFAULT_OUTPUT_NAMING_RULE } from '../../domain/organization';
 import type { PhotoAsset, YuNetFaceOverlay } from '../../domain/photo';
+import type { ThumbnailPreviewMode } from '../../domain/preferences';
 import type {
   ClusterSlateOcrResult,
   OcrTextLine,
@@ -70,6 +72,7 @@ interface PhotoDto {
   readonly virtualFolderId?: string | null;
   readonly sourcePath: string;
   readonly previewPath: string;
+  readonly renderedPreviewPath?: string | null;
   readonly fileSizeBytes?: number;
   readonly isSlateAnchor: boolean;
   readonly clusterId: string | null;
@@ -192,6 +195,9 @@ function mapPhotoDto(dto: PhotoDto): PhotoAsset {
     directoryId: dto.directoryId,
     virtualFolderId: dto.virtualFolderId ?? null,
     imageUrl: toWebViewAssetUrl(dto.previewPath),
+    renderedThumbnailUrl: dto.renderedPreviewPath
+      ? toWebViewAssetUrl(dto.renderedPreviewPath)
+      : null,
     fileSizeBytes: dto.fileSizeBytes,
     isSlateAnchor: dto.isSlateAnchor,
     clusterId: dto.clusterId,
@@ -343,6 +349,7 @@ function mapSessionDto(
  * via `run_face_clustering` without losing any saved `.kroma.json` edits.
  */
 export class TauriStudioGateway implements StudioGateway {
+  private static readonly MAX_DEVELOP_BUFFER_LRU = 12;
   private hasLoadedLocalShoot = false;
   private cachedRuntimeStatus: RuntimeInfo | null = null;
   private readonly developBufferLru = new Map<string, DevelopWorkingBuffer | null>();
@@ -380,7 +387,9 @@ export class TauriStudioGateway implements StudioGateway {
   subscribePreviewsReady(listener: (batch: PreviewsReadyBatch) => void): () => void {
     interface WirePreviewPatch {
       readonly photoId: string;
-      readonly previewPath: string;
+      readonly previewPath?: string | null;
+      readonly renderedPreviewPath?: string | null;
+      readonly clearRenderedPreview?: boolean;
       readonly capturedAtEpochSec: number | null;
       readonly capturedAtLabel: string | null;
     }
@@ -398,11 +407,37 @@ export class TauriStudioGateway implements StudioGateway {
           total: event.payload.total,
           updates: event.payload.updates.map((u) => ({
             photoId: u.photoId,
-            imageUrl: toWebViewAssetUrl(u.previewPath),
+            imageUrl: u.previewPath ? toWebViewAssetUrl(u.previewPath) : null,
+            renderedThumbnailUrl: u.renderedPreviewPath
+              ? toWebViewAssetUrl(u.renderedPreviewPath)
+              : null,
+            clearRenderedThumbnail: Boolean(u.clearRenderedPreview),
             capturedAtEpochSec: u.capturedAtEpochSec,
             capturedAtLabel: u.capturedAtLabel,
           })),
         });
+      }
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+      } else {
+        unlistenFn = unlisten;
+      }
+    });
+    return () => {
+      disposed = true;
+      unlistenFn?.();
+    };
+  }
+
+  subscribeThumbnailRenderProgress(
+    listener: (progress: ThumbnailRenderProgress) => void,
+  ): () => void {
+    let disposed = false;
+    let unlistenFn: (() => void) | null = null;
+    void listen<ThumbnailRenderProgress>('kroma://thumbnail-render-progress', (event) => {
+      if (!disposed) {
+        listener(event.payload);
       }
     }).then((unlisten) => {
       if (disposed) {
@@ -782,6 +817,24 @@ export class TauriStudioGateway implements StudioGateway {
     return mapSessionDto(dto, this.cachedRuntimeStatus);
   }
 
+  peekDevelopWorkingBuffer(
+    photoId: string,
+    maxDim = 1600,
+    precision: WorkingBufferPrecision = 'f16',
+  ): DevelopWorkingBuffer | null {
+    if (!this.hasLoadedLocalShoot) {
+      return null;
+    }
+    const cacheKey = `${photoId}@${maxDim}@${precision}`;
+    if (!this.developBufferLru.has(cacheKey)) {
+      return null;
+    }
+    const hit = this.developBufferLru.get(cacheKey) ?? null;
+    this.developBufferLru.delete(cacheKey);
+    this.developBufferLru.set(cacheKey, hit);
+    return hit;
+  }
+
   async loadDevelopWorkingBuffer(
     photoId: string,
     maxDim = 1600,
@@ -809,7 +862,7 @@ export class TauriStudioGateway implements StudioGateway {
     })
       .then((raw) => {
         const parsed = raw instanceof ArrayBuffer ? parseDevelopWorkingBuffer(raw) : null;
-        if (this.developBufferLru.size >= 3) {
+        if (this.developBufferLru.size >= TauriStudioGateway.MAX_DEVELOP_BUFFER_LRU) {
           const oldestKey = this.developBufferLru.keys().next().value;
           if (oldestKey !== undefined) {
             this.developBufferLru.delete(oldestKey);
@@ -825,6 +878,19 @@ export class TauriStudioGateway implements StudioGateway {
 
     this.inFlightDevelopBuffers.set(cacheKey, request);
     return request;
+  }
+
+  async render32BitThumbnails(
+    mode: ThumbnailPreviewMode,
+    photoIds?: readonly string[],
+  ): Promise<void> {
+    if (!this.hasLoadedLocalShoot) {
+      return;
+    }
+    await invoke<void>('render_32bit_thumbnails', {
+      mode,
+      photoIds: photoIds && photoIds.length > 0 ? [...photoIds] : null,
+    });
   }
 
   async savePhotoDevelopRecipe(

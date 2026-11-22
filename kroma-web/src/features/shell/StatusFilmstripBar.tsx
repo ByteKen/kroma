@@ -15,9 +15,10 @@ export function StatusFilmstripBar() {
     runtimeInfo,
     isScanningFolder,
     scanProgress,
+    thumbnailRenderProgress,
+    developViewportStatus,
     activeWorkspace,
     manualMatchSplitOpen,
-    runFaceOrganizer,
     statusBanner,
     canUndo,
     canRedo,
@@ -62,6 +63,35 @@ export function StatusFilmstripBar() {
 
   const isFloatingDockVisible =
     Boolean(session) && activeWorkspace === 'culling' && !manualMatchSplitOpen;
+  const thumbProgressPct =
+    thumbnailRenderProgress && thumbnailRenderProgress.total > 0
+      ? Math.min(
+          100,
+          Math.max(
+            0,
+            Math.round((thumbnailRenderProgress.completed / thumbnailRenderProgress.total) * 100),
+          ),
+        )
+      : null;
+  const backendTag = developViewportStatus?.backend === 'webgpu' ? 'WEBGPU' : 'WEBGL2';
+  const developTelemetryLabel = developViewportStatus
+    ? developViewportStatus.state === 'decoding'
+      ? developViewportStatus.precision === 'f32'
+        ? 'Decoding 32-bit RAW…'
+        : 'Decoding 16-bit RAW…'
+      : developViewportStatus.precision === 'f32'
+        ? developViewportStatus.isRawDemosaic
+          ? `32-BIT RAW • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
+          : `32-BIT FLOAT • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
+        : developViewportStatus.isRawDemosaic
+          ? `16-BIT RAW • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
+          : `16-BIT FLOAT • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
+    : null;
+  const developTelemetryTooltip = developViewportStatus
+    ? developViewportStatus.state === 'decoding'
+      ? `Demosaicing ${developViewportStatus.precision === 'f32' ? '32-bit' : '16-bit'} scene-linear wide-gamut Rec.2020 RAW for Studio…`
+      : `${developViewportStatus.precision === 'f32' ? '32-bit' : '16-bit'} ${developViewportStatus.isRawDemosaic ? 'Scene-Linear Wide-Gamut Rec.2020 RAW' : 'High-Bit-Depth Float'} • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
+    : '';
   const appInfoLabel = isDesktopRuntime ? `Kroma v${appVersion}` : `Kroma v${appVersion} • Preview`;
   const appInfoTooltip = isDesktopRuntime
     ? [
@@ -128,52 +158,72 @@ export function StatusFilmstripBar() {
         )}
       </div>
 
-      {/* Right: Contextual Compact Actions (only when Floating Dock is hidden) + App Version Info */}
+      {/* Right: Undo/Redo (when Floating Dock is hidden) + 32-Bit Decode & Preview Progress + App Version */}
       <div className="flex items-center gap-2 shrink-0">
-        {session && !isFloatingDockVisible && (
+        {session && !isFloatingDockVisible && (canUndo || canRedo) && (
           <div className="flex items-center gap-1">
-            {(canUndo || canRedo) && (
-              <>
-                <DarkroomButton
-                  variant="ghost"
-                  size="xs"
-                  icon="undo"
-                  tooltipSide="top"
-                  disabled={!canUndo || isScanningFolder}
-                  onClick={() => void undoOrganizationAction()}
-                  title={undoLabel ? `Undo ${undoLabel} (${undoKey})` : `Undo (${undoKey})`}
-                  aria-label="Undo organization change"
-                  className="h-5 px-1"
-                />
-                <DarkroomButton
-                  variant="ghost"
-                  size="xs"
-                  icon="redo"
-                  tooltipSide="top"
-                  disabled={!canRedo || isScanningFolder}
-                  onClick={() => void redoOrganizationAction()}
-                  title={redoLabel ? `Redo ${redoLabel} (${redoKey})` : `Redo (${redoKey})`}
-                  aria-label="Redo organization change"
-                  className="h-5 px-1"
-                />
-              </>
-            )}
-
-            {!session.isClustered && (
-              <DarkroomButton
-                variant="emerald"
-                size="xs"
-                icon="face"
-                tooltipSide="top"
-                disabled={isScanningFolder}
-                onClick={() => void runFaceOrganizer()}
-                title="Group photos by face"
-                className="h-5 px-2 text-[10px]"
-              >
-                <span>Organize by Face</span>
-              </DarkroomButton>
-            )}
+            <DarkroomButton
+              variant="ghost"
+              size="xs"
+              icon="undo"
+              tooltipSide="top"
+              disabled={!canUndo || isScanningFolder}
+              onClick={() => void undoOrganizationAction()}
+              title={undoLabel ? `Undo ${undoLabel} (${undoKey})` : `Undo (${undoKey})`}
+              aria-label="Undo organization change"
+              className="h-5 px-1"
+            />
+            <DarkroomButton
+              variant="ghost"
+              size="xs"
+              icon="redo"
+              tooltipSide="top"
+              disabled={!canRedo || isScanningFolder}
+              onClick={() => void redoOrganizationAction()}
+              title={redoLabel ? `Redo ${redoLabel} (${redoKey})` : `Redo (${redoKey})`}
+              aria-label="Redo organization change"
+              className="h-5 px-1"
+            />
           </div>
+        )}
+
+        {thumbnailRenderProgress?.active && thumbProgressPct !== null && (
+          <DarkroomTooltip
+            content={`Rendering 32-bit linear grid & filmstrip previews (${thumbnailRenderProgress.completed}/${thumbnailRenderProgress.total}) — change anytime in Settings → Performance`}
+            side="top"
+          >
+            <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-surface-active/80 border border-amber-core/35 tabular-nums-mono text-[9.5px] text-amber-soft shrink-0">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-core animate-pulse shrink-0" />
+              <span>
+                32-bit Previews {thumbnailRenderProgress.completed}/{thumbnailRenderProgress.total}
+              </span>
+              <div className="w-10 h-1 rounded-full bg-canvas border border-hairline overflow-hidden shrink-0">
+                <div
+                  className="h-full bg-amber-core transition-all duration-150"
+                  style={{ width: `${thumbProgressPct}%` }}
+                />
+              </div>
+            </div>
+          </DarkroomTooltip>
+        )}
+
+        {isStudio && developViewportStatus && developTelemetryLabel && (
+          <DarkroomTooltip content={developTelemetryTooltip} side="top">
+            {developViewportStatus.state === 'decoding' ? (
+              <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-surface-active/80 border border-emerald-focus/35 tabular-nums-mono text-[9.5px] text-emerald-bright shrink-0">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-focus animate-pulse shrink-0" />
+                <span>{developTelemetryLabel}</span>
+              </div>
+            ) : (
+              <TelemetryPill
+                tone={developViewportStatus.isRawDemosaic ? 'emerald' : 'amber'}
+                dot
+                className="py-0.5 px-2 text-[9.5px] shrink-0"
+              >
+                {developTelemetryLabel}
+              </TelemetryPill>
+            )}
+          </DarkroomTooltip>
         )}
 
         <DarkroomTooltip content={appInfoTooltip} side="top">

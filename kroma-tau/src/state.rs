@@ -12,16 +12,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 
 const MAX_ORGANIZATION_HISTORY: usize = 50;
-const MAX_DEVELOP_BUFFER_CACHE: usize = 4;
+const MAX_DEVELOP_BUFFER_CACHE: usize = 12;
 
-/// Cached 16-bit half-float `KR16` working buffer + compact 384px linear histogram proxy
-/// for instant Studio Develop photo switching and zero-I/O live RAW histograms.
+/// Cached 16-bit half-float `KR16` / 32-bit float `KR32` working buffer + compact linear
+/// proxies (`384px` histogram proxy + `640px` thumbnail proxy) for instant Studio Develop photo
+/// switching, zero-I/O live RAW histograms, and ~4ms 32-bit thumbnail updates on slider edits.
 #[derive(Debug, Clone)]
 pub struct CachedDevelopBuffer {
     pub cache_key: String,
     pub source_path: String,
     pub kr16_bytes: Arc<Vec<u8>>,
     pub hist_buffer: Arc<DecodedDevelopBuffer>,
+    pub thumb_buffer: Arc<DecodedDevelopBuffer>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +118,8 @@ pub struct ActiveShootContext {
     pub photo_file_sizes: HashMap<String, u64>,
     /// Maps photo_id -> cached fast JPEG preview path (or web-native source path) for WebView rendering
     pub preview_paths: HashMap<String, String>,
+    /// Maps photo_id -> optional 32-bit rendered JPEG thumbnail path matching its current recipe
+    pub rendered_preview_paths: HashMap<String, String>,
     /// Maps original source_path -> fast preview path for AI scanning
     pub source_to_preview: HashMap<String, String>,
     /// Maps photo_id -> relative directory bucket id
@@ -144,6 +148,7 @@ pub struct AppState {
     pub model_download_cancel: Arc<AtomicBool>,
     pub active_shoot: Arc<Mutex<Option<ActiveShootContext>>>,
     pub load_generation: Arc<AtomicU64>,
+    pub thumbnail_render_generation: Arc<AtomicU64>,
     pub custom_yunet_path: Arc<Mutex<Option<PathBuf>>>,
     pub custom_recognizer_path: Arc<Mutex<Option<PathBuf>>>,
     pub custom_segmenter_path: Arc<Mutex<Option<PathBuf>>>,
@@ -168,6 +173,7 @@ impl AppState {
             model_download_cancel: Arc::new(AtomicBool::new(false)),
             active_shoot: Arc::new(Mutex::new(None)),
             load_generation: Arc::new(AtomicU64::new(0)),
+            thumbnail_render_generation: Arc::new(AtomicU64::new(0)),
             custom_yunet_path: Arc::new(Mutex::new(None)),
             custom_recognizer_path: Arc::new(Mutex::new(None)),
             custom_segmenter_path: Arc::new(Mutex::new(None)),

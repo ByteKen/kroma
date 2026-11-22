@@ -33,6 +33,7 @@ import type {
   StorageCacheSummary,
   StudioGateway,
   StudioSessionSnapshot,
+  ThumbnailRenderProgress,
 } from '../application/ports/studioGateway';
 import {
   filterClusterPhotos,
@@ -87,6 +88,7 @@ import {
   DEFAULT_STUDIO_PREFERENCES,
   normalizeStudioPreferences,
   type StudioPreferences,
+  type ThumbnailPreviewMode,
 } from '../domain/preferences';
 import {
   removeRecentProject,
@@ -133,6 +135,15 @@ export interface AmbiguousReviewItem {
   readonly source: 'backend_queue' | 'cluster_low_confidence';
 }
 
+export interface DevelopViewportStatus {
+  readonly state: 'decoding' | 'ready';
+  readonly precision: WorkingBufferPrecision;
+  readonly isRawDemosaic: boolean;
+  readonly backend: 'webgpu' | 'webgl2';
+  readonly width?: number;
+  readonly height?: number;
+}
+
 interface StudioContextValue {
   // Queries
   isDesktopRuntime: boolean;
@@ -146,6 +157,8 @@ interface StudioContextValue {
   isScanningOcr: boolean;
   slateOcrResults: readonly ClusterSlateOcrResult[];
   scanProgress: ScanProgressUpdate | null;
+  thumbnailRenderProgress: ThumbnailRenderProgress | null;
+  developViewportStatus: DevelopViewportStatus | null;
   exportJob: ExportJobState | null;
   runtimeInfo: RuntimeInfo | null;
   session: StudioSessionSnapshot | null;
@@ -229,6 +242,7 @@ interface StudioContextValue {
   setManualMatchSplitOpen: (open: boolean) => void;
   setStudioFocusMode: (enabled: boolean) => void;
   toggleStudioFocusMode: () => void;
+  setDevelopViewportStatus: (status: DevelopViewportStatus | null) => void;
   setActiveDevelopPhotoId: (photoId: string) => void;
   toggleDirectoryFilter: (directoryId: string) => void;
   setActiveVirtualFolderId: (filter: VirtualFolderFilter) => void;
@@ -255,6 +269,11 @@ interface StudioContextValue {
   toggleLandmarksOverlay: () => void;
   togglePhotoSelection: (photoId: string, options?: { readonly shiftKey?: boolean }) => void;
   selectAllVisiblePhotos: () => void;
+  peekDevelopWorkingBuffer: (
+    photoId: string,
+    maxDim?: number,
+    precision?: WorkingBufferPrecision,
+  ) => DevelopWorkingBuffer | null;
   loadDevelopWorkingBuffer: (
     photoId: string,
     maxDim?: number,
@@ -334,6 +353,10 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
   const [isScanningOcr, setIsScanningOcr] = useState(false);
   const [slateOcrResults, setSlateOcrResults] = useState<readonly ClusterSlateOcrResult[]>([]);
   const [scanProgress, setScanProgress] = useState<ScanProgressUpdate | null>(null);
+  const [thumbnailRenderProgress, setThumbnailRenderProgress] =
+    useState<ThumbnailRenderProgress | null>(null);
+  const [developViewportStatus, setDevelopViewportStatus] =
+    useState<DevelopViewportStatus | null>(null);
   const [exportJob, setExportJob] = useState<ExportJobState | null>(null);
   const [activeWorkspace, setActiveWorkspaceState] = useState<WorkspaceView>('home');
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -434,10 +457,20 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
   const lastSelectedPhotoIdRef = useRef<string | null>(null);
   const sessionRef = useRef<StudioSessionSnapshot | null>(null);
   const developHistoryRef = useRef<DevelopHistoryStack>(EMPTY_DEVELOP_HISTORY);
+  const thumbnailPreviewModeRef = useRef<ThumbnailPreviewMode>(preferences.thumbnailPreviewMode);
   const isDesktopRuntime = gateway.isDesktopRuntime();
 
   sessionRef.current = session;
   developHistoryRef.current = developHistory;
+  thumbnailPreviewModeRef.current = preferences.thumbnailPreviewMode;
+
+  const request32BitThumbnails = useCallback(
+    (mode: ThumbnailPreviewMode, photoIds?: readonly string[]) => {
+      if (!isDesktopRuntime || !gateway.render32BitThumbnails) return;
+      void gateway.render32BitThumbnails(mode, photoIds).catch(() => { });
+    },
+    [isDesktopRuntime, gateway],
+  );
 
   const findPhotoRecipe = useCallback((photoId: string): DevelopRecipe | null => {
     const current = sessionRef.current;
@@ -483,11 +516,15 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
         batchItems.push({ photoId: change.photoId, recipe: nextRecipe });
       }
 
+      const changedIds = batchItems.map((item) => item.photoId);
       if (gateway.savePhotoDevelopRecipesBatch) {
         void gateway
           .savePhotoDevelopRecipesBatch(batchItems, activeDevelopPhotoId)
           .then((hist) => {
             if (hist) setLiveHistogram(hist);
+            if (thumbnailPreviewModeRef.current !== 'fast') {
+              request32BitThumbnails(thumbnailPreviewModeRef.current, changedIds);
+            }
           })
           .catch((err) => {
             setStatusBanner(`Undo/redo save error: ${String(err)}`);
@@ -500,12 +537,15 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
               if (hist && item.photoId === activeDevelopPhotoId) {
                 setLiveHistogram(hist);
               }
+              if (thumbnailPreviewModeRef.current !== 'fast') {
+                request32BitThumbnails(thumbnailPreviewModeRef.current, [item.photoId]);
+              }
             })
             .catch(() => { });
         }
       }
     },
-    [gateway, activeDevelopPhotoId],
+    [gateway, activeDevelopPhotoId, request32BitThumbnails],
   );
 
   useEffect(() => {
@@ -555,6 +595,8 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
         next.customSegmenterModelPath !== preferences.customSegmenterModelPath;
       const gpuChanged = next.enableGpuAcceleration !== preferences.enableGpuAcceleration;
       const cacheDirChanged = next.customCacheDir !== preferences.customCacheDir;
+      const thumbnailModeChanged =
+        next.thumbnailPreviewMode !== preferences.thumbnailPreviewMode;
 
       if (modelsChanged && isDesktopRuntime && gateway.setCustomAiModels) {
         try {
@@ -602,6 +644,12 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
 
       setPreferences(next);
       saveStudioPreferencesToStorage(next);
+      if (sessionRef.current && (thumbnailModeChanged || cacheDirChanged)) {
+        if (next.thumbnailPreviewMode === 'fast') {
+          setThumbnailRenderProgress(null);
+        }
+        request32BitThumbnails(next.thumbnailPreviewMode);
+      }
       notifyAction('Settings applied');
       return true;
     },
@@ -611,15 +659,18 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       preferences.customSegmenterModelPath,
       preferences.enableGpuAcceleration,
       preferences.customCacheDir,
+      preferences.thumbnailPreviewMode,
       preferences.defaultSubjectSortMode,
       isDesktopRuntime,
       gateway,
+      request32BitThumbnails,
       notifyAction,
     ],
   );
 
   const resetPreferences = useCallback(() => {
     const defaults = { ...DEFAULT_STUDIO_PREFERENCES };
+    const modeChanged = preferences.thumbnailPreviewMode !== defaults.thumbnailPreviewMode;
     setPreferences(defaults);
     saveStudioPreferencesToStorage(defaults);
     if (isDesktopRuntime && gateway.setCustomAiModels) {
@@ -630,8 +681,17 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
         })
         .catch(() => { });
     }
+    if (sessionRef.current && modeChanged) {
+      request32BitThumbnails(defaults.thumbnailPreviewMode);
+    }
     notifyAction('Settings restored to factory defaults');
-  }, [isDesktopRuntime, gateway, notifyAction]);
+  }, [
+    isDesktopRuntime,
+    gateway,
+    preferences.thumbnailPreviewMode,
+    request32BitThumbnails,
+    notifyAction,
+  ]);
 
   const pickOnnxModelFile = useCallback(async (): Promise<string | null> => {
     if (!isDesktopRuntime || !gateway.pickOnnxModelFile) {
@@ -825,6 +885,24 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       try {
         const result = await gateway.clearStorageCache(target);
         if (result) {
+          if (target === 'previews' || target === 'all') {
+            setThumbnailRenderProgress(null);
+            setSession((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                clusters: prev.clusters.map((cluster) => ({
+                  ...cluster,
+                  photos: cluster.photos.map((photo) =>
+                    photo.renderedThumbnailUrl ? { ...photo, renderedThumbnailUrl: null } : photo,
+                  ),
+                })),
+              };
+            });
+            if (sessionRef.current && thumbnailPreviewModeRef.current !== 'fast') {
+              request32BitThumbnails(thumbnailPreviewModeRef.current);
+            }
+          }
           const label =
             target === 'previews'
               ? 'RAW preview cache'
@@ -843,7 +921,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
         return null;
       }
     },
-    [gateway, notifyAction],
+    [gateway, request32BitThumbnails, notifyAction],
   );
 
   const applyLoadedSession = useCallback(
@@ -890,7 +968,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     setBootPhase('checking_updates');
     const [updateResult] = await Promise.all([
       checkGithubForAppUpdate(detectedAppVersionRef.current),
-      initialSessionPromiseRef.current.catch(() => {}),
+      initialSessionPromiseRef.current.catch(() => { }),
     ]);
     if (!mountedRef.current) return;
     if (updateResult.status === 'update_available') {
@@ -997,6 +1075,10 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       if (!active) return;
       setModelDownloadProgress(progress);
     });
+    const unsubscribeThumbnailProgress = gateway.subscribeThumbnailRenderProgress?.((progress) => {
+      if (!active) return;
+      setThumbnailRenderProgress(progress.active && progress.total > 0 ? progress : null);
+    });
     const unsubscribePreviews = gateway.subscribePreviewsReady?.((batch) => {
       if (!active || batch.updates.length === 0) return;
       const patchById = new Map(batch.updates.map((u) => [u.photoId, u]));
@@ -1006,14 +1088,20 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
           ...prev,
           clusters: prev.clusters.map((cluster) => {
             const anchorPatch = patchById.get(cluster.anchor.anchorPhotoId);
-            let changed = Boolean(anchorPatch);
+            let changed = Boolean(anchorPatch?.imageUrl);
             const nextPhotos = cluster.photos.map((photo) => {
               const patch = patchById.get(photo.id);
               if (!patch) return photo;
               changed = true;
+              const nextRendered = patch.clearRenderedThumbnail
+                ? null
+                : patch.renderedThumbnailUrl !== undefined && patch.renderedThumbnailUrl !== null
+                  ? patch.renderedThumbnailUrl
+                  : photo.renderedThumbnailUrl;
               return {
                 ...photo,
-                imageUrl: patch.imageUrl,
+                imageUrl: patch.imageUrl ?? photo.imageUrl,
+                renderedThumbnailUrl: nextRendered,
                 capturedAtEpochSec: patch.capturedAtEpochSec ?? photo.capturedAtEpochSec,
                 capturedAtLabel: patch.capturedAtLabel ?? photo.capturedAtLabel,
               };
@@ -1021,7 +1109,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
             if (!changed) return cluster;
             return {
               ...cluster,
-              anchor: anchorPatch
+              anchor: anchorPatch?.imageUrl
                 ? { ...cluster.anchor, thumbnailUrl: anchorPatch.imageUrl }
                 : cluster.anchor,
               photos: nextPhotos,
@@ -1117,6 +1205,9 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
         if (!active || !loaded) return;
         applyLoadedSession(loaded);
         recordRecentFromSnapshot(loaded);
+        if (initialPrefs.thumbnailPreviewMode !== 'fast') {
+          request32BitThumbnails(initialPrefs.thumbnailPreviewMode);
+        }
         setActiveWorkspace(loaded.isClustered ? initialPrefs.defaultOpenWorkspace : 'develop');
       } catch {
         // Ignore startup session errors cleanly
@@ -1169,6 +1260,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       mountedRef.current = false;
       unsubscribe();
       unsubscribeModelProgress?.();
+      unsubscribeThumbnailProgress?.();
       unsubscribePreviews?.();
       const pendingItems: { photoId: string; recipe: DevelopRecipe }[] = [];
       for (const [pendingPhotoId, pending] of pendingRecipeSavesRef.current.entries()) {
@@ -1190,6 +1282,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     gateway,
     applyLoadedSession,
     recordRecentFromSnapshot,
+    request32BitThumbnails,
     updatePreferences,
     setActiveWorkspace,
     downloadModelsForStartup,
@@ -1372,8 +1465,12 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       if (loaded) {
         setDevelopHistory(EMPTY_DEVELOP_HISTORY);
         setSlateOcrResults([]);
+        setThumbnailRenderProgress(null);
         applyLoadedSession(loaded);
         recordRecentFromSnapshot(loaded);
+        if (thumbnailPreviewModeRef.current !== 'fast') {
+          request32BitThumbnails(thumbnailPreviewModeRef.current);
+        }
         const restoredSubjects = loaded.clusters.filter((c) => !c.anchor.id.startsWith('_')).length;
         setActiveWorkspace(loaded.isClustered ? preferences.defaultOpenWorkspace : 'develop');
         notifyAction(
@@ -1397,6 +1494,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     preferences.defaultOpenWorkspace,
     applyLoadedSession,
     recordRecentFromSnapshot,
+    request32BitThumbnails,
     setActiveWorkspace,
     notifyAction,
   ]);
@@ -1415,8 +1513,12 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
         const loaded = await gateway.openShootFolderAtPath(folderPath);
         if (loaded) {
           setDevelopHistory(EMPTY_DEVELOP_HISTORY);
+          setThumbnailRenderProgress(null);
           applyLoadedSession(loaded);
           recordRecentFromSnapshot(loaded);
+          if (thumbnailPreviewModeRef.current !== 'fast') {
+            request32BitThumbnails(thumbnailPreviewModeRef.current);
+          }
           const restoredSubjects = loaded.clusters.filter((c) => !c.anchor.id.startsWith('_')).length;
           setActiveWorkspace(loaded.isClustered ? preferences.defaultOpenWorkspace : 'develop');
           notifyAction(
@@ -1439,6 +1541,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       preferences.defaultOpenWorkspace,
       applyLoadedSession,
       recordRecentFromSnapshot,
+      request32BitThumbnails,
       setActiveWorkspace,
       notifyAction,
     ],
@@ -1904,6 +2007,18 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     );
   }, [visibleClusterPhotos]);
 
+  const peekDevelopWorkingBuffer = useCallback(
+    (
+      photoId: string,
+      maxDim = 1600,
+      precision: WorkingBufferPrecision = 'f16',
+    ): DevelopWorkingBuffer | null => {
+      if (!gateway.peekDevelopWorkingBuffer) return null;
+      return gateway.peekDevelopWorkingBuffer(photoId, maxDim, precision);
+    },
+    [gateway],
+  );
+
   const loadDevelopWorkingBuffer = useCallback(
     async (
       photoId: string,
@@ -1972,6 +2087,9 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
           .savePhotoDevelopRecipe(photoId, nextRecipe)
           .then((hist) => {
             if (hist) setLiveHistogram(hist);
+            if (thumbnailPreviewModeRef.current !== 'fast') {
+              request32BitThumbnails(thumbnailPreviewModeRef.current, [photoId]);
+            }
           })
           .catch((err) => {
             notifyAction(`Sidecar save error: ${String(err)}`);
@@ -1979,7 +2097,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       }, 240);
       pendingRecipeSavesRef.current.set(photoId, { timerId, recipe: nextRecipe });
     },
-    [findPhotoRecipe, gateway, notifyAction],
+    [findPhotoRecipe, gateway, request32BitThumbnails, notifyAction],
   );
 
   const flushPendingRecipeSaves = useCallback(async () => {
@@ -2016,10 +2134,10 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
           if (photo.id === sourcePhotoId) return photo;
           const shouldUpdate =
             scope === 'entire_shoot'
-              ? !photo.isSlateAnchor
+              ? true
               : scope === 'selected_in_cluster'
-                ? selectedPhotoIds.has(photo.id) && !photo.isSlateAnchor
-                : activePoolIds.has(photo.id) && !photo.isSlateAnchor;
+                ? selectedPhotoIds.has(photo.id)
+                : activePoolIds.has(photo.id);
           if (!shouldUpdate) return photo;
           const after = syncDevelopRecipe(photo.developRecipe, src, mask);
           targetIds.push(photo.id);
@@ -2031,6 +2149,13 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       });
 
       if (changes.length > 0) {
+        for (const id of [sourcePhotoId, ...targetIds]) {
+          const pending = pendingRecipeSavesRef.current.get(id);
+          if (pending) {
+            window.clearTimeout(pending.timerId);
+            pendingRecipeSavesRef.current.delete(id);
+          }
+        }
         setDevelopHistory((prev) =>
           recordDevelopHistory(prev, {
             label: `Sync Settings (${changes.length})`,
@@ -2042,10 +2167,15 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
         notifyAction(`Synced Develop settings across ${targetIds.length} photo(s)`);
         void gateway
           .syncDevelopRecipeToPhotos(sourcePhotoId, targetIds, src, mask)
+          .then(() => {
+            if (thumbnailPreviewModeRef.current !== 'fast') {
+              request32BitThumbnails(thumbnailPreviewModeRef.current, targetIds);
+            }
+          })
           .catch((err) => notifyAction(`Sync error: ${String(err)}`));
       }
     },
-    [findPhotoRecipe, developPhotos, selectedPhotoIds, gateway, notifyAction],
+    [findPhotoRecipe, developPhotos, selectedPhotoIds, gateway, request32BitThumbnails, notifyAction],
   );
 
   const applyRelativeNudgeToClusterSelection = useCallback(
@@ -2074,6 +2204,13 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       });
 
       if (changes.length > 0) {
+        for (const id of nudgedIds) {
+          const pending = pendingRecipeSavesRef.current.get(id);
+          if (pending) {
+            window.clearTimeout(pending.timerId);
+            pendingRecipeSavesRef.current.delete(id);
+          }
+        }
         setDevelopHistory((prev) =>
           recordDevelopHistory(prev, {
             label: `Quick Develop (${label})`,
@@ -2085,10 +2222,15 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
         notifyAction(`Quick Develop ${label} applied to ${nudgedIds.length} photo(s)`);
         void gateway
           .applyRelativeDevelopDeltaToPhotos(nudgedIds, delta)
+          .then(() => {
+            if (thumbnailPreviewModeRef.current !== 'fast') {
+              request32BitThumbnails(thumbnailPreviewModeRef.current, nudgedIds);
+            }
+          })
           .catch((err) => notifyAction(`Quick Develop error: ${String(err)}`));
       }
     },
-    [developPhotos, selectedPhotoIds, activeDevelopPhoto, gateway, notifyAction],
+    [developPhotos, selectedPhotoIds, activeDevelopPhoto, gateway, request32BitThumbnails, notifyAction],
   );
 
   const copyActiveRecipe = useCallback(() => {
@@ -2120,6 +2262,13 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     });
 
     if (changes.length > 0) {
+      for (const id of pastedIds) {
+        const pending = pendingRecipeSavesRef.current.get(id);
+        if (pending) {
+          window.clearTimeout(pending.timerId);
+          pendingRecipeSavesRef.current.delete(id);
+        }
+      }
       setDevelopHistory((prev) =>
         recordDevelopHistory(prev, {
           label: `Paste Recipe (${changes.length})`,
@@ -2135,15 +2284,33 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
           .savePhotoDevelopRecipesBatch(batchItems, activeDevelopPhoto?.id ?? null)
           .then((hist) => {
             if (hist) setLiveHistogram(hist);
+            if (thumbnailPreviewModeRef.current !== 'fast') {
+              request32BitThumbnails(thumbnailPreviewModeRef.current, pastedIds);
+            }
           })
           .catch(() => { });
       } else {
         for (const item of batchItems) {
-          void gateway.savePhotoDevelopRecipe(item.photoId, item.recipe).catch(() => { });
+          void gateway
+            .savePhotoDevelopRecipe(item.photoId, item.recipe)
+            .then(() => {
+              if (thumbnailPreviewModeRef.current !== 'fast') {
+                request32BitThumbnails(thumbnailPreviewModeRef.current, [item.photoId]);
+              }
+            })
+            .catch(() => { });
         }
       }
     }
-  }, [copiedRecipe, developPhotos, selectedPhotoIds, activeDevelopPhoto, gateway, notifyAction]);
+  }, [
+    copiedRecipe,
+    developPhotos,
+    selectedPhotoIds,
+    activeDevelopPhoto,
+    gateway,
+    request32BitThumbnails,
+    notifyAction,
+  ]);
 
   const mergeClustersById = useCallback(
     async (sourceClusterId: string, targetClusterId: string) => {
@@ -2234,6 +2401,12 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       const updated = await gateway.autoLevelClusterEyes(activeCluster.anchor.id);
       if (updated) {
         applyLoadedSession(updated, activeCluster.anchor.id);
+        if (thumbnailPreviewModeRef.current !== 'fast') {
+          request32BitThumbnails(
+            thumbnailPreviewModeRef.current,
+            activeCluster.photos.map((p) => p.id),
+          );
+        }
         notifyAction(
           `Auto-leveled eye horizon across ${activeCluster.anchor.subjectName}`,
         );
@@ -2241,7 +2414,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     } catch (err) {
       notifyAction(`Auto-level failed: ${String(err)}`);
     }
-  }, [activeCluster, gateway, applyLoadedSession, notifyAction]);
+  }, [activeCluster, gateway, applyLoadedSession, request32BitThumbnails, notifyAction]);
 
   const resolveAmbiguousReview = useCallback(
     (photoId: string, decision: 'approve' | 'split') => {
@@ -2499,12 +2672,15 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
             ),
           };
         });
+        if (thumbnailPreviewModeRef.current !== 'fast') {
+          request32BitThumbnails(thumbnailPreviewModeRef.current, targetIds);
+        }
         notifyAction(
           `Synced neutral White Balance (${wb.temperatureKelvin}K) across ${activeCluster.anchor.subjectName}`,
         );
       })
       .catch((err) => notifyAction(`Auto WB calibration failed: ${String(err)}`));
-  }, [activeCluster, gateway, notifyAction]);
+  }, [activeCluster, gateway, request32BitThumbnails, notifyAction]);
 
   const canUndo = session?.history?.canUndo ?? false;
   const canRedo = session?.history?.canRedo ?? false;
@@ -2754,12 +2930,13 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
   }, [isDesktopRuntime, gateway, notifyAction]);
 
   const exitApp = useCallback(async (): Promise<void> => {
+    await flushPendingRecipeSaves();
     if (isDesktopRuntime && gateway.exitApp) {
       await gateway.exitApp();
       return;
     }
     notifyAction('Exit App is available in Kroma Desktop');
-  }, [isDesktopRuntime, gateway, notifyAction]);
+  }, [flushPendingRecipeSaves, isDesktopRuntime, gateway, notifyAction]);
 
   const sessionWithSortedClusters = useMemo(() => {
     if (!session) return null;
@@ -2778,6 +2955,8 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     isScanningOcr,
     slateOcrResults,
     scanProgress,
+    thumbnailRenderProgress,
+    developViewportStatus,
     exportJob,
     runtimeInfo,
     session: sessionWithSortedClusters,
@@ -2859,6 +3038,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     setManualMatchSplitOpen,
     setStudioFocusMode,
     toggleStudioFocusMode,
+    setDevelopViewportStatus,
     setActiveDevelopPhotoId: handleSetActiveDevelopPhotoId,
     toggleDirectoryFilter,
     setActiveVirtualFolderId,
@@ -2879,6 +3059,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     toggleLandmarksOverlay,
     togglePhotoSelection,
     selectAllVisiblePhotos,
+    peekDevelopWorkingBuffer,
     loadDevelopWorkingBuffer,
     generateAiMask,
     updatePhotoRecipe,

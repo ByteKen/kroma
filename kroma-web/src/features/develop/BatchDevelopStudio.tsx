@@ -10,6 +10,7 @@ import {
   type DevelopRecipe,
 } from '../../domain/develop';
 import { rgbToHsl } from '../../domain/developShaderMath';
+import { shouldProbeHighBitDepthBuffer } from '../../domain/developWorkingBuffer';
 import { isFaceOnlySlateCode } from '../../domain/identity';
 import {
   aiMaskKindLabel,
@@ -41,6 +42,7 @@ import {
 } from '../slates/SubjectHoverPreviewCard';
 import {
   BeforeAfterCanvas,
+  DEVELOP_WORKING_MAX_DIM,
   type CompareViewportMode,
   type ViewportZoomLevel,
 } from './BeforeAfterCanvas';
@@ -72,6 +74,8 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
   isActive = true,
 }: BatchDevelopStudioProps) {
   const {
+    isDesktopRuntime,
+    preferences,
     session,
     activeCluster,
     developSourceMode,
@@ -91,6 +95,8 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
     selectCluster,
     setActiveDevelopPhotoId,
     togglePhotoSelection,
+    peekDevelopWorkingBuffer,
+    loadDevelopWorkingBuffer,
     generateAiMask,
     updatePhotoRecipe,
     syncRecipeFromPhoto,
@@ -277,6 +283,41 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
       img.src = url;
     }
   }, [isActive, activePhotoIndex, developPhotos]);
+
+  // Quietly pre-decode adjacent RAW working buffers (+1, -1, +2) after a brief dwell so stepping
+  // forward or back in Studio hits the in-memory LRU cache in 0 ms without competing with the active frame.
+  const workingMaxDim = preferences.studioPreviewMaxDim ?? DEVELOP_WORKING_MAX_DIM;
+  useEffect(() => {
+    if (!isActive || !isDesktopRuntime || activePhotoIndex < 0 || developPhotos.length <= 1) {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        for (const offset of [1, -1, 2]) {
+          if (cancelled) return;
+          const idx = activePhotoIndex + offset;
+          if (idx < 0 || idx >= developPhotos.length) continue;
+          const neighbor = developPhotos[idx];
+          if (!neighbor || !shouldProbeHighBitDepthBuffer(neighbor.fileName)) continue;
+          if (peekDevelopWorkingBuffer(neighbor.id, workingMaxDim, 'f16')) continue;
+          await loadDevelopWorkingBuffer(neighbor.id, workingMaxDim, 'f16');
+        }
+      })();
+    }, 140);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    isActive,
+    isDesktopRuntime,
+    activePhotoIndex,
+    developPhotos,
+    workingMaxDim,
+    peekDevelopWorkingBuffer,
+    loadDevelopWorkingBuffer,
+  ]);
 
   const currentMasks = activeDevelopPhoto?.developRecipe.masks ?? [];
   const currentBgRemoval =
@@ -1293,6 +1334,7 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
               >
                 <GradedThumbnailImg
                   src={photo.imageUrl}
+                  renderedSrc={photo.renderedThumbnailUrl}
                   alt={photo.fileName}
                   recipe={photo.developRecipe}
                   loading="lazy"
@@ -1300,7 +1342,7 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
                   className="w-full h-full object-cover"
                 />
 
-                {!photo.isSlateAnchor && !isActive && (
+                {!isActive && (
                   <button
                     type="button"
                     onClick={(e) => {

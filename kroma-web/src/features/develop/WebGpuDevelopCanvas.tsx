@@ -59,7 +59,7 @@ interface WebGpuDevelopCanvasProps extends DevelopViewportCanvasProps {
   readonly onUnavailable?: () => void;
 }
 
-const MAX_WORK_DIM = 2048;
+const MAX_WORK_DIM = 2560;
 
 function f16BitsToF32(h: number): number {
   const sign = (h & 0x8000) !== 0 ? -1 : 1;
@@ -1057,7 +1057,9 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
     };
   }, []);
 
-  // Upload 32-bit float (`KR32` `rgba32float`) or 16-bit half-float (`KR16` upconverted to f32) working buffer
+  // Upload 16-bit half-float (`KR16` `rgba16float`) or 32-bit float (`KR32` `rgba32float`) working buffer
+  // directly to GPU texture memory without JS float conversion loops; all downstream compute passes
+  // (`grade_pass.wgsl`, `mask_pass.wgsl`, `spatial_pass.wgsl`) execute in 32-bit `rgba32float`.
   useEffect(() => {
     if (!gpuReady || !workingBuffer) return;
     const res = resRef.current;
@@ -1069,32 +1071,39 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
     }
 
     try {
-      let floatData: Float32Array;
-      if (workingBuffer.float32Rgba) {
-        floatData = workingBuffer.float32Rgba;
-      } else if (workingBuffer.halfFloatRgba) {
-        const src16 = workingBuffer.halfFloatRgba;
-        floatData = new Float32Array(src16.length);
-        for (let i = 0; i < src16.length; i++) {
-          floatData[i] = f16BitsToF32(src16[i]!);
-        }
+      let tex: GPUTexture;
+      if (workingBuffer.halfFloatRgba) {
+        res.srcTex?.destroy();
+        tex = device.createTexture({
+          label: 'kroma-src-rgba16f',
+          size: [workingBuffer.width, workingBuffer.height],
+          format: 'rgba16float',
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        queue.writeTexture(
+          { texture: tex },
+          workingBuffer.halfFloatRgba as Uint16Array<ArrayBuffer>,
+          { bytesPerRow: workingBuffer.width * 8, rowsPerImage: workingBuffer.height },
+          [workingBuffer.width, workingBuffer.height],
+        );
+      } else if (workingBuffer.float32Rgba) {
+        res.srcTex?.destroy();
+        tex = device.createTexture({
+          label: 'kroma-src-rgba32f',
+          size: [workingBuffer.width, workingBuffer.height],
+          format: 'rgba32float',
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        queue.writeTexture(
+          { texture: tex },
+          workingBuffer.float32Rgba as Float32Array<ArrayBuffer>,
+          { bytesPerRow: workingBuffer.width * 16, rowsPerImage: workingBuffer.height },
+          [workingBuffer.width, workingBuffer.height],
+        );
       } else {
         return;
       }
 
-      res.srcTex?.destroy();
-      const tex = device.createTexture({
-        label: 'kroma-src-rgba32f',
-        size: [workingBuffer.width, workingBuffer.height],
-        format: 'rgba32float',
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-      });
-      queue.writeTexture(
-        { texture: tex },
-        floatData as Float32Array<ArrayBuffer>,
-        { bytesPerRow: workingBuffer.width * 16, rowsPerImage: workingBuffer.height },
-        [workingBuffer.width, workingBuffer.height],
-      );
       res.srcTex = tex;
       imgSizeRef.current = { w: workingBuffer.width, h: workingBuffer.height };
       inputLinearRef.current = workingBuffer.isLinear;

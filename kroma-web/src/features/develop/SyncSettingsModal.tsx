@@ -96,17 +96,17 @@ export function SyncSettingsModal({
   const selectedTargetPhotos = useMemo(
     () =>
       allProjectPhotos.filter(
-        (p) => selectedPhotoIds.has(p.id) && p.id !== sourcePhoto.id && !p.isSlateAnchor,
+        (p) => selectedPhotoIds.has(p.id) && p.id !== sourcePhoto.id,
       ),
     [allProjectPhotos, selectedPhotoIds, sourcePhoto.id],
   );
   const selectedCount = selectedTargetPhotos.length;
   const scopeTargetCount = useMemo(
-    () => scopePhotos.filter((p) => !p.isSlateAnchor && p.id !== sourcePhoto.id).length,
+    () => scopePhotos.filter((p) => p.id !== sourcePhoto.id).length,
     [scopePhotos, sourcePhoto.id],
   );
   const projectTargetCount = useMemo(
-    () => allProjectPhotos.filter((p) => !p.isSlateAnchor && p.id !== sourcePhoto.id).length,
+    () => allProjectPhotos.filter((p) => p.id !== sourcePhoto.id).length,
     [allProjectPhotos, sourcePhoto.id],
   );
 
@@ -116,9 +116,9 @@ export function SyncSettingsModal({
       return selectedTargetPhotos;
     }
     if (scope === 'entire_cluster') {
-      return scopePhotos.filter((p) => !p.isSlateAnchor && p.id !== sourcePhoto.id);
+      return scopePhotos.filter((p) => p.id !== sourcePhoto.id);
     }
-    return allProjectPhotos.filter((p) => !p.isSlateAnchor && p.id !== sourcePhoto.id);
+    return allProjectPhotos.filter((p) => p.id !== sourcePhoto.id);
   }, [open, scope, scopePhotos, allProjectPhotos, selectedTargetPhotos, sourcePhoto.id]);
 
   const previewTargets = useMemo(() => targetPhotos.slice(0, MAX_PREVIEW_TARGETS), [targetPhotos]);
@@ -244,6 +244,7 @@ export function SyncSettingsModal({
             <div className="relative h-[86px] w-[68px] rounded-md overflow-hidden border border-amber-core/70 bg-surface-lowest">
               <GradedThumbnailImg
                 src={sourcePhoto.imageUrl}
+                renderedSrc={sourcePhoto.renderedThumbnailUrl}
                 alt={sourcePhoto.fileName}
                 recipe={sourcePhoto.developRecipe}
                 loading="eager"

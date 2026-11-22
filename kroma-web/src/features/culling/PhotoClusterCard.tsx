@@ -107,6 +107,7 @@ export function PhotoClusterCard({
       >
         <GradedThumbnailImg
           src={photo.imageUrl}
+          renderedSrc={photo.renderedThumbnailUrl}
           alt={photo.fileName}
           recipe={photo.developRecipe}
           draggable={false}
@@ -119,7 +120,10 @@ export function PhotoClusterCard({
             }
           }}
           style={{
-            transform: rotation !== 0 ? `rotate(${rotation}deg) scale(1.05)` : undefined,
+            transform:
+              !photo.renderedThumbnailUrl && rotation !== 0
+                ? `rotate(${rotation}deg) scale(1.05)`
+                : undefined,
           }}
           className="w-full h-full object-cover transition-transform duration-200 group-hover:scale-[1.02]"
         />

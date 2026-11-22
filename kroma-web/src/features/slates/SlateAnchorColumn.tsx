@@ -478,6 +478,7 @@ export function SlateAnchorColumn() {
                     return repPhoto ? (
                       <GradedThumbnailImg
                         src={anchor.thumbnailUrl}
+                        renderedSrc={repPhoto.renderedThumbnailUrl}
                         alt={anchor.subjectName}
                         recipe={repPhoto.developRecipe}
                         draggable={false}
