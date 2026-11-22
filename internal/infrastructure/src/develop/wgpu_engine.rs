@@ -354,7 +354,12 @@ impl WgpuDevelopEngine {
         // Pack source RGB32F into RGBA32F on CPU before acquiring GPU lock
         let src_raw = buffer.image.as_raw();
         let mut src_rgba = vec![0.0_f32; (src_w as usize) * (src_h as usize) * 4];
-        for (dst, src) in src_rgba.chunks_exact_mut(4).zip(src_raw.chunks_exact(3)) {
+        for (dst, src) in src_rgba
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(src_raw.as_chunks::<3>().0)
+        {
             dst[0] = src[0];
             dst[1] = src[1];
             dst[2] = src[2];

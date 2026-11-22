@@ -429,14 +429,10 @@ fn looks_like_metadata_tag(cleaned: &str) -> bool {
     }
     // Single-token Bachelor of Science degree acronyms like BSARC, BSIT, BSCE, BSBA, BSHM, BSN
     let compact = cleaned.trim_end_matches('.');
-    if !compact.contains(' ')
+    !compact.contains(' ')
         && (3..=8).contains(&compact.len())
         && compact.chars().all(|c| c.is_ascii_alphabetic())
         && compact.to_ascii_uppercase().starts_with("BS")
-    {
-        return true;
-    }
-    false
 }
 
 fn merge_same_baseline_lines(lines: &[&OcrTextLine]) -> Vec<OcrTextLine> {
