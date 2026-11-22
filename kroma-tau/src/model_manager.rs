@@ -1,5 +1,6 @@
 use crate::dto::{
-    ModelDownloadProgressDto, ModelManifestEntryStatusDto, ModelManifestStatusDto,
+    AppUpdateDownloadProgressDto, ModelDownloadProgressDto, ModelManifestEntryStatusDto,
+    ModelManifestStatusDto,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub const MODEL_DOWNLOAD_PROGRESS_EVENT: &str = "kroma://model-download-progress";
+pub const APP_UPDATE_PROGRESS_EVENT: &str = "kroma://app-update-progress";
 
 const EMBEDDED_MODELS_MANIFEST: &str = include_str!("../../models/models.json");
 const INSTALLED_INDEX_FILE: &str = "installed.json";
@@ -505,6 +507,117 @@ where
     inspect_manifest_status(manifest, managed_models_dir, fallback_search_dirs)
 }
 
+pub fn sanitize_installer_file_name(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.chars().any(char::is_control)
+    {
+        return Err(format!("invalid installer filename '{raw}'"));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.ends_with(".exe") || lower.ends_with(".msi") || lower.ends_with(".dmg")) {
+        return Err(format!(
+            "unsupported installer extension in '{raw}' (expected .exe, .msi, or .dmg)"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Streams a desktop installer bundle (`.exe`, `.msi`, or `.dmg`) from GitHub Releases into
+/// `%TEMP%/kroma_updates/<asset_name>`, emitting live progress updates for the in-app updater modal.
+pub fn download_app_update_installer<F>(
+    url: &str,
+    asset_name: &str,
+    expected_size: u64,
+    mut on_progress: F,
+) -> Result<PathBuf, String>
+where
+    F: FnMut(AppUpdateDownloadProgressDto),
+{
+    let trimmed_url = url.trim();
+    if !trimmed_url.starts_with("https://") || trimmed_url.chars().any(char::is_control) {
+        return Err("Update download URL must use https://".to_string());
+    }
+    let safe_name = sanitize_installer_file_name(asset_name)?;
+    let updates_dir = std::env::temp_dir().join("kroma_updates");
+    fs::create_dir_all(&updates_dir)
+        .map_err(|err| format!("failed to prepare updates directory: {err}"))?;
+    let dest = updates_dir.join(&safe_name);
+
+    on_progress(AppUpdateDownloadProgressDto {
+        phase: "downloading",
+        asset_name: safe_name.clone(),
+        downloaded_bytes: 0,
+        total_bytes: expected_size,
+        bytes_per_second: 0,
+    });
+
+    let agent = build_download_agent();
+    let mut response = agent
+        .get(trimmed_url)
+        .header(
+            "User-Agent",
+            concat!("KromaDesktop/", env!("CARGO_PKG_VERSION")),
+        )
+        .call()
+        .map_err(|err| format!("Could not download {safe_name}: {err}"))?;
+
+    let response_len = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&len| len > 0);
+    let expected_total = if expected_size > 0 {
+        expected_size
+    } else {
+        response_len.unwrap_or(0)
+    };
+
+    let started_at = Instant::now();
+    let mut last_emit = Instant::now();
+    let mut reader = response.body_mut().as_reader();
+    let cancel_flag = AtomicBool::new(false);
+
+    let (written, _) = stream_and_verify_to_file(
+        &mut reader,
+        &dest,
+        expected_size,
+        "",
+        &cancel_flag,
+        |downloaded| {
+            let now = Instant::now();
+            if now.duration_since(last_emit) >= PROGRESS_EMIT_INTERVAL
+                || (expected_total > 0 && downloaded >= expected_total)
+            {
+                last_emit = now;
+                let elapsed_secs = started_at.elapsed().as_secs_f64().max(0.05);
+                let bps = (downloaded as f64 / elapsed_secs).round().max(0.0) as u64;
+                on_progress(AppUpdateDownloadProgressDto {
+                    phase: "downloading",
+                    asset_name: safe_name.clone(),
+                    downloaded_bytes: downloaded,
+                    total_bytes: expected_total.max(downloaded),
+                    bytes_per_second: bps,
+                });
+            }
+        },
+    )?;
+
+    on_progress(AppUpdateDownloadProgressDto {
+        phase: "launching",
+        asset_name: safe_name,
+        downloaded_bytes: written,
+        total_bytes: expected_total.max(written),
+        bytes_per_second: 0,
+    });
+
+    Ok(dest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,6 +673,20 @@ mod tests {
             sanitize_relative_path("ocr/ppocrv5_mobile_det.onnx").unwrap(),
             PathBuf::from("ocr").join("ppocrv5_mobile_det.onnx")
         );
+    }
+
+    #[test]
+    fn sanitize_installer_file_name_accepts_exe_msi_dmg_and_rejects_traversal() {
+        assert_eq!(
+            sanitize_installer_file_name("Kroma_0.1.1_x64-setup.exe").unwrap(),
+            "Kroma_0.1.1_x64-setup.exe"
+        );
+        assert_eq!(
+            sanitize_installer_file_name("Kroma_0.1.1_aarch64.dmg").unwrap(),
+            "Kroma_0.1.1_aarch64.dmg"
+        );
+        assert!(sanitize_installer_file_name("../Kroma_0.1.1_x64-setup.exe").is_err());
+        assert!(sanitize_installer_file_name("Kroma_0.1.1.bat").is_err());
     }
 
     #[test]

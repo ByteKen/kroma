@@ -1,3 +1,5 @@
+import { isMacPlatform } from './platform';
+
 export const KROMA_GITHUB_REPO = 'ByteKen/kroma';
 export const KROMA_GITHUB_URL = `https://github.com/${KROMA_GITHUB_REPO}`;
 export const KROMA_RELEASES_URL = `${KROMA_GITHUB_URL}/releases`;
@@ -17,12 +19,16 @@ export interface AppUpdateCheckResult {
   readonly publishedAt: string | null;
   readonly changelogMarkdown: string | null;
   readonly changelogSource: ChangelogSource | null;
+  readonly installerAssetName?: string | null;
+  readonly installerDownloadUrl?: string | null;
+  readonly installerSizeBytes?: number | null;
   readonly message: string;
 }
 
 export interface GithubReleaseAssetPayload {
   readonly name?: string;
   readonly browser_download_url?: string;
+  readonly size?: number;
 }
 
 interface GithubReleasePayload {
@@ -199,6 +205,41 @@ function selectLatestDesktopRelease(
   return best;
 }
 
+/**
+ * Picks the best native desktop installer asset for the active OS from a GitHub Release's `assets` list:
+ * - macOS: prefers Apple Silicon (`aarch64.dmg` / `arm64.dmg`), then any `.dmg`
+ * - Windows: prefers NSIS (`setup.exe`), then any `.exe`, then `.msi`
+ */
+export function selectPlatformInstallerAsset(
+  assets: readonly GithubReleaseAssetPayload[] | undefined,
+  isMac = isMacPlatform(),
+): GithubReleaseAssetPayload | null {
+  if (!assets || assets.length === 0) return null;
+  const valid = assets.filter(
+    (a) =>
+      typeof a.name === 'string' &&
+      a.name.trim().length > 0 &&
+      typeof a.browser_download_url === 'string' &&
+      a.browser_download_url.startsWith('https://'),
+  );
+  if (valid.length === 0) return null;
+
+  if (isMac) {
+    return (
+      valid.find((a) => /(?:aarch64|arm64).*\.dmg$/i.test(a.name!)) ??
+      valid.find((a) => /\.dmg$/i.test(a.name!)) ??
+      null
+    );
+  }
+
+  return (
+    valid.find((a) => /setup\.exe$/i.test(a.name!)) ??
+    valid.find((a) => /\.exe$/i.test(a.name!)) ??
+    valid.find((a) => /\.msi$/i.test(a.name!)) ??
+    null
+  );
+}
+
 export async function checkGithubForAppUpdate(
   currentVersion: string,
   fetchFn: typeof fetch = fetch,
@@ -287,6 +328,8 @@ export async function checkGithubForAppUpdate(
         }
       }
 
+      const installerAsset = selectPlatformInstallerAsset(release.assets);
+
       return {
         status: 'update_available',
         currentVersion: normalizedCurrent,
@@ -296,6 +339,12 @@ export async function checkGithubForAppUpdate(
         publishedAt: release.published_at ?? null,
         changelogMarkdown,
         changelogSource,
+        installerAssetName: installerAsset?.name ?? null,
+        installerDownloadUrl: installerAsset?.browser_download_url ?? null,
+        installerSizeBytes:
+          typeof installerAsset?.size === 'number' && installerAsset.size > 0
+            ? installerAsset.size
+            : null,
         message: `Update available: v${latest} (you have v${normalizedCurrent}).`,
       };
     }

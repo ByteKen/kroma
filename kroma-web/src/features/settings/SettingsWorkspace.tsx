@@ -16,7 +16,12 @@ import {
   type AppUpdateCheckResult,
 } from '../../domain/appUpdates';
 import { formatByteSize } from '../../domain/exportEstimate';
-import { formatShortcutCombo, formatShortcutKey, isMacPlatform } from '../../domain/platform';
+import {
+  formatShortcutCombo,
+  formatShortcutKey,
+  isMacPlatform,
+  openExternalUrl,
+} from '../../domain/platform';
 import {
   countStudioPreferenceChanges,
   DEFAULT_STUDIO_PREFERENCES,
@@ -1760,7 +1765,11 @@ export function SettingsWorkspace() {
                                   href={KROMA_GITHUB_URL}
                                   target="_blank"
                                   rel="noreferrer"
-                                  className="text-amber-soft hover:underline"
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    void openExternalUrl(KROMA_GITHUB_URL);
+                                  }}
+                                  className="text-amber-soft hover:underline cursor-pointer"
                                 >
                                   github.com/{KROMA_GITHUB_REPO}
                                 </a>

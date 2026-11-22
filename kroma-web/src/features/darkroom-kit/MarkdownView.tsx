@@ -4,6 +4,7 @@ import {
   type MarkdownBlockNode,
   type MarkdownInlineNode,
 } from '../../domain/markdown';
+import { openExternalUrl } from '../../domain/platform';
 
 interface MarkdownViewProps {
   readonly markdown: string;
@@ -50,7 +51,11 @@ function renderInlineNodes(nodes: readonly MarkdownInlineNode[], keyPrefix: stri
             href={node.href}
             target="_blank"
             rel="noreferrer"
-            className="text-amber-soft underline decoration-amber-core/50 underline-offset-2 hover:text-amber-core transition-colors"
+            onClick={(e) => {
+              e.preventDefault();
+              void openExternalUrl(node.href);
+            }}
+            className="text-amber-soft underline decoration-amber-core/50 underline-offset-2 hover:text-amber-core transition-colors cursor-pointer"
           >
             {renderInlineNodes(node.children, key)}
           </a>

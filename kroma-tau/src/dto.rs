@@ -152,6 +152,16 @@ pub struct ModelDownloadOutcomeDto {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AppUpdateDownloadProgressDto {
+    pub phase: &'static str,
+    pub asset_name: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub bytes_per_second: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GeneratedAiMaskDto {
     pub kind: String,
     pub matte_width: u16,

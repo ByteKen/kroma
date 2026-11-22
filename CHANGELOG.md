@@ -19,6 +19,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Portrait RAW Orientation in 32-Bit Studio & Export:** Added explicit EXIF IFD orientation fallback when camera RAW decoders report `Orientation::Normal`, fixing sideways portrait `.ARW`, `.CR2`, and `.NEF` frames after 32-bit decoding.
 - **Subfolder `.kroma.json` Sidecar Reloading:** Fixed sanitized sidecar filename mapping so saved adjustments inside subfolders with spaces, commas, or symbols restore reliably when reopening a project.
 - **Same-Stem RAW + JPEG Export Filename Collision:** Disambiguated duplicate output filenames within the same folder (e.g., `DSC05928.ARW` + `DSC05928.jpg` both exporting to `.jpg`) using `_2`, `_3` suffixes so no photo is overwritten.
+- **Desktop External Browser Links (`Download Update` & `About`):** Added native in-app update installer downloading & launching (`download_and_install_app_update` with live progress bar) plus a native OS browser launcher (`open_external_url`) for external links on Windows and macOS.
 
 ## [0.1.0] - 2026-11-22
 

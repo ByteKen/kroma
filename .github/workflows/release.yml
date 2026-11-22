@@ -120,25 +120,52 @@ jobs:
       - name: Build Kroma Desktop Windows installers
         run: npm --prefix kroma-web run tauri:build
 
-      - name: Stage Windows installers
+      - name: Stage Windows installers & portable archive
         shell: pwsh
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
+          $ver = $env:VERSION
           $outDir = "release-artifacts"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-          $installers = @()
-          $installers += Get-ChildItem -Path "target/release/bundle/nsis" -Filter "*.exe" -ErrorAction SilentlyContinue
-          $installers += Get-ChildItem -Path "target/release/bundle/msi" -Filter "*.msi" -ErrorAction SilentlyContinue
+          $nsis = Get-ChildItem -Path "target/release/bundle/nsis" -Filter "*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $msi = Get-ChildItem -Path "target/release/bundle/msi" -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
 
-          if ($installers.Count -eq 0) {
+          if (-not $nsis -and -not $msi) {
             Write-Error "No Windows installer bundles (.exe/.msi) were produced under target/release/bundle/."
             exit 1
           }
 
-          foreach ($file in $installers) {
-            Copy-Item -Path $file.FullName -Destination (Join-Path $outDir $file.Name) -Force
-            Write-Host "Staged $($file.Name) ($($file.Length) bytes)"
+          if ($nsis) {
+            $destExe = Join-Path $outDir "Kroma-${ver}_Windows_x64-setup.exe"
+            Copy-Item -Path $nsis.FullName -Destination $destExe -Force
+            Write-Host "Staged $(Split-Path $destExe -Leaf) ($((Get-Item $destExe).Length) bytes)"
           }
+
+          if ($msi) {
+            $destMsi = Join-Path $outDir "Kroma-${ver}_Windows_x64.msi"
+            Copy-Item -Path $msi.FullName -Destination $destMsi -Force
+            Write-Host "Staged $(Split-Path $destMsi -Leaf) ($((Get-Item $destMsi).Length) bytes)"
+          }
+
+          $binPath = "target/release/kroma-desktop.exe"
+          if (-not (Test-Path $binPath)) {
+            Write-Error "Missing portable binary at $binPath"
+            exit 1
+          }
+          $portableStage = "portable-stage/Kroma-${ver}_Windows_x86_64"
+          New-Item -ItemType Directory -Force -Path $portableStage | Out-Null
+          Copy-Item -Path $binPath -Destination (Join-Path $portableStage "Kroma.exe") -Force
+          Get-ChildItem -Path "target/release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item -Path $_.FullName -Destination (Join-Path $portableStage $_.Name) -Force
+          }
+          if (Test-Path "README.md") { Copy-Item "README.md" -Destination $portableStage -Force }
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" -Destination $portableStage -Force }
+
+          $destZip = Join-Path $outDir "Kroma-${ver}_Windows_x86_64.zip"
+          Compress-Archive -Path "$portableStage/*" -DestinationPath $destZip -Force
+          Write-Host "Staged $(Split-Path $destZip -Leaf) ($((Get-Item $destZip).Length) bytes)"
 
       - name: Upload Windows installer artifacts
         uses: actions/upload-artifact@v4
@@ -149,7 +176,7 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    name: Build macOS Installer (Apple Silicon arm64)
+    name: Build macOS Installers & Portable Archives (Apple Silicon arm64)
     needs: verify
     runs-on: macos-latest
     steps:
@@ -179,11 +206,13 @@ jobs:
       - name: Run Rust tests on Apple Silicon host
         run: cargo test --workspace
 
-      - name: Build Kroma Desktop macOS DMG (aarch64-apple-darwin)
-        run: npm --prefix kroma-web run tauri:build -- --target aarch64-apple-darwin --bundles dmg
+      - name: Build Kroma Desktop macOS App & DMG (aarch64-apple-darwin)
+        run: npm --prefix kroma-web run tauri:build -- --target aarch64-apple-darwin --bundles app,dmg
 
-      - name: Stage macOS DMG installer
+      - name: Stage macOS DMG, ZIP, and TAR.GZ archives
         shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
           mkdir -p release-artifacts
           shopt -s nullglob
@@ -192,16 +221,20 @@ jobs:
             echo "Error: No macOS .dmg bundle produced under target/aarch64-apple-darwin/release/bundle/dmg/." >&2
             exit 1
           fi
-          for f in "${dmgs[@]}"; do
-            cp "$f" release-artifacts/
-            ls -lh "release-artifacts/$(basename "$f")"
-          done
+          cp "${dmgs[0]}" "release-artifacts/Kroma-${VERSION}_MacOS_arm64.dmg"
 
-      - name: Upload macOS DMG artifact
+          app_bundle="target/aarch64-apple-darwin/release/bundle/macos/Kroma.app"
+          if [ -d "$app_bundle" ]; then
+            ditto -c -k --sequesterRsrc --keepParent "$app_bundle" "release-artifacts/Kroma-${VERSION}_MacOS_arm64.zip"
+            tar -czf "release-artifacts/Kroma-${VERSION}_MacOS_arm64.tar.gz" -C "target/aarch64-apple-darwin/release/bundle/macos" "Kroma.app"
+          fi
+          ls -lh release-artifacts/
+
+      - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
           name: kroma-macos-aarch64
-          path: release-artifacts/*.dmg
+          path: release-artifacts/*
           retention-days: 14
           if-no-files-found: error
 
@@ -219,8 +252,25 @@ jobs:
           node-version: "22"
 
       - name: Extract Markdown release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          node scripts/release-check.mjs --extract-changelog "${{ needs.verify.outputs.version }}" > release-notes.md
+          node scripts/release-check.mjs --extract-changelog "$VERSION" > release-notes.md
+          cat <<EOF >> release-notes.md
+
+          ---
+
+          ### Downloads by Operating System
+
+          | Operating System | Format | File |
+          | :--- | :--- | :--- |
+          | **Windows (64-bit \`x86_64\`)** | Setup Installer (Recommended) | \`Kroma-${VERSION}_Windows_x64-setup.exe\` |
+          | **Windows (64-bit \`x86_64\`)** | MSI Installer | \`Kroma-${VERSION}_Windows_x64.msi\` |
+          | **Windows (64-bit \`x86_64\`)** | Portable ZIP (No install required) | \`Kroma-${VERSION}_Windows_x86_64.zip\` |
+          | **macOS (Apple Silicon \`arm64\`)** | Disk Image Installer (Recommended) | \`Kroma-${VERSION}_MacOS_arm64.dmg\` |
+          | **macOS (Apple Silicon \`arm64\`)** | Portable App Bundle (\`.zip\`) | \`Kroma-${VERSION}_MacOS_arm64.zip\` |
+          | **macOS (Apple Silicon \`arm64\`)** | Portable App Bundle (\`.tar.gz\`) | \`Kroma-${VERSION}_MacOS_arm64.tar.gz\` |
+          EOF
           cat release-notes.md
 
       - name: Download all platform installer artifacts
@@ -233,7 +283,7 @@ jobs:
         shell: bash
         run: |
           cd release-artifacts
-          sha256sum *.exe *.msi *.dmg | sort -k2 > SHA256SUMS.txt
+          sha256sum *.exe *.msi *.dmg *.zip *.tar.gz | sort -k2 > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
@@ -249,5 +299,7 @@ jobs:
             release-artifacts/*.exe
             release-artifacts/*.msi
             release-artifacts/*.dmg
+            release-artifacts/*.zip
+            release-artifacts/*.tar.gz
             release-artifacts/SHA256SUMS.txt
             CHANGELOG.md

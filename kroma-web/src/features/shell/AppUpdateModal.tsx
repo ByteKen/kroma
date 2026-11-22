@@ -1,8 +1,21 @@
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { AnimatePresence, motion } from 'framer-motion';
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
+import { isTauriDesktopEnvironment } from '../../adapters/gateways/tauriStudioGateway';
 import kromaLogo from '../../assets/kroma-logo.png';
 import type { AppUpdateCheckResult } from '../../domain/appUpdates';
+import { formatByteSize } from '../../domain/exportEstimate';
+import { openExternalUrl } from '../../domain/platform';
 import { DarkroomButton, FAST_FADE, MarkdownView, SOFT_SPRING } from '../darkroom-kit';
+
+interface AppUpdateDownloadProgress {
+  readonly phase: 'downloading' | 'launching' | 'completed';
+  readonly assetName: string;
+  readonly downloadedBytes: number;
+  readonly totalBytes: number;
+  readonly bytesPerSecond: number;
+}
 
 interface AppUpdateModalProps {
   readonly isOpen: boolean;
@@ -23,17 +36,86 @@ function formatPublishedDate(iso: string | null): string | null {
 }
 
 export function AppUpdateModal({ isOpen, update, mode, onDismiss }: AppUpdateModalProps) {
+  const [isInstalling, setIsInstalling] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState<AppUpdateDownloadProgress | null>(null);
+  const [installError, setInstallError] = useState<string | null>(null);
+  const isDesktop = isTauriDesktopEnvironment();
+  const canInstallNatively = Boolean(
+    isDesktop && update?.installerDownloadUrl && update?.installerAssetName,
+  );
+
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      setIsInstalling(false);
+      setDownloadProgress(null);
+      setInstallError(null);
+      return;
+    }
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
+      if (event.key === 'Escape' && !isInstalling) {
         event.preventDefault();
         onDismiss();
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isOpen, onDismiss]);
+  }, [isOpen, isInstalling, onDismiss]);
+
+  useEffect(() => {
+    if (!isOpen || !isDesktop) return;
+    let disposed = false;
+    let unlistenFn: (() => void) | null = null;
+    void listen<AppUpdateDownloadProgress>('kroma://app-update-progress', (event) => {
+      if (!disposed) {
+        setDownloadProgress(event.payload);
+      }
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+      } else {
+        unlistenFn = unlisten;
+      }
+    });
+    return () => {
+      disposed = true;
+      unlistenFn?.();
+    };
+  }, [isOpen, isDesktop]);
+
+  const handleInstallOrDownload = async () => {
+    if (!update) return;
+    if (!canInstallNatively || !update.installerDownloadUrl || !update.installerAssetName) {
+      void openExternalUrl(update.releaseUrl);
+      return;
+    }
+    setIsInstalling(true);
+    setInstallError(null);
+    try {
+      await invoke<string>('download_and_install_app_update', {
+        url: update.installerDownloadUrl,
+        assetName: update.installerAssetName,
+        sizeBytes: update.installerSizeBytes ?? null,
+      });
+    } catch (err) {
+      setIsInstalling(false);
+      setDownloadProgress(null);
+      setInstallError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const progressPct = (() => {
+    if (!downloadProgress) return 0;
+    if (downloadProgress.phase === 'launching' || downloadProgress.phase === 'completed') {
+      return 100;
+    }
+    if (downloadProgress.totalBytes > 0) {
+      return Math.min(
+        99,
+        Math.max(2, Math.round((downloadProgress.downloadedBytes / downloadProgress.totalBytes) * 100)),
+      );
+    }
+    return 15;
+  })();
 
   const publishedLabel = formatPublishedDate(update?.publishedAt ?? null);
   const latestVersion = update?.latestVersion ?? '';
@@ -140,27 +222,99 @@ export function AppUpdateModal({ isOpen, update, mode, onDismiss }: AppUpdateMod
               )}
             </div>
 
-            {/* Footer Actions */}
-            <footer className="shrink-0 px-6 py-3.5 border-t border-hairline bg-surface/70 flex items-center justify-between gap-3">
-              <span className="text-[11px] text-ink-telemetry truncate">
-                {mode === 'startup'
-                  ? 'You can update now or continue into Kroma.'
-                  : 'Downloads open in your default browser.'}
-              </span>
+            {/* Footer Actions & Native In-App Installer Progress */}
+            <footer className="shrink-0 px-6 py-3.5 border-t border-hairline bg-surface/70 flex flex-col gap-2.5">
+              {isInstalling && (
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between gap-2 tabular-nums-mono text-[10.5px]">
+                    <span className="text-ink-primary truncate">
+                      {downloadProgress?.phase === 'launching'
+                        ? `Launching ${update.installerAssetName ?? 'installer'}… Kroma will close momentarily.`
+                        : `Downloading ${update.installerAssetName ?? `v${latestVersion}`}…`}
+                    </span>
+                    <span className="text-amber-soft shrink-0">
+                      {progressPct}%
+                      {downloadProgress && downloadProgress.totalBytes > 0
+                        ? ` · ${formatByteSize(downloadProgress.downloadedBytes)} / ${formatByteSize(downloadProgress.totalBytes)}`
+                        : ''}
+                      {downloadProgress && downloadProgress.bytesPerSecond > 0
+                        ? ` · ${formatByteSize(downloadProgress.bytesPerSecond)}/s`
+                        : ''}
+                    </span>
+                  </div>
+                  <div className="h-1.5 w-full rounded-full bg-canvas overflow-hidden border border-hairline">
+                    <div
+                      className="h-full bg-amber-core transition-all duration-150"
+                      style={{ width: `${progressPct}%` }}
+                    />
+                  </div>
+                </div>
+              )}
 
-              <div className="flex items-center gap-2 shrink-0">
-                <DarkroomButton variant="ghost" size="sm" onClick={onDismiss}>
-                  {mode === 'startup' ? 'Remind Me Later' : 'Close'}
-                </DarkroomButton>
-                <a
-                  href={update.releaseUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-lg bg-amber-core text-amber-ink font-display text-[12px] font-bold hover:brightness-110 active:scale-[0.98] transition-all shadow-[0_2px_10px_rgba(245,158,11,0.28)]"
-                >
-                  <span className="material-symbols-outlined text-[15px]">download</span>
-                  Download Update
-                </a>
+              {installError && (
+                <div className="px-3 py-2 rounded-lg bg-crimson-clip/10 border border-crimson-clip/40 flex items-center justify-between gap-2 text-[11px] text-crimson-clip">
+                  <span className="truncate">{installError}</span>
+                  <button
+                    type="button"
+                    onClick={() => void openExternalUrl(update.releaseUrl)}
+                    className="shrink-0 underline font-semibold cursor-pointer"
+                  >
+                    Open in Browser
+                  </button>
+                </div>
+              )}
+
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-[11px] text-ink-telemetry truncate">
+                    {canInstallNatively
+                      ? `Direct installer${update.installerSizeBytes ? ` (${formatByteSize(update.installerSizeBytes)})` : ''}`
+                      : mode === 'startup'
+                        ? 'You can update now or continue into Kroma.'
+                        : 'Downloads open in your default browser.'}
+                  </span>
+                  {canInstallNatively && (
+                    <button
+                      type="button"
+                      onClick={() => void openExternalUrl(update.releaseUrl)}
+                      className="text-[11px] text-amber-soft hover:underline shrink-0 cursor-pointer"
+                    >
+                      GitHub Release
+                    </button>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <DarkroomButton
+                    variant="ghost"
+                    size="sm"
+                    disabled={isInstalling}
+                    onClick={onDismiss}
+                  >
+                    {mode === 'startup' ? 'Remind Me Later' : 'Close'}
+                  </DarkroomButton>
+                  <button
+                    type="button"
+                    disabled={isInstalling}
+                    onClick={() => void handleInstallOrDownload()}
+                    className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-lg bg-amber-core text-amber-ink font-display text-[12px] font-bold hover:brightness-110 active:scale-[0.98] disabled:opacity-60 transition-all shadow-[0_2px_10px_rgba(245,158,11,0.28)] cursor-pointer"
+                  >
+                    <span
+                      className={`material-symbols-outlined text-[15px] ${
+                        isInstalling ? 'animate-spin' : ''
+                      }`}
+                    >
+                      {isInstalling ? 'progress_activity' : 'download'}
+                    </span>
+                    {isInstalling
+                      ? downloadProgress?.phase === 'launching'
+                        ? 'Launching…'
+                        : 'Downloading…'
+                      : canInstallNatively
+                        ? 'Download & Install'
+                        : 'Download Update'}
+                  </button>
+                </div>
               </div>
             </footer>
           </motion.div>

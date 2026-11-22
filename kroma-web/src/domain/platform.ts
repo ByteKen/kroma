@@ -35,3 +35,33 @@ export function formatShortcutCombo(combo: string, isMac = isMacPlatform()): str
   if (!isMac) return combo;
   return combo.replace(/\bCtrl\+/gi, '⌘').replace(/\bAlt\+/gi, '⌥');
 }
+
+/**
+ * Opens an external `http://` or `https://` URL in the user's default system browser.
+ * In Tauri v2 Desktop, WebView2 / WKWebView blocks `<a target="_blank">` popups unless routed
+ * through the native OS protocol handler (`open_external_url`).
+ */
+export async function openExternalUrl(url: string): Promise<void> {
+  const trimmed = url.trim();
+  if (!trimmed.startsWith('https://') && !trimmed.startsWith('http://')) {
+    return;
+  }
+  if (typeof window !== 'undefined') {
+    const tauriInternals = (
+      window as Window & {
+        __TAURI_INTERNALS__?: {
+          invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
+        };
+      }
+    ).__TAURI_INTERNALS__;
+    if (typeof tauriInternals?.invoke === 'function') {
+      try {
+        await tauriInternals.invoke('open_external_url', { url: trimmed });
+        return;
+      } catch {
+        // Fall through to window.open fallback
+      }
+    }
+    window.open(trimmed, '_blank', 'noopener,noreferrer');
+  }
+}

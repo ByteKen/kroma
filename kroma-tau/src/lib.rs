@@ -39,6 +39,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::exit_app,
+            commands::open_external_url,
+            commands::download_and_install_app_update,
             commands::reveal_main_window,
             commands::check_runtime_status,
             commands::check_models_manifest,

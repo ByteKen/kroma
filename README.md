@@ -33,7 +33,10 @@ Kroma is a **local-first desktop RAW photo editor and portrait workflow studio**
 
 ## Installation
 
-Download the latest installer for Windows (64-bit) or macOS (Apple Silicon) from the [Releases](https://github.com/ByteKen/kroma/releases) page.
+Download the latest installer or portable archive for your OS from the [Releases](https://github.com/ByteKen/kroma/releases) page:
+
+- **Windows (64-bit `x86_64`):** `Kroma-<version>_Windows_x64-setup.exe` (Installer), `Kroma-<version>_Windows_x64.msi` (MSI), or `Kroma-<version>_Windows_x86_64.zip` (Portable)
+- **macOS (Apple Silicon `arm64`):** `Kroma-<version>_MacOS_arm64.dmg` (Installer), `Kroma-<version>_MacOS_arm64.zip`, or `Kroma-<version>_MacOS_arm64.tar.gz`
 
 ## Development
 

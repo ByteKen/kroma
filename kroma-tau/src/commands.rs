@@ -11,8 +11,8 @@ use crate::dto::{
 };
 use crate::face_cache;
 use crate::model_manager::{
-    download_pending_models, inspect_manifest_status, load_models_manifest,
-    MODEL_DOWNLOAD_PROGRESS_EVENT,
+    download_app_update_installer, download_pending_models, inspect_manifest_status,
+    load_models_manifest, APP_UPDATE_PROGRESS_EVENT, MODEL_DOWNLOAD_PROGRESS_EVENT,
 };
 use crate::state::{
     ActiveShootContext, AppState, CachedDevelopBuffer, CachedOcrEngine, OrganizationHistory,
@@ -117,6 +117,105 @@ fn persist_organization_plan(ctx: &ActiveShootContext) -> Result<(), String> {
 #[tauri::command]
 pub fn exit_app(app: AppHandle) {
     app.exit(0);
+}
+
+#[tauri::command]
+pub fn open_external_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err("Only http:// and https:// URLs are permitted".to_string());
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("URL contains invalid control characters".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", trimmed])
+            .spawn()
+            .map_err(|err| format!("Failed to open browser: {err}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|err| format!("Failed to open browser: {err}"))?;
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|err| format!("Failed to open browser: {err}"))?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn download_and_install_app_update(
+    url: String,
+    asset_name: String,
+    size_bytes: Option<u64>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let app_for_progress = app.clone();
+    let expected_size = size_bytes.unwrap_or(0);
+    let installer_path = tauri::async_runtime::spawn_blocking(move || {
+        download_app_update_installer(&url, &asset_name, expected_size, |progress| {
+            let _ = app_for_progress.emit(APP_UPDATE_PROGRESS_EVENT, progress);
+        })
+    })
+    .await
+    .map_err(|err| format!("app update download worker failed: {err}"))??;
+
+    #[cfg(target_os = "windows")]
+    {
+        let is_msi = installer_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("msi"));
+        if is_msi {
+            std::process::Command::new("msiexec")
+                .arg("/i")
+                .arg(&installer_path)
+                .spawn()
+                .map_err(|err| format!("Failed to launch MSI installer: {err}"))?;
+        } else {
+            std::process::Command::new(&installer_path)
+                .spawn()
+                .map_err(|err| format!("Failed to launch installer: {err}"))?;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&installer_path)
+            .spawn()
+            .map_err(|err| format!("Failed to open DMG installer: {err}"))?;
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&installer_path)
+            .spawn()
+            .map_err(|err| format!("Failed to open installer: {err}"))?;
+    }
+
+    // Exit Kroma shortly after spawning the installer so Windows NSIS can replace the binary cleanly
+    let app_for_exit = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(650));
+        app_for_exit.exit(0);
+    });
+
+    Ok(installer_path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
