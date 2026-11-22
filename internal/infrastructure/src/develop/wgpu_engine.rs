@@ -81,8 +81,6 @@ struct SpatialUniforms {
 pub struct WgpuDevelopEngine {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    backend_label: String,
-    adapter_name: String,
     max_texture_dim: u32,
     grade_bgl: wgpu::BindGroupLayout,
     grade_pipeline: wgpu::ComputePipeline,
@@ -98,32 +96,73 @@ pub struct WgpuDevelopEngine {
     dispatch_lock: Mutex<()>,
 }
 
+#[derive(Clone, Debug)]
+struct ProbedWgpuAdapterInfo {
+    backend_label: String,
+    adapter_name: String,
+}
+
+static PROBED_WGPU_ADAPTER: OnceLock<Option<ProbedWgpuAdapterInfo>> = OnceLock::new();
 static SHARED_WGPU_ENGINE: OnceLock<Option<WgpuDevelopEngine>> = OnceLock::new();
+
+/// Lightweight adapter metadata probe used on app startup (`check_runtime_status`).
+/// Queries only `adapter.get_info()` and drops the adapter immediately without creating a
+/// DX12/Metal `wgpu::Device`, shader compiler, or `gpu-allocator` heaps (~150-250 MB saved at boot).
+fn probe_wgpu_adapter_info() -> Option<&'static ProbedWgpuAdapterInfo> {
+    PROBED_WGPU_ADAPTER
+        .get_or_init(|| {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::PRIMARY,
+                ..Default::default()
+            });
+            let adapter = pollster::block_on(instance.request_adapter(
+                &wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                },
+            ))
+            .ok()?;
+            let info = adapter.get_info();
+            let backend_label = match info.backend {
+                wgpu::Backend::Dx12 => "wgpu DX12".to_string(),
+                wgpu::Backend::Metal => "wgpu Metal".to_string(),
+                wgpu::Backend::Vulkan => "wgpu Vulkan".to_string(),
+                other => format!("wgpu {other:?}"),
+            };
+            Some(ProbedWgpuAdapterInfo {
+                backend_label,
+                adapter_name: info.name,
+            })
+        })
+        .as_ref()
+}
 
 /// Returns the shared lazy-initialized `WgpuDevelopEngine` (DX12 on Windows, Metal on macOS,
 /// Vulkan on Linux) or `None` if no compatible GPU adapter is present.
+/// Only initialized on demand when running a GPU develop render/export.
 pub fn shared_wgpu_develop_engine() -> Option<&'static WgpuDevelopEngine> {
     SHARED_WGPU_ENGINE
         .get_or_init(WgpuDevelopEngine::try_init)
         .as_ref()
 }
 
-/// Returns `true` when a native `wgpu` GPU adapter compiled Kroma's WGSL compute shaders cleanly.
+/// Returns `true` when a native `wgpu` GPU adapter is present (lightweight probe, no device created).
 pub fn is_wgpu_develop_available() -> bool {
-    shared_wgpu_develop_engine().is_some()
+    probe_wgpu_adapter_info().is_some()
 }
 
 /// Human-readable GPU compute backend label (e.g. `"wgpu DX12"` or `"wgpu Metal"`).
 pub fn wgpu_develop_backend_label() -> String {
-    match shared_wgpu_develop_engine() {
-        Some(engine) => engine.backend_label.clone(),
+    match probe_wgpu_adapter_info() {
+        Some(info) => info.backend_label.clone(),
         None => "CPU".to_string(),
     }
 }
 
 /// Human-readable GPU adapter hardware name (e.g. `"NVIDIA GeForce RTX 4070"` or `"Apple M3 Pro"`).
 pub fn wgpu_develop_adapter_name() -> Option<String> {
-    shared_wgpu_develop_engine().map(|e| e.adapter_name.clone())
+    probe_wgpu_adapter_info().map(|info| info.adapter_name.clone())
 }
 
 impl WgpuDevelopEngine {
@@ -140,14 +179,6 @@ impl WgpuDevelopEngine {
         }))
         .ok()?;
 
-        let info = adapter.get_info();
-        let backend_label = match info.backend {
-            wgpu::Backend::Dx12 => "wgpu DX12".to_string(),
-            wgpu::Backend::Metal => "wgpu Metal".to_string(),
-            wgpu::Backend::Vulkan => "wgpu Vulkan".to_string(),
-            other => format!("wgpu {other:?}"),
-        };
-        let adapter_name = info.name.clone();
         let limits = adapter.limits();
         let max_texture_dim = limits.max_texture_dimension_2d;
 
@@ -155,7 +186,7 @@ impl WgpuDevelopEngine {
             label: Some("kroma-develop-wgpu-device"),
             required_features: wgpu::Features::empty(),
             required_limits: limits,
-            memory_hints: wgpu::MemoryHints::Performance,
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
             ..Default::default()
         }))
         .ok()?;
@@ -264,8 +295,6 @@ impl WgpuDevelopEngine {
         Some(Self {
             device,
             queue,
-            backend_label,
-            adapter_name,
             max_texture_dim,
             grade_bgl,
             grade_pipeline,
