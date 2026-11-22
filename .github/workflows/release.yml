@@ -149,18 +149,8 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    name: Build macOS Installer (${{ matrix.label }})
+    name: Build macOS Installer (Apple Silicon arm64)
     needs: verify
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: Apple Silicon (arm64)
-            arch: aarch64
-            target: aarch64-apple-darwin
-          - label: Intel (x64)
-            arch: x64
-            target: x86_64-apple-darwin
     runs-on: macos-latest
     steps:
       - name: Checkout repository
@@ -173,34 +163,33 @@ jobs:
           cache: "npm"
           cache-dependency-path: kroma-web/package-lock.json
 
-      - name: Install Rust stable toolchain & macOS target
+      - name: Install Rust stable toolchain & Apple Silicon target
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: macos-${{ matrix.arch }}
+          key: macos-aarch64
 
       - name: Install frontend dependencies
         run: npm --prefix kroma-web ci
 
       - name: Run Rust tests on Apple Silicon host
-        if: matrix.arch == 'aarch64'
         run: cargo test --workspace
 
-      - name: Build Kroma Desktop macOS DMG (${{ matrix.target }})
-        run: npm --prefix kroma-web run tauri:build -- --target ${{ matrix.target }} --bundles dmg
+      - name: Build Kroma Desktop macOS DMG (aarch64-apple-darwin)
+        run: npm --prefix kroma-web run tauri:build -- --target aarch64-apple-darwin --bundles dmg
 
       - name: Stage macOS DMG installer
         shell: bash
         run: |
           mkdir -p release-artifacts
           shopt -s nullglob
-          dmgs=(target/${{ matrix.target }}/release/bundle/dmg/*.dmg)
+          dmgs=(target/aarch64-apple-darwin/release/bundle/dmg/*.dmg)
           if [ ${#dmgs[@]} -eq 0 ]; then
-            echo "Error: No macOS .dmg bundle produced under target/${{ matrix.target }}/release/bundle/dmg/." >&2
+            echo "Error: No macOS .dmg bundle produced under target/aarch64-apple-darwin/release/bundle/dmg/." >&2
             exit 1
           fi
           for f in "${dmgs[@]}"; do
@@ -211,7 +200,7 @@ jobs:
       - name: Upload macOS DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: kroma-macos-${{ matrix.arch }}
+          name: kroma-macos-aarch64
           path: release-artifacts/*.dmg
           retention-days: 14
           if-no-files-found: error

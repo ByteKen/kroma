@@ -52,7 +52,7 @@ Kroma is a **local-first desktop RAW photo editor and portrait workflow studio**
 
 - **Minimum:**
   - **OS:** macOS 12 Monterey or newer
-  - **Chip:** Apple M1 or Intel Core i5 (2018 or newer)
+  - **Chip:** Apple Silicon (M1 or newer)
   - **RAM:** 8 GB
   - **Storage:** 1 GB free space *(includes ~350 MB for local AI models)*
 - **Recommended:**
