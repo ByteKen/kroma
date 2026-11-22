@@ -1,0 +1,27 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+
+# Frontend (Vite / React / Tauri)
+kroma-web/node_modules
+kroma-web/dist
+kroma-web/dist-ssr
+kroma-web/*.local
+ui/node_modules
+ui/dist
+ui/dist-ssr
+ui/*.local
+
+# ONNX AI Models (downloaded on launch via models/models.json)
+models/*
+!models/models.json
+
+# Local Test Suite (kept out of repository commits)
+/tests/
+
+# Local AI Assistant Rules & Skills
+/.agents/
+
+# OS & Editors
+.DS_Store
+Thumbs.db

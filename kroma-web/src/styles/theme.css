@@ -1,0 +1,172 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: "Material Symbols Outlined";
+  font-style: normal;
+  font-weight: 100 700;
+  font-display: block;
+  src: url("material-symbols/material-symbols-outlined.woff2") format("woff2");
+}
+
+/*
+ * Kroma — Pro Darkroom Studio Design System (from DESIGN.md & Stitch prototype)
+ * Neutral zero-cast obsidian & graphite palette engineered to preserve skin-tone
+ * and color-grading accuracy during extended darkroom culling and batch sessions.
+ */
+@theme {
+  /* Core Neutral Darkroom Surfaces */
+  --color-canvas: #111214;
+  --color-surface-lowest: #0d0e10;
+  --color-surface-low: #16181c;
+  --color-surface: #1a1c20;
+  --color-surface-elevated: #1f2126;
+  --color-surface-active: #23262d;
+  --color-surface-highest: #2e323b;
+  --color-hairline: #2a2d34;
+  --color-hairline-strong: #3b3f4a;
+
+  /* Functional Optical Accents */
+  --color-amber-core: #f59e0b;
+  --color-amber-soft: #ffc174;
+  --color-amber-ink: #111214;
+  --color-emerald-focus: #10b981;
+  --color-emerald-bright: #4edea3;
+  --color-tangerine-alert: #f97316;
+  --color-crimson-clip: #ef4444;
+
+  /* Typographic Contrast Hierarchy */
+  --color-ink-primary: #f3f4f6;
+  --color-ink-secondary: #9ca3af;
+  --color-ink-telemetry: #64748b;
+
+  /* Typography Families */
+  --font-display: "Manrope", system-ui, -apple-system, sans-serif;
+  --font-body: "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    background-color: var(--color-canvas);
+    color: var(--color-ink-primary);
+    overscroll-behavior: none;
+  }
+
+  /* Precision darkroom scrollbars */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-hairline);
+    border-radius: 9999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-hairline-strong);
+  }
+
+  /* Layered in @layer base so Tailwind utilities like text-[15px] cleanly override default size */
+  .material-symbols-outlined {
+    font-family: "Material Symbols Outlined";
+    font-weight: normal;
+    font-style: normal;
+    font-size: 24px;
+    line-height: 1;
+    letter-spacing: normal;
+    text-transform: none;
+    display: inline-block;
+    white-space: nowrap;
+    word-wrap: normal;
+    direction: ltr;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: "liga";
+    font-variation-settings:
+      "FILL" 0,
+      "wght" 400,
+      "GRAD" 0,
+      "opsz" 20;
+    user-select: none;
+  }
+}
+
+.tabular-nums-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom precision darkroom range input */
+input[type="range"].kroma-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--color-hairline);
+  outline: none;
+}
+
+input[type="range"].kroma-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 9999px;
+  background: var(--color-ink-primary);
+  border: 2px solid var(--color-canvas);
+  cursor: pointer;
+  transition: transform 120ms ease, border-color 120ms ease;
+}
+
+input[type="range"].kroma-slider::-webkit-slider-thumb:hover {
+  border-color: var(--color-amber-core);
+  transform: scale(1.15);
+}
+
+/* Smooth GPU-composited darkroom skeleton shimmer for workspace transitions */
+@keyframes kroma-shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.kroma-skeleton {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--color-surface);
+}
+
+.kroma-skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.045) 45%,
+    rgba(255, 193, 116, 0.04) 55%,
+    transparent 100%
+  );
+  animation: kroma-shimmer 1.15s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kroma-skeleton::after {
+    animation: none;
+  }
+}

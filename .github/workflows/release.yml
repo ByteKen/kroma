@@ -1,0 +1,264 @@
+name: Release Desktop Binaries
+
+on:
+  push:
+    # Only trigger on semver desktop release tags (ignores auxiliary tags like models-v1)
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.1.0; must match workspace version)"
+        required: true
+        type: string
+      draft:
+        description: "Publish as draft GitHub Release"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Pre-Release Quality Gates
+    runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      is_draft: ${{ steps.meta.outputs.is_draft }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: meta
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_DRAFT: ${{ inputs.draft }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $tag = if ($env:EVENT_NAME -eq "workflow_dispatch") { $env:INPUT_TAG } else { $env:REF_NAME }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            Write-Error "Invalid release tag '$tag'. Expected format vX.Y.Z or vX.Y.Z-rc.1."
+            exit 1
+          }
+          $version = $tag.Substring(1)
+          $isPrerelease = if ($version -match '-') { "true" } else { "false" }
+          $isDraft = if ($env:EVENT_NAME -eq "workflow_dispatch") { $env:INPUT_DRAFT } else { "false" }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "is_prerelease=$isPrerelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "is_draft=$isDraft" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: kroma-web/package-lock.json
+
+      - name: Validate versions, CHANGELOG.md, models.json, and git hygiene
+        shell: pwsh
+        env:
+          EXPECTED_TAG: ${{ steps.meta.outputs.tag }}
+        run: node scripts/release-check.mjs --all --expected-tag "$env:EXPECTED_TAG"
+
+      - name: Install frontend dependencies
+        run: npm --prefix kroma-web ci
+
+      - name: Frontend typecheck & unit tests
+        run: |
+          npm --prefix kroma-web run typecheck
+          npm --prefix kroma-web test
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Rust workspace tests & Clippy lints (Windows)
+        run: |
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+
+  build-windows:
+    name: Build Windows Installers (NSIS & MSI)
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: kroma-web/package-lock.json
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: npm --prefix kroma-web ci
+
+      - name: Build Kroma Desktop Windows installers
+        run: npm --prefix kroma-web run tauri:build
+
+      - name: Stage Windows installers
+        shell: pwsh
+        run: |
+          $outDir = "release-artifacts"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          $installers = @()
+          $installers += Get-ChildItem -Path "target/release/bundle/nsis" -Filter "*.exe" -ErrorAction SilentlyContinue
+          $installers += Get-ChildItem -Path "target/release/bundle/msi" -Filter "*.msi" -ErrorAction SilentlyContinue
+
+          if ($installers.Count -eq 0) {
+            Write-Error "No Windows installer bundles (.exe/.msi) were produced under target/release/bundle/."
+            exit 1
+          }
+
+          foreach ($file in $installers) {
+            Copy-Item -Path $file.FullName -Destination (Join-Path $outDir $file.Name) -Force
+            Write-Host "Staged $($file.Name) ($($file.Length) bytes)"
+          }
+
+      - name: Upload Windows installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kroma-windows-x64
+          path: release-artifacts/*
+          retention-days: 14
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS Installer (${{ matrix.label }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Apple Silicon (arm64)
+            arch: aarch64
+            target: aarch64-apple-darwin
+          - label: Intel (x64)
+            arch: x64
+            target: x86_64-apple-darwin
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: kroma-web/package-lock.json
+
+      - name: Install Rust stable toolchain & macOS target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ matrix.arch }}
+
+      - name: Install frontend dependencies
+        run: npm --prefix kroma-web ci
+
+      - name: Run Rust tests on Apple Silicon host
+        if: matrix.arch == 'aarch64'
+        run: cargo test --workspace
+
+      - name: Build Kroma Desktop macOS DMG (${{ matrix.target }})
+        run: npm --prefix kroma-web run tauri:build -- --target ${{ matrix.target }} --bundles dmg
+
+      - name: Stage macOS DMG installer
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          shopt -s nullglob
+          dmgs=(target/${{ matrix.target }}/release/bundle/dmg/*.dmg)
+          if [ ${#dmgs[@]} -eq 0 ]; then
+            echo "Error: No macOS .dmg bundle produced under target/${{ matrix.target }}/release/bundle/dmg/." >&2
+            exit 1
+          fi
+          for f in "${dmgs[@]}"; do
+            cp "$f" release-artifacts/
+            ls -lh "release-artifacts/$(basename "$f")"
+          done
+
+      - name: Upload macOS DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kroma-macos-${{ matrix.arch }}
+          path: release-artifacts/*.dmg
+          retention-days: 14
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [verify, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Extract Markdown release notes from CHANGELOG.md
+        run: |
+          node scripts/release-check.mjs --extract-changelog "${{ needs.verify.outputs.version }}" > release-notes.md
+          cat release-notes.md
+
+      - name: Download all platform installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Generate unified SHA256SUMS.txt
+        shell: bash
+        run: |
+          cd release-artifacts
+          sha256sum *.exe *.msi *.dmg | sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.verify.outputs.tag }}
+          name: Kroma ${{ needs.verify.outputs.tag }}
+          body_path: release-notes.md
+          draft: ${{ needs.verify.outputs.is_draft == 'true' }}
+          prerelease: ${{ needs.verify.outputs.is_prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          files: |
+            release-artifacts/*.exe
+            release-artifacts/*.msi
+            release-artifacts/*.dmg
+            release-artifacts/SHA256SUMS.txt
+            CHANGELOG.md

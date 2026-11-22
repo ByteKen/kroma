@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "releaseTag": "models-v1",
+  "models": [
+    {
+      "id": "yunet-face-detector",
+      "name": "YuNet 2026 Face Detector",
+      "category": "face_detection",
+      "version": "2026.05",
+      "relativePath": "face_detection_yunet_2026may.onnx",
+      "url": "https://github.com/ByteKen/kroma/releases/download/models-v1/face_detection_yunet_2026may.onnx",
+      "sizeBytes": 229738,
+      "sha256": "ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0",
+      "required": true
+    },
+    {
+      "id": "arcface-w600k-r50",
+      "name": "ArcFace R50 Face Recognition",
+      "category": "face_recognition",
+      "version": "1.0.0",
+      "relativePath": "w600k_r50.onnx",
+      "url": "https://github.com/ByteKen/kroma/releases/download/models-v1/w600k_r50.onnx",
+      "sizeBytes": 174383860,
+      "sha256": "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43",
+      "required": true
+    },
+    {
+      "id": "rmbg-1.4",
+      "name": "RMBG-1.4 Subject Masking",
+      "category": "subject_masking",
+      "version": "1.4.0",
+      "relativePath": "rmbg-1.4.onnx",
+      "url": "https://github.com/ByteKen/kroma/releases/download/models-v1/rmbg-1.4.onnx",
+      "sizeBytes": 176153355,
+      "sha256": "8cafcf770b06757c4eaced21b1a88e57fd2b66de01b8045f35f01535ba742e0f",
+      "required": true
+    },
+    {
+      "id": "ppocrv5-mobile-det",
+      "name": "PP-OCRv5 Text Detector",
+      "category": "slate_ocr",
+      "version": "5.0.0",
+      "relativePath": "ocr/ppocrv5_mobile_det.onnx",
+      "url": "https://github.com/ByteKen/kroma/releases/download/models-v1/ppocrv5_mobile_det.onnx",
+      "sizeBytes": 4819576,
+      "sha256": "4d97c44a20d30a81aad087d6a396b08f786c4635742afc391f6621f5c6ae78ae",
+      "required": true
+    },
+    {
+      "id": "ppocrv5-en-rec",
+      "name": "PP-OCRv5 English Recognizer",
+      "category": "slate_ocr",
+      "version": "5.0.0",
+      "relativePath": "ocr/en_ppocrv5_rec.onnx",
+      "url": "https://github.com/ByteKen/kroma/releases/download/models-v1/en_ppocrv5_rec.onnx",
+      "sizeBytes": 7830888,
+      "sha256": "4e16deb22c4da6468bdca539b2cd3c8687825538b67109177c47d359ab994cd7",
+      "required": true
+    },
+    {
+      "id": "ppocrv5-en-dict",
+      "name": "PP-OCRv5 Character Dictionary",
+      "category": "slate_ocr",
+      "version": "5.0.0",
+      "relativePath": "ocr/en_ppocrv5_dict.txt",
+      "url": "https://github.com/ByteKen/kroma/releases/download/models-v1/en_ppocrv5_dict.txt",
+      "sizeBytes": 1416,
+      "sha256": "e025a66d31f327ba0c232e03f407ae8d105e1e709e7ccb3f408aa778c24e70d6",
+      "required": true
+    }
+  ]
+}

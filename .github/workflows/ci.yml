@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  release-metadata:
+    name: Release Metadata & Hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate versions, manifest, and git hygiene
+        run: node scripts/release-check.mjs --check-versions --check-manifest --check-hygiene
+
+  frontend:
+    name: Frontend (Typecheck, Test, Build)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: kroma-web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm --prefix kroma-web ci
+
+      - name: Typecheck
+        run: npm --prefix kroma-web run typecheck
+
+      - name: Unit tests
+        run: npm --prefix kroma-web test
+
+      - name: Production bundle build
+        run: npm --prefix kroma-web run build
+
+  rust:
+    name: Rust Workspace (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows (DirectML)
+            os: windows-latest
+          - label: macOS (CoreML)
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace unit tests
+        run: cargo test --workspace
+
+      - name: Run workspace Clippy lints
+        run: cargo clippy --workspace --all-targets -- -D warnings

@@ -1,0 +1,28 @@
+[package]
+name = "kroma-infra"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kroma-domain = { path = "../domain" }
+kroma-app = { path = "../application" }
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "copy-dylibs", "api-31"] }
+pollster = "0.4"
+rawler = "0.7"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+wgpu = { version = "25", default-features = false, features = ["wgsl"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["directml"] }
+wgpu = { version = "25", default-features = false, features = ["dx12"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["coreml"] }
+wgpu = { version = "25", default-features = false, features = ["metal"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "25", default-features = false, features = ["vulkan"] }

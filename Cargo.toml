@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "internal/domain",
+    "internal/application",
+    "internal/infrastructure",
+    "internal/cli",
+    "kroma-tau",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["ByteKen"]
+license = "Apache-2.0"
+
+# Keep dev builds fast while running RAW/image/pixel hot-path crates at full release speed
+[profile.dev.package.rawler]
+opt-level = 3
+
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.zune-core]
+opt-level = 3
+
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.tiff]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.rayon]
+opt-level = 3
+
+[profile.dev.package.kroma-domain]
+opt-level = 3
+
+[profile.dev.package.kroma-app]
+opt-level = 3
+
+[profile.dev.package.kroma-infra]
+opt-level = 3

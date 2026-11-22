@@ -1,0 +1,13 @@
+[package]
+name = "kroma-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "kroma"
+path = "src/main.rs"
+
+[dependencies]
+kroma-domain = { path = "../domain" }
+kroma-app = { path = "../application" }
+kroma-infra = { path = "../infrastructure" }
