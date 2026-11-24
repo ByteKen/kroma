@@ -7,6 +7,8 @@ struct PresentUniforms {
   uvTransform: vec4<f32>,
   // (showShadowClip, showHighlightClip, showCheckerboard, 0)
   flags: vec4<f32>,
+  // (minU, minV, maxU, maxV) oriented full-frame crop bounds
+  cropBounds: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: PresentUniforms;
@@ -49,7 +51,10 @@ fn sampleBilinear(uv: vec2<f32>) -> vec4<f32> {
 @fragment
 fn fs_main(fragIn: VsOut) -> @location(0) vec4<f32> {
   let uv = fragIn.texCoord * u.uvTransform.xy + u.uvTransform.zw;
-  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+  if (
+    uv.x < u.cropBounds.x || uv.x > u.cropBounds.z ||
+    uv.y < u.cropBounds.y || uv.y > u.cropBounds.w
+  ) {
     return vec4<f32>(0.0, 0.0, 0.0, 0.0);
   }
 

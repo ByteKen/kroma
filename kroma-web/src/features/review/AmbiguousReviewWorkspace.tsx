@@ -1,16 +1,16 @@
 import { AnimatePresence, motion } from 'framer-motion';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { useStudio } from '../../app/StudioContext';
 import { formatSimilarityPercent, isFaceOnlySlateCode } from '../../domain/identity';
 import {
   DarkroomButton,
   FAST_FADE,
   SOFT_SPRING,
-  TACTILE_SPRING,
   TelemetryPill,
+  VirtualVerticalList,
 } from '../darkroom-kit';
 
-export function AmbiguousReviewWorkspace() {
+export const AmbiguousReviewWorkspace = memo(function AmbiguousReviewWorkspace() {
   const {
     ambiguousReviewQueue,
     sfaceThreshold,
@@ -239,26 +239,26 @@ export function AmbiguousReviewWorkspace() {
           </div>
         </div>
 
-        <div className="flex-1 min-h-0 overflow-y-auto p-2.5 flex flex-col gap-1.5">
-          <AnimatePresence mode="popLayout">
-            {ambiguousReviewQueue.map((item) => {
+        <div className="flex-1 min-h-0 flex flex-col p-2.5 overflow-hidden">
+          <VirtualVerticalList
+            items={ambiguousReviewQueue}
+            rowHeightPx={68}
+            gapPx={6}
+            overscan={6}
+            getKey={(item) => item.photo.id}
+            className="flex-1 min-h-0 pr-0.5"
+            renderItem={(item) => {
               const isSelected = item.photo.id === activeItem.photo.id;
               const isChecked = checkedPhotoIds.has(item.photo.id);
               return (
-                <motion.div
-                  key={item.photo.id}
-                  layout="position"
-                  initial={{ opacity: 0, x: -8 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  exit={{ opacity: 0, x: -16 }}
-                  transition={TACTILE_SPRING}
+                <div
                   onClick={(e) => {
                     if (e.shiftKey || e.ctrlKey || e.metaKey) {
                       toggleChecked(item.photo.id, e.shiftKey);
                     }
                     setSelectedPhotoId(item.photo.id);
                   }}
-                  className={`relative p-2 rounded-lg border text-left flex items-center gap-2 transition-colors cursor-pointer select-none ${isSelected
+                  className={`relative h-full p-2 rounded-lg border text-left flex items-center gap-2 transition-colors cursor-pointer select-none ${isSelected
                       ? 'bg-surface-active border-tangerine-alert/70'
                       : isChecked
                         ? 'bg-amber-core/10 border-amber-core/50'
@@ -266,9 +266,8 @@ export function AmbiguousReviewWorkspace() {
                     }`}
                 >
                   {isSelected && (
-                    <motion.span
-                      layoutId="review-queue-active"
-                      transition={TACTILE_SPRING}
+                    <span
+                      aria-hidden="true"
                       className="absolute left-0 top-1.5 bottom-1.5 w-1 rounded-r bg-tangerine-alert"
                     />
                   )}
@@ -288,6 +287,8 @@ export function AmbiguousReviewWorkspace() {
                   <img
                     src={item.photo.imageUrl}
                     alt={item.photo.fileName}
+                    loading="lazy"
+                    decoding="async"
                     draggable={false}
                     className="w-11 h-13 rounded object-cover object-top shrink-0 bg-surface-lowest"
                   />
@@ -308,10 +309,10 @@ export function AmbiguousReviewWorkspace() {
                       {item.reason}
                     </span>
                   </div>
-                </motion.div>
+                </div>
               );
-            })}
-          </AnimatePresence>
+            }}
+          />
         </div>
       </aside>
 
@@ -365,6 +366,7 @@ export function AmbiguousReviewWorkspace() {
                     <img
                       src={anchor.thumbnailUrl}
                       alt={anchor.subjectName}
+                      decoding="async"
                       draggable={false}
                       className="max-w-[100cqw] max-h-[100cqh] w-auto h-auto rounded block"
                     />
@@ -392,6 +394,7 @@ export function AmbiguousReviewWorkspace() {
                       <img
                         src={photo.imageUrl}
                         alt={photo.fileName}
+                        decoding="async"
                         draggable={false}
                         className="max-w-[100cqw] max-h-[100cqh] w-auto h-auto rounded block"
                       />
@@ -544,4 +547,4 @@ export function AmbiguousReviewWorkspace() {
       </section>
     </div>
   );
-}
+});

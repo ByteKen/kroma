@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Releases & Changelog
+    url: https://github.com/ByteKen/kroma/releases
+    about: Check the latest Kroma installers and recent fixes before filing a report.

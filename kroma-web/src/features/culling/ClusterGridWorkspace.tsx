@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'framer-motion';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useStudio, type GridDisplayMode } from '../../app/StudioContext';
 import { isFaceOnlySlateCode } from '../../domain/identity';
 import {
@@ -28,7 +28,7 @@ const DISPLAY_MODES: readonly SegmentedOption<GridDisplayMode>[] = [
   { id: 'loupe', icon: 'search_check', title: 'Single loupe' },
 ];
 
-export function ClusterGridWorkspace() {
+export const ClusterGridWorkspace = memo(function ClusterGridWorkspace() {
   const {
     session,
     preferences,
@@ -125,6 +125,16 @@ export function ClusterGridWorkspace() {
       gridRef.current?.scrollToIndex(nextIndex, false);
     },
     [visibleClusterPhotos],
+  );
+
+  const selectedPhotoIdsArray = useMemo(
+    () => (selectedPhotoIds.size > 1 ? Array.from(selectedPhotoIds) : null),
+    [selectedPhotoIds],
+  );
+
+  const handleOpenManualMatch = useCallback(
+    () => setManualMatchSplitOpen(true),
+    [setManualMatchSplitOpen],
   );
 
   const handleCloseLightbox = useCallback(() => {
@@ -380,9 +390,7 @@ export function ClusterGridWorkspace() {
                 isSelected={isSelected}
                 virtualFolderLabel={virtualFolderLabel}
                 dragPhotoIds={
-                  isSelected && selectedPhotoIds.size > 1
-                    ? Array.from(selectedPhotoIds)
-                    : [photo.id]
+                  isSelected && selectedPhotoIdsArray ? selectedPhotoIdsArray : undefined
                 }
                 isClustered={session.isClustered}
                 reviewWarningThreshold={reviewWarningThreshold}
@@ -391,8 +399,8 @@ export function ClusterGridWorkspace() {
                 showMetadata={preferences.showThumbnailMetadata}
                 onToggleSelect={togglePhotoSelection}
                 onOpenLightbox={handleOpenLightbox}
-                onOpenDevelop={(photoId) => openPhotoInDevelop(photoId)}
-                onManualMatch={() => setManualMatchSplitOpen(true)}
+                onOpenDevelop={openPhotoInDevelop}
+                onManualMatch={handleOpenManualMatch}
               />
             );
           }}
@@ -424,4 +432,4 @@ export function ClusterGridWorkspace() {
       />
     </section>
   );
-}
+});

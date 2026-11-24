@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { useStudio, type AnchorSortMode } from '../../app/StudioContext';
 import {
   filterSubjectClusters,
@@ -15,6 +15,7 @@ import {
   PanelResizeHandle,
   TelemetryPill,
   useResizableWidth,
+  VirtualVerticalList,
 } from '../darkroom-kit';
 import { GradedThumbnailImg } from '../develop/GradedThumbnailImg';
 import { VirtualFolderTreePanel } from '../folders/VirtualFolderTreePanel';
@@ -37,7 +38,7 @@ const SORT_LABELS: Record<AnchorSortMode, string> = {
 
 const SORT_ORDER: readonly AnchorSortMode[] = ['capture_time', 'exposures', 'confidence'];
 
-export function SlateAnchorColumn() {
+export const SlateAnchorColumn = memo(function SlateAnchorColumn() {
   const {
     session,
     activeWorkspace,
@@ -311,12 +312,11 @@ export function SlateAnchorColumn() {
         </div>
       )}
 
-      {/* Scrollable Subject List — shrink-0 on every card prevents vertical squashing */}
+      {/* Virtualized Subject List — mounts only visible subject cards so 500+ subject folders switch in <5 ms */}
       <div
         onMouseLeave={clearHoverPreview}
         onDragEnd={clearHoverPreview}
-        onScroll={clearHoverPreview}
-        className="flex-1 min-h-0 overflow-y-auto p-2.5 flex flex-col gap-2"
+        className="flex-1 min-h-0 flex flex-col p-2.5 overflow-hidden"
       >
         {filteredClusters.length === 0 ? (
           <div className="py-10 px-3 flex flex-col items-center justify-center text-center gap-2 text-ink-telemetry">
@@ -336,7 +336,16 @@ export function SlateAnchorColumn() {
             </DarkroomButton>
           </div>
         ) : (
-          filteredClusters.map((cluster) => {
+          <VirtualVerticalList
+            items={filteredClusters}
+            rowHeightPx={74}
+            gapPx={8}
+            overscan={6}
+            getKey={(cluster) => cluster.anchor.id}
+            onMouseLeave={clearHoverPreview}
+            onScroll={clearHoverPreview}
+            className="flex-1 min-h-0 pr-0.5"
+            renderItem={(cluster) => {
           const { anchor } = cluster;
           const isSelected = activeCluster?.anchor.id === anchor.id;
           const isMultiSelected = selectedClusterIds.has(anchor.id);
@@ -380,7 +389,6 @@ export function SlateAnchorColumn() {
 
           return (
             <article
-              key={anchor.id}
               onClick={(e) => {
                 if (e.ctrlKey || e.metaKey) {
                   setSelectedClusterIds((prev) => {
@@ -397,7 +405,7 @@ export function SlateAnchorColumn() {
               onMouseEnter={(e) => {
                 if (!isEditing) scheduleHoverPreview(cluster, e.currentTarget);
               }}
-              className={`shrink-0 p-2 rounded-lg border relative overflow-hidden cursor-pointer transition-colors ${isDropTarget
+              className={`h-full p-2 rounded-lg border relative overflow-hidden cursor-pointer transition-colors ${isDropTarget
                   ? 'bg-emerald-focus/15 border-emerald-bright ring-1 ring-emerald-bright/60'
                   : isMultiSelected && selectedClusterIds.size > 1
                     ? 'bg-emerald-focus/10 border-emerald-focus/60'
@@ -577,7 +585,8 @@ export function SlateAnchorColumn() {
               </div>
             </article>
           );
-        })
+            }}
+          />
         )}
       </div>
 
@@ -598,4 +607,4 @@ export function SlateAnchorColumn() {
       />
     </>
   );
-}
+});

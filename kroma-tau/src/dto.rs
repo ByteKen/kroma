@@ -838,6 +838,7 @@ pub struct AmbiguousCandidateDto {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShootSessionDto {
+    pub session_mode: String,
     pub folder_path: String,
     pub project_name: String,
     pub is_clustered: bool,

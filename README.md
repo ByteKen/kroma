@@ -133,7 +133,7 @@ npm --prefix kroma-web run tauri:build
 ```
 
 > [!NOTE]
-> See [CHANGELOG.md](./CHANGELOG.md) for release history and [models/models.json](./models/models.json) for the bundled AI model manifest.
+> See [CHANGELOG.md](./CHANGELOG.md) for release history, [CONTRIBUTING.md](./CONTRIBUTING.md) for contributor guidelines, and [models/models.json](./models/models.json) for the bundled AI model manifest.
 
 ## License
 

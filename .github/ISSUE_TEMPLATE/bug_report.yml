@@ -1,0 +1,116 @@
+name: Bug Report
+description: Report a crash, rendering glitch, or unexpected behavior in Kroma
+title: 'bug: '
+labels:
+  - bug
+  - needs triage
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before Submitting
+      description: Confirm these quick checks first so we can investigate faster.
+      options:
+        - label: I tested on the latest [Kroma release](https://github.com/ByteKen/kroma/releases)
+          required: true
+        - label: I searched existing open and closed [issues](https://github.com/ByteKen/kroma/issues) for duplicates
+          required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Impact
+      description: How severely does this affect your editing or culling session?
+      options:
+        - Crash, freeze, or blank viewport
+        - Incorrect color, export, or sidecar data
+        - Major workflow friction or performance drop
+        - Minor UI or visual glitch
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Workspace / Subsystem
+      description: Choose the part of Kroma where the issue occurs.
+      options:
+        - Studio Develop (WebGPU / WebGL2)
+        - RAW Decoding & Previews
+        - Face Organizer & Clustering
+        - Slate OCR
+        - AI Masking & Background Removal
+        - Batch Export & Sidecars
+        - Single Photo Mode
+        - Settings, Cache & AI Models
+        - Performance, RAM, or GPU Usage
+        - UI, Layout, or Shortcuts
+        - Installer or Auto-Updater
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: What Happened & Steps to Reproduce
+      description: Describe the exact steps needed to trigger the issue.
+      placeholder: |
+        1. Open a folder containing Sony .ARW files
+        2. Switch to Studio Develop and zoom to 100%
+        3. Drag across the viewport...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect Kroma to do instead?
+
+  - type: input
+    id: media
+    attributes:
+      label: Camera / File Format (if applicable)
+      description: Camera body, file format, approximate megapixels, and photo count.
+      placeholder: e.g. Sony A7 IV .ARW (33 MP), ~250 photos
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshots or Screen Recordings
+      description: Drag and drop screenshots or short clips showing the issue.
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics, GPU Backend, or Logs
+      description: >-
+        Include any error banners, bottom status-bar GPU badge (e.g. `32-BIT RAW • WEBGPU` or
+        `WEBGL2`), GPU model, or console/terminal output if available.
+      placeholder: |
+        GPU: RTX 4070 / Apple M3 Pro (WebGPU)
+        Error banner or console output: ...
+
+  - type: input
+    id: version
+    attributes:
+      label: Kroma Version
+      description: Found in the bottom-right status bar or Settings → About.
+      placeholder: v0.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux
+    validations:
+      required: true

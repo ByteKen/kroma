@@ -16,6 +16,11 @@ import {
   loadRecentProjectsFromStorage,
   saveRecentProjectsToStorage,
 } from '../adapters/storage/recentProjectsStorage';
+import { clearDevelopBitmapCache } from '../features/develop/developBitmapCache';
+import {
+  sharedLiveDevelopDraftStore,
+  type LiveDevelopDraftEntry,
+} from '../features/develop/liveDevelopDraftStore';
 import type {
   AiModelRole,
   BatchExportRequest,
@@ -142,6 +147,7 @@ export interface DevelopViewportStatus {
   readonly backend: 'webgpu' | 'webgl2';
   readonly width?: number;
   readonly height?: number;
+  readonly upgradingHiRes?: boolean;
 }
 
 interface StudioContextValue {
@@ -223,6 +229,8 @@ interface StudioContextValue {
   setDevelopSourceMode: (mode: DevelopSourceMode) => void;
   selectDevelopFolder: (folderId: string | null) => void;
   openShootFolder: () => Promise<void>;
+  openPhotoFiles: () => Promise<void>;
+  openParentFolder: () => Promise<void>;
   openRecentShootFolder: (folderPath: string) => Promise<void>;
   removeRecentProjectEntry: (folderPath: string) => void;
   clearRecentProjects: () => void;
@@ -279,6 +287,9 @@ interface StudioContextValue {
     maxDim?: number,
     precision?: WorkingBufferPrecision,
   ) => Promise<DevelopWorkingBuffer | null>;
+  getPhotoNativeDimensions: (
+    photoId: string,
+  ) => Promise<{ readonly width: number; readonly height: number } | null>;
   generateAiMask: (photoId: string, kind: AiMaskKind) => Promise<GeneratedAiMaskResult | null>;
   updatePhotoRecipe: (
     photoId: string,
@@ -381,16 +392,27 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     });
   }, []);
 
+  const sessionModeRef = useRef(session?.sessionMode ?? 'folder');
+  sessionModeRef.current = session?.sessionMode ?? 'folder';
+
   const setActiveWorkspace = useCallback((next: WorkspaceView) => {
+    const resolvedNext: WorkspaceView =
+      sessionModeRef.current === 'single' &&
+      (next === 'culling' || next === 'slate_ocr' || next === 'review_queue')
+        ? 'develop'
+        : next;
+    if (resolvedNext !== 'develop') {
+      commitPendingLiveDraftRef.current();
+    }
     setSettingsOpen(false);
-    if (next !== 'develop') {
+    if (resolvedNext !== 'develop') {
       setStudioFocusMode(false);
     }
     setActiveWorkspaceState((prev) => {
-      if ((prev === 'home') !== (next === 'home')) {
+      if ((prev === 'home') !== (resolvedNext === 'home')) {
         setSearchQuery('');
       }
-      return next;
+      return resolvedNext;
     });
   }, []);
 
@@ -453,6 +475,8 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
   const pendingRecipeSavesRef = useRef<
     Map<string, { timerId: number; recipe: DevelopRecipe }>
   >(new Map());
+  const pendingDraftCommitTimerRef = useRef<number | null>(null);
+  const commitPendingLiveDraftRef = useRef<() => void>(() => {});
   const activeFolderPathRef = useRef<string | null>(null);
   const lastSelectedPhotoIdRef = useRef<string | null>(null);
   const sessionRef = useRef<StudioSessionSnapshot | null>(null);
@@ -473,6 +497,10 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
   );
 
   const findPhotoRecipe = useCallback((photoId: string): DevelopRecipe | null => {
+    const liveDraft = sharedLiveDevelopDraftStore.getDraft();
+    if (liveDraft && liveDraft.photoId === photoId) {
+      return liveDraft.recipe;
+    }
     const current = sessionRef.current;
     if (!current) return null;
     for (const cluster of current.clusters) {
@@ -782,6 +810,9 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
 
   const recordRecentFromSnapshot = useCallback((loaded: StudioSessionSnapshot) => {
     if (!loaded.folderPath) return;
+    // Keep Recent Projects strictly for full folder shoots so opening a single photo from a
+    // folder never overwrites that folder's project card with a 1-frame entry.
+    if (loaded.sessionMode && loaded.sessionMode !== 'folder') return;
     const coverThumbnails: string[] = [];
     const primaryClusters = loaded.clusters.filter((c) => !c.anchor.id.startsWith('_'));
     const sourceClusters = primaryClusters.length > 0 ? primaryClusters : loaded.clusters;
@@ -926,6 +957,19 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
 
   const applyLoadedSession = useCallback(
     (loaded: StudioSessionSnapshot, preferredClusterId?: string) => {
+      if (pendingDraftCommitTimerRef.current !== null) {
+        window.clearTimeout(pendingDraftCommitTimerRef.current);
+        pendingDraftCommitTimerRef.current = null;
+      }
+      sharedLiveDevelopDraftStore.clear();
+      if (
+        activeFolderPathRef.current &&
+        loaded.folderPath &&
+        activeFolderPathRef.current !== loaded.folderPath
+      ) {
+        clearDevelopBitmapCache();
+      }
+      sessionModeRef.current = loaded.sessionMode ?? 'folder';
       setSession(loaded);
       setResolvedAmbiguousIds(new Set());
       setActiveDirectoryId(null);
@@ -1547,6 +1591,58 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     ],
   );
 
+  const openPhotoFiles = useCallback(async () => {
+    if (!isDesktopRuntime || !gateway.openPhotoFiles) {
+      notifyAction(
+        'Opening local photo files requires Kroma Desktop (`npm run tauri:dev`)',
+      );
+      return;
+    }
+
+    try {
+      setIsScanningFolder(true);
+      setScanProgress(null);
+      notifyAction('Loading selected photo(s)...');
+      const loaded = await gateway.openPhotoFiles();
+      if (loaded) {
+        setDevelopHistory(EMPTY_DEVELOP_HISTORY);
+        setSlateOcrResults([]);
+        setThumbnailRenderProgress(null);
+        applyLoadedSession(loaded);
+        if (thumbnailPreviewModeRef.current !== 'fast') {
+          request32BitThumbnails(thumbnailPreviewModeRef.current);
+        }
+        setActiveWorkspace('develop');
+        notifyAction(
+          loaded.sessionMode === 'single'
+            ? `Opened ${loaded.telemetry.projectName} in Single Photo Mode`
+            : `Loaded ${loaded.telemetry.totalPhotos} selected photo(s) in ${loaded.telemetry.indexElapsedSeconds}s`,
+        );
+      } else {
+        notifyAction('Photo selection cancelled');
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      notifyAction(`Photo load failed: ${msg}`);
+    } finally {
+      setIsScanningFolder(false);
+      setScanProgress(null);
+    }
+  }, [
+    isDesktopRuntime,
+    gateway,
+    applyLoadedSession,
+    request32BitThumbnails,
+    setActiveWorkspace,
+    notifyAction,
+  ]);
+
+  const openParentFolder = useCallback(async () => {
+    const parentPath = session?.folderPath;
+    if (!parentPath) return;
+    await openRecentShootFolder(parentPath);
+  }, [session?.folderPath, openRecentShootFolder]);
+
   const runFaceOrganizer = useCallback(async () => {
     if (!session) return;
     try {
@@ -1671,6 +1767,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
 
   const setDevelopSourceMode = useCallback(
     (mode: DevelopSourceMode) => {
+      commitPendingLiveDraftRef.current();
       setDevelopSourceModeState(mode);
       setLiveHistogram(null);
       if (!session) return;
@@ -1691,6 +1788,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
 
   const selectDevelopFolder = useCallback(
     (folderId: string | null) => {
+      commitPendingLiveDraftRef.current();
       setDevelopSourceModeState('folders');
       setActiveDevelopFolderId(folderId);
       setLiveHistogram(null);
@@ -1706,6 +1804,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
 
   const selectCluster = useCallback(
     (clusterId: string) => {
+      commitPendingLiveDraftRef.current();
       setActiveClusterId(clusterId);
       setLiveHistogram(null);
       const next = session?.clusters.find((c) => c.anchor.id === clusterId);
@@ -1719,12 +1818,14 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
   );
 
   const handleSetActiveDevelopPhotoId = useCallback((photoId: string) => {
+    commitPendingLiveDraftRef.current();
     setActiveDevelopPhotoId(photoId);
     setLiveHistogram(null);
   }, []);
 
   const openPhotoInDevelop = useCallback(
     (photoId: string, clusterId?: string) => {
+      commitPendingLiveDraftRef.current();
       if (clusterId && clusterId !== activeClusterId) {
         selectCluster(clusterId);
       }
@@ -2031,6 +2132,16 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     [gateway],
   );
 
+  const getPhotoNativeDimensions = useCallback(
+    async (
+      photoId: string,
+    ): Promise<{ readonly width: number; readonly height: number } | null> => {
+      if (!gateway.getPhotoNativeDimensions) return null;
+      return gateway.getPhotoNativeDimensions(photoId);
+    },
+    [gateway],
+  );
+
   const generateAiMask = useCallback(
     async (photoId: string, kind: AiMaskKind): Promise<GeneratedAiMaskResult | null> => {
       if (!gateway.generateAiMask) return null;
@@ -2044,6 +2155,77 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     [gateway, notifyAction],
   );
 
+  const commitDraftEntry = useCallback(
+    (entry: LiveDevelopDraftEntry, coalesceHistory: boolean) => {
+      const nextHistory = recordDevelopHistory(developHistoryRef.current, {
+        label: entry.label,
+        coalesceKey: coalesceHistory ? `edit:${entry.photoId}:${entry.label}` : undefined,
+        timestampMs: Date.now(),
+        changes: [{ photoId: entry.photoId, before: entry.beforeRecipe, after: entry.recipe }],
+      });
+      developHistoryRef.current = nextHistory;
+      setDevelopHistory(nextHistory);
+
+      setSession((prev) => {
+        if (!prev) return prev;
+        let touched = false;
+        const nextClusters = prev.clusters.map((cluster) => {
+          const idx = cluster.photos.findIndex((photo) => photo.id === entry.photoId);
+          if (idx === -1) return cluster;
+          touched = true;
+          const nextPhotos = cluster.photos.slice();
+          nextPhotos[idx] = { ...nextPhotos[idx], developRecipe: entry.recipe };
+          return { ...cluster, photos: nextPhotos };
+        });
+        return touched ? { ...prev, clusters: nextClusters } : prev;
+      });
+
+      const existingPending = pendingRecipeSavesRef.current.get(entry.photoId);
+      if (existingPending) {
+        window.clearTimeout(existingPending.timerId);
+      }
+      const timerId = window.setTimeout(() => {
+        pendingRecipeSavesRef.current.delete(entry.photoId);
+        void gateway
+          .savePhotoDevelopRecipe(entry.photoId, entry.recipe)
+          .then((hist) => {
+            if (hist) setLiveHistogram(hist);
+            if (thumbnailPreviewModeRef.current !== 'fast') {
+              request32BitThumbnails(thumbnailPreviewModeRef.current, [entry.photoId]);
+            }
+          })
+          .catch((err) => {
+            notifyAction(`Sidecar save error: ${String(err)}`);
+          });
+      }, 240);
+      pendingRecipeSavesRef.current.set(entry.photoId, { timerId, recipe: entry.recipe });
+    },
+    [gateway, request32BitThumbnails, notifyAction],
+  );
+
+  const commitPendingLiveDraft = useCallback(() => {
+    if (pendingDraftCommitTimerRef.current !== null) {
+      window.clearTimeout(pendingDraftCommitTimerRef.current);
+      pendingDraftCommitTimerRef.current = null;
+    }
+    const pending = sharedLiveDevelopDraftStore.takePendingCommit();
+    if (pending) {
+      commitDraftEntry(pending, true);
+    }
+  }, [commitDraftEntry]);
+
+  commitPendingLiveDraftRef.current = commitPendingLiveDraft;
+
+  useEffect(() => {
+    return () => {
+      if (pendingDraftCommitTimerRef.current !== null) {
+        window.clearTimeout(pendingDraftCommitTimerRef.current);
+        pendingDraftCommitTimerRef.current = null;
+      }
+      sharedLiveDevelopDraftStore.clear();
+    };
+  }, []);
+
   const updatePhotoRecipe = useCallback(
     (
       photoId: string,
@@ -2051,56 +2233,54 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       label: string = 'Develop edit',
       coalesce: boolean = true,
     ) => {
-      const beforeRecipe = findPhotoRecipe(photoId);
-      if (beforeRecipe) {
-        setDevelopHistory((prev) =>
-          recordDevelopHistory(prev, {
-            label,
-            coalesceKey: coalesce ? `edit:${photoId}:${label}` : undefined,
-            timestampMs: Date.now(),
-            changes: [{ photoId, before: beforeRecipe, after: nextRecipe }],
-          }),
-        );
-      }
-
-      setSession((prev) => {
-        if (!prev) return prev;
-        let touched = false;
-        const nextClusters = prev.clusters.map((cluster) => {
-          const idx = cluster.photos.findIndex((photo) => photo.id === photoId);
-          if (idx === -1) return cluster;
-          touched = true;
-          const nextPhotos = cluster.photos.slice();
-          nextPhotos[idx] = { ...nextPhotos[idx], developRecipe: nextRecipe };
-          return { ...cluster, photos: nextPhotos };
+      if (coalesce) {
+        // High-frequency slider/curve/wheel/brush drag: publish to the external draft store so
+        // ONLY the active Studio canvas & inspector re-render at 120 FPS (zero StudioProvider cascade).
+        const beforeRecipe = findPhotoRecipe(photoId) ?? nextRecipe;
+        const displaced = sharedLiveDevelopDraftStore.setDraft({
+          photoId,
+          beforeRecipe,
+          recipe: nextRecipe,
+          label,
         });
-        return touched ? { ...prev, clusters: nextClusters } : prev;
-      });
-
-      const existingPending = pendingRecipeSavesRef.current.get(photoId);
-      if (existingPending) {
-        window.clearTimeout(existingPending.timerId);
+        if (displaced) {
+          commitDraftEntry(displaced, true);
+        }
+        if (pendingDraftCommitTimerRef.current !== null) {
+          window.clearTimeout(pendingDraftCommitTimerRef.current);
+        }
+        pendingDraftCommitTimerRef.current = window.setTimeout(() => {
+          pendingDraftCommitTimerRef.current = null;
+          commitPendingLiveDraft();
+        }, 120);
+        return;
       }
-      const timerId = window.setTimeout(() => {
-        pendingRecipeSavesRef.current.delete(photoId);
-        void gateway
-          .savePhotoDevelopRecipe(photoId, nextRecipe)
-          .then((hist) => {
-            if (hist) setLiveHistogram(hist);
-            if (thumbnailPreviewModeRef.current !== 'fast') {
-              request32BitThumbnails(thumbnailPreviewModeRef.current, [photoId]);
-            }
-          })
-          .catch((err) => {
-            notifyAction(`Sidecar save error: ${String(err)}`);
-          });
-      }, 240);
-      pendingRecipeSavesRef.current.set(photoId, { timerId, recipe: nextRecipe });
+
+      // Discrete edit (preset, reset, WB eyedropper, AI mask, final brush stroke):
+      // flush any in-flight drag cleanly and commit immediately as a distinct undo step.
+      if (pendingDraftCommitTimerRef.current !== null) {
+        window.clearTimeout(pendingDraftCommitTimerRef.current);
+        pendingDraftCommitTimerRef.current = null;
+      }
+      const pending = sharedLiveDevelopDraftStore.takePendingCommit();
+      if (pending && pending.photoId === photoId && pending.label === label) {
+        commitDraftEntry(
+          { photoId, beforeRecipe: pending.beforeRecipe, recipe: nextRecipe, label },
+          false,
+        );
+        return;
+      }
+      if (pending) {
+        commitDraftEntry(pending, true);
+      }
+      const beforeRecipe = findPhotoRecipe(photoId) ?? nextRecipe;
+      commitDraftEntry({ photoId, beforeRecipe, recipe: nextRecipe, label }, false);
     },
-    [findPhotoRecipe, gateway, request32BitThumbnails, notifyAction],
+    [findPhotoRecipe, commitDraftEntry, commitPendingLiveDraft],
   );
 
   const flushPendingRecipeSaves = useCallback(async () => {
+    commitPendingLiveDraft();
     const entries = Array.from(pendingRecipeSavesRef.current.entries());
     if (entries.length === 0) return;
     pendingRecipeSavesRef.current.clear();
@@ -2115,14 +2295,14 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     await Promise.allSettled(
       items.map((item) => gateway.savePhotoDevelopRecipe(item.photoId, item.recipe)),
     );
-  }, [gateway]);
+  }, [commitPendingLiveDraft, gateway]);
 
   const syncRecipeFromPhoto = useCallback(
     (sourcePhotoId: string, mask: DevelopSyncMask, scope: SyncTargetScope) => {
-      const current = sessionRef.current;
-      if (!current) return;
       const src = findPhotoRecipe(sourcePhotoId);
-      if (!src) return;
+      commitPendingLiveDraft();
+      const current = sessionRef.current;
+      if (!current || !src) return;
 
       const activePoolIds = new Set(developPhotos.map((p) => p.id));
       const targetIds: string[] = [];
@@ -2175,11 +2355,21 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
           .catch((err) => notifyAction(`Sync error: ${String(err)}`));
       }
     },
-    [findPhotoRecipe, developPhotos, selectedPhotoIds, gateway, request32BitThumbnails, notifyAction],
+    [
+      findPhotoRecipe,
+      commitPendingLiveDraft,
+      developPhotos,
+      selectedPhotoIds,
+      gateway,
+      request32BitThumbnails,
+      notifyAction,
+    ],
   );
 
   const applyRelativeNudgeToClusterSelection = useCallback(
     (delta: RelativeDevelopDelta, label: string) => {
+      const liveDraft = sharedLiveDevelopDraftStore.getDraft();
+      commitPendingLiveDraft();
       const current = sessionRef.current;
       if (!current) return;
       const activePoolIds = new Set(developPhotos.map((p) => p.id));
@@ -2194,9 +2384,11 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
             photo.id === activeDevelopPhoto?.id ||
             (selectedPhotoIds.size > 0 && selectedPhotoIds.has(photo.id));
           if (!inTarget) return photo;
-          const after = applyRelativeDevelopDelta(photo.developRecipe, delta);
+          const baseRecipe =
+            liveDraft && liveDraft.photoId === photo.id ? liveDraft.recipe : photo.developRecipe;
+          const after = applyRelativeDevelopDelta(baseRecipe, delta);
           nudgedIds.push(photo.id);
-          changes.push({ photoId: photo.id, before: photo.developRecipe, after });
+          changes.push({ photoId: photo.id, before: baseRecipe, after });
           clusterTouched = true;
           return { ...photo, developRecipe: after };
         });
@@ -2230,16 +2422,27 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
           .catch((err) => notifyAction(`Quick Develop error: ${String(err)}`));
       }
     },
-    [developPhotos, selectedPhotoIds, activeDevelopPhoto, gateway, request32BitThumbnails, notifyAction],
+    [
+      commitPendingLiveDraft,
+      developPhotos,
+      selectedPhotoIds,
+      activeDevelopPhoto,
+      gateway,
+      request32BitThumbnails,
+      notifyAction,
+    ],
   );
 
   const copyActiveRecipe = useCallback(() => {
     if (!activeDevelopPhoto) return;
-    setCopiedRecipe(activeDevelopPhoto.developRecipe);
+    const latest = findPhotoRecipe(activeDevelopPhoto.id) ?? activeDevelopPhoto.developRecipe;
+    commitPendingLiveDraft();
+    setCopiedRecipe(latest);
     notifyAction(`Copied recipe from ${activeDevelopPhoto.fileName}`);
-  }, [activeDevelopPhoto, notifyAction]);
+  }, [activeDevelopPhoto, findPhotoRecipe, commitPendingLiveDraft, notifyAction]);
 
   const pasteRecipeToClusterSelection = useCallback(() => {
+    commitPendingLiveDraft();
     const current = sessionRef.current;
     if (!copiedRecipe || !current) return;
     const activePoolIds = new Set(developPhotos.map((p) => p.id));
@@ -2303,6 +2506,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       }
     }
   }, [
+    commitPendingLiveDraft,
     copiedRecipe,
     developPhotos,
     selectedPhotoIds,
@@ -2695,20 +2899,24 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     developHistory.redoStack[developHistory.redoStack.length - 1]?.label ?? null;
 
   const undoDevelopAction = useCallback(() => {
+    commitPendingLiveDraft();
     const { nextStack, entry } = undoDevelopHistory(developHistoryRef.current);
     if (!entry) return;
+    developHistoryRef.current = nextStack;
     setDevelopHistory(nextStack);
     applyRecipeChangesToSession(entry.changes, 'before');
     notifyAction(`Undid: ${entry.label}`);
-  }, [applyRecipeChangesToSession, notifyAction]);
+  }, [commitPendingLiveDraft, applyRecipeChangesToSession, notifyAction]);
 
   const redoDevelopAction = useCallback(() => {
+    commitPendingLiveDraft();
     const { nextStack, entry } = redoDevelopHistory(developHistoryRef.current);
     if (!entry) return;
+    developHistoryRef.current = nextStack;
     setDevelopHistory(nextStack);
     applyRecipeChangesToSession(entry.changes, 'after');
     notifyAction(`Redid: ${entry.label}`);
-  }, [applyRecipeChangesToSession, notifyAction]);
+  }, [commitPendingLiveDraft, applyRecipeChangesToSession, notifyAction]);
 
   const undoOrganizationAction = useCallback(async () => {
     if (!canUndo || isScanningFolder) return;
@@ -2738,12 +2946,13 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     }
   }, [canRedo, isScanningFolder, redoLabel, gateway, applyLoadedSession, activeClusterId, notifyAction]);
 
-  // Global Ctrl+O (Open Project) & Ctrl+, (Open Settings) shortcuts for native desktop ergonomics
+  // Global Ctrl+O (Open Folder), Ctrl+Shift+O (Open Photo(s)) & Ctrl+, (Open Settings) shortcuts
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
       const key = event.key.toLowerCase();
       if (key !== 'o' && key !== ',') return;
+      if (key === ',' && event.shiftKey) return;
       const target = event.target as HTMLElement | null;
       if (
         target &&
@@ -2757,12 +2966,16 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
         return;
       }
       if (!isScanningFolder) {
-        void openShootFolder();
+        if (event.shiftKey) {
+          void openPhotoFiles();
+        } else {
+          void openShootFolder();
+        }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isScanningFolder, openShootFolder, toggleSettings]);
+  }, [isScanningFolder, openShootFolder, openPhotoFiles, toggleSettings]);
 
   // Context-aware global Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y) Undo/Redo:
   // - Inside Studio (`develop`), undoes/redoes non-destructive color & curve edits.
@@ -2784,7 +2997,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       const key = event.key.toLowerCase();
       if (key === 'z' && !event.shiftKey) {
         if (activeWorkspace === 'develop') {
-          if (!canUndoDevelop) return;
+          if (!canUndoDevelop && !sharedLiveDevelopDraftStore.getDraft()) return;
           event.preventDefault();
           undoDevelopAction();
         } else {
@@ -2943,154 +3156,310 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     return { ...session, clusters: sortedClusters };
   }, [session, sortedClusters]);
 
-  const value: StudioContextValue = {
-    isDesktopRuntime,
-    isBootReady,
-    bootPhase,
-    modelManifestStatus,
-    modelDownloadProgress,
-    modelDownloadError,
-    startupUpdate,
-    isScanningFolder,
-    isScanningOcr,
-    slateOcrResults,
-    scanProgress,
-    thumbnailRenderProgress,
-    developViewportStatus,
-    exportJob,
-    runtimeInfo,
-    session: sessionWithSortedClusters,
-    preferences,
-    recentProjects,
-    activeWorkspace,
-    activeCluster,
-    developSourceMode: effectiveDevelopSourceMode,
-    activeDevelopFolderId,
-    developPhotos,
-    activeDevelopScopeLabel,
-    activeDevelopPhoto,
-    liveHistogram,
-    visibleClusterPhotos,
-    ambiguousReviewQueue,
-    selectedPhotoIds,
-    copiedRecipe,
-    activeDirectoryId,
-    activeVirtualFolderId,
-    activeVirtualFolderAllowedIds,
-    folderCreateNonce,
-    smartBin,
-    searchQuery,
-    sfaceThreshold,
-    lastClusteredThreshold,
-    reviewWarningThreshold,
-    approvedReviewPhotoIds: resolvedAmbiguousIds,
-    useTemporalAssist,
-    lastClusteredTemporalAssist,
-    manualMatchSplitOpen,
-    studioFocusMode,
-    displayMode,
-    anchorSortMode,
-    showLandmarksOverlay,
-    outputRule,
-    statusBanner,
-    canUndo,
-    canRedo,
-    undoLabel,
-    redoLabel,
-    canUndoDevelop,
-    canRedoDevelop,
-    undoDevelopLabel,
-    redoDevelopLabel,
-    isWindowMaximized,
-    settingsOpen,
-    retryModelDownload,
-    continueWithoutModels,
-    dismissStartupUpdate,
-    setActiveWorkspace,
-    openSettings,
-    closeSettings,
-    toggleSettings,
-    updatePreferences,
-    savePreferences,
-    resetPreferences,
-    pickOnnxModelFile,
-    inspectOnnxModel,
-    applyCustomAiModel,
-    setDevelopSourceMode,
-    selectDevelopFolder,
-    openShootFolder,
-    openRecentShootFolder,
-    removeRecentProjectEntry,
-    clearRecentProjects,
-    togglePinRecentProjectEntry,
-    getStorageCacheSummary,
-    pickCacheDirectory,
-    clearStorageCache,
-    runFaceOrganizer,
-    scanProjectSlatesOcr,
-    cancelSlateOcrScan,
-    scanSinglePhotoOcr,
-    applySlateOcrRenames,
-    openPhotoInDevelop,
-    selectCluster,
-    selectNextCluster,
-    selectNextSingletonCluster,
-    setManualMatchSplitOpen,
-    setStudioFocusMode,
-    toggleStudioFocusMode,
-    setDevelopViewportStatus,
-    setActiveDevelopPhotoId: handleSetActiveDevelopPhotoId,
-    toggleDirectoryFilter,
-    setActiveVirtualFolderId,
-    requestNewVirtualFolder,
-    createVirtualFolder,
-    renameVirtualFolder,
-    moveVirtualFolder,
-    deleteVirtualFolder,
-    assignPhotosToVirtualFolder,
-    assignClustersToVirtualFolder,
-    setSmartBin,
-    setSearchQuery,
-    setSfaceThreshold,
-    setReviewWarningThreshold,
-    setUseTemporalAssist,
-    setDisplayMode,
-    setAnchorSortMode,
-    toggleLandmarksOverlay,
-    togglePhotoSelection,
-    selectAllVisiblePhotos,
-    peekDevelopWorkingBuffer,
-    loadDevelopWorkingBuffer,
-    generateAiMask,
-    updatePhotoRecipe,
-    syncRecipeFromPhoto,
-    applyRelativeNudgeToClusterSelection,
-    copyActiveRecipe,
-    pasteRecipeToClusterSelection,
-    mergeActiveClusterInto,
-    mergeClustersById,
-    movePhotosToCluster,
-    splitSelectedPhotos,
-    splitPhotoIdsToNewCluster,
-    autoLevelActiveCluster,
-    resolveAmbiguousReview,
-    batchResolveAmbiguousReview,
-    renameActiveSlate,
-    setExcludeSlateFromClientPack,
-    setOutputPattern,
-    syncSlateWhiteBalanceForActiveCluster,
-    undoOrganizationAction,
-    redoOrganizationAction,
-    undoDevelopAction,
-    redoDevelopAction,
-    pickExportDirectory,
-    estimateExportSize,
-    runBatchExport,
-    minimizeWindow,
-    toggleMaximizeWindow,
-    exitApp,
-    notifyAction,
-  };
+  const value = useMemo<StudioContextValue>(
+    () => ({
+      isDesktopRuntime,
+      isBootReady,
+      bootPhase,
+      modelManifestStatus,
+      modelDownloadProgress,
+      modelDownloadError,
+      startupUpdate,
+      isScanningFolder,
+      isScanningOcr,
+      slateOcrResults,
+      scanProgress,
+      thumbnailRenderProgress,
+      developViewportStatus,
+      exportJob,
+      runtimeInfo,
+      session: sessionWithSortedClusters,
+      preferences,
+      recentProjects,
+      activeWorkspace,
+      activeCluster,
+      developSourceMode: effectiveDevelopSourceMode,
+      activeDevelopFolderId,
+      developPhotos,
+      activeDevelopScopeLabel,
+      activeDevelopPhoto,
+      liveHistogram,
+      visibleClusterPhotos,
+      ambiguousReviewQueue,
+      selectedPhotoIds,
+      copiedRecipe,
+      activeDirectoryId,
+      activeVirtualFolderId,
+      activeVirtualFolderAllowedIds,
+      folderCreateNonce,
+      smartBin,
+      searchQuery,
+      sfaceThreshold,
+      lastClusteredThreshold,
+      reviewWarningThreshold,
+      approvedReviewPhotoIds: resolvedAmbiguousIds,
+      useTemporalAssist,
+      lastClusteredTemporalAssist,
+      manualMatchSplitOpen,
+      studioFocusMode,
+      displayMode,
+      anchorSortMode,
+      showLandmarksOverlay,
+      outputRule,
+      statusBanner,
+      canUndo,
+      canRedo,
+      undoLabel,
+      redoLabel,
+      canUndoDevelop,
+      canRedoDevelop,
+      undoDevelopLabel,
+      redoDevelopLabel,
+      isWindowMaximized,
+      settingsOpen,
+      retryModelDownload,
+      continueWithoutModels,
+      dismissStartupUpdate,
+      setActiveWorkspace,
+      openSettings,
+      closeSettings,
+      toggleSettings,
+      updatePreferences,
+      savePreferences,
+      resetPreferences,
+      pickOnnxModelFile,
+      inspectOnnxModel,
+      applyCustomAiModel,
+      setDevelopSourceMode,
+      selectDevelopFolder,
+      openShootFolder,
+      openPhotoFiles,
+      openParentFolder,
+      openRecentShootFolder,
+      removeRecentProjectEntry,
+      clearRecentProjects,
+      togglePinRecentProjectEntry,
+      getStorageCacheSummary,
+      pickCacheDirectory,
+      clearStorageCache,
+      runFaceOrganizer,
+      scanProjectSlatesOcr,
+      cancelSlateOcrScan,
+      scanSinglePhotoOcr,
+      applySlateOcrRenames,
+      openPhotoInDevelop,
+      selectCluster,
+      selectNextCluster,
+      selectNextSingletonCluster,
+      setManualMatchSplitOpen,
+      setStudioFocusMode,
+      toggleStudioFocusMode,
+      setDevelopViewportStatus,
+      setActiveDevelopPhotoId: handleSetActiveDevelopPhotoId,
+      toggleDirectoryFilter,
+      setActiveVirtualFolderId,
+      requestNewVirtualFolder,
+      createVirtualFolder,
+      renameVirtualFolder,
+      moveVirtualFolder,
+      deleteVirtualFolder,
+      assignPhotosToVirtualFolder,
+      assignClustersToVirtualFolder,
+      setSmartBin,
+      setSearchQuery,
+      setSfaceThreshold,
+      setReviewWarningThreshold,
+      setUseTemporalAssist,
+      setDisplayMode,
+      setAnchorSortMode,
+      toggleLandmarksOverlay,
+      togglePhotoSelection,
+      selectAllVisiblePhotos,
+      peekDevelopWorkingBuffer,
+      loadDevelopWorkingBuffer,
+      getPhotoNativeDimensions,
+      generateAiMask,
+      updatePhotoRecipe,
+      syncRecipeFromPhoto,
+      applyRelativeNudgeToClusterSelection,
+      copyActiveRecipe,
+      pasteRecipeToClusterSelection,
+      mergeActiveClusterInto,
+      mergeClustersById,
+      movePhotosToCluster,
+      splitSelectedPhotos,
+      splitPhotoIdsToNewCluster,
+      autoLevelActiveCluster,
+      resolveAmbiguousReview,
+      batchResolveAmbiguousReview,
+      renameActiveSlate,
+      setExcludeSlateFromClientPack,
+      setOutputPattern,
+      syncSlateWhiteBalanceForActiveCluster,
+      undoOrganizationAction,
+      redoOrganizationAction,
+      undoDevelopAction,
+      redoDevelopAction,
+      pickExportDirectory,
+      estimateExportSize,
+      runBatchExport,
+      minimizeWindow,
+      toggleMaximizeWindow,
+      exitApp,
+      notifyAction,
+    }),
+    [
+      isDesktopRuntime,
+      isBootReady,
+      bootPhase,
+      modelManifestStatus,
+      modelDownloadProgress,
+      modelDownloadError,
+      startupUpdate,
+      isScanningFolder,
+      isScanningOcr,
+      slateOcrResults,
+      scanProgress,
+      thumbnailRenderProgress,
+      developViewportStatus,
+      exportJob,
+      runtimeInfo,
+      sessionWithSortedClusters,
+      preferences,
+      recentProjects,
+      activeWorkspace,
+      activeCluster,
+      effectiveDevelopSourceMode,
+      activeDevelopFolderId,
+      developPhotos,
+      activeDevelopScopeLabel,
+      activeDevelopPhoto,
+      liveHistogram,
+      visibleClusterPhotos,
+      ambiguousReviewQueue,
+      selectedPhotoIds,
+      copiedRecipe,
+      activeDirectoryId,
+      activeVirtualFolderId,
+      activeVirtualFolderAllowedIds,
+      folderCreateNonce,
+      smartBin,
+      searchQuery,
+      sfaceThreshold,
+      lastClusteredThreshold,
+      reviewWarningThreshold,
+      resolvedAmbiguousIds,
+      useTemporalAssist,
+      lastClusteredTemporalAssist,
+      manualMatchSplitOpen,
+      studioFocusMode,
+      displayMode,
+      anchorSortMode,
+      showLandmarksOverlay,
+      outputRule,
+      statusBanner,
+      canUndo,
+      canRedo,
+      undoLabel,
+      redoLabel,
+      canUndoDevelop,
+      canRedoDevelop,
+      undoDevelopLabel,
+      redoDevelopLabel,
+      isWindowMaximized,
+      settingsOpen,
+      retryModelDownload,
+      continueWithoutModels,
+      dismissStartupUpdate,
+      setActiveWorkspace,
+      openSettings,
+      closeSettings,
+      toggleSettings,
+      updatePreferences,
+      savePreferences,
+      resetPreferences,
+      pickOnnxModelFile,
+      inspectOnnxModel,
+      applyCustomAiModel,
+      setDevelopSourceMode,
+      selectDevelopFolder,
+      openShootFolder,
+      openPhotoFiles,
+      openParentFolder,
+      openRecentShootFolder,
+      removeRecentProjectEntry,
+      clearRecentProjects,
+      togglePinRecentProjectEntry,
+      getStorageCacheSummary,
+      pickCacheDirectory,
+      clearStorageCache,
+      runFaceOrganizer,
+      scanProjectSlatesOcr,
+      cancelSlateOcrScan,
+      scanSinglePhotoOcr,
+      applySlateOcrRenames,
+      openPhotoInDevelop,
+      selectCluster,
+      selectNextCluster,
+      selectNextSingletonCluster,
+      setManualMatchSplitOpen,
+      setStudioFocusMode,
+      toggleStudioFocusMode,
+      setDevelopViewportStatus,
+      handleSetActiveDevelopPhotoId,
+      toggleDirectoryFilter,
+      setActiveVirtualFolderId,
+      requestNewVirtualFolder,
+      createVirtualFolder,
+      renameVirtualFolder,
+      moveVirtualFolder,
+      deleteVirtualFolder,
+      assignPhotosToVirtualFolder,
+      assignClustersToVirtualFolder,
+      setSmartBin,
+      setSearchQuery,
+      setSfaceThreshold,
+      setReviewWarningThreshold,
+      setUseTemporalAssist,
+      setDisplayMode,
+      setAnchorSortMode,
+      toggleLandmarksOverlay,
+      togglePhotoSelection,
+      selectAllVisiblePhotos,
+      peekDevelopWorkingBuffer,
+      loadDevelopWorkingBuffer,
+      getPhotoNativeDimensions,
+      generateAiMask,
+      updatePhotoRecipe,
+      syncRecipeFromPhoto,
+      applyRelativeNudgeToClusterSelection,
+      copyActiveRecipe,
+      pasteRecipeToClusterSelection,
+      mergeActiveClusterInto,
+      mergeClustersById,
+      movePhotosToCluster,
+      splitSelectedPhotos,
+      splitPhotoIdsToNewCluster,
+      autoLevelActiveCluster,
+      resolveAmbiguousReview,
+      batchResolveAmbiguousReview,
+      renameActiveSlate,
+      setExcludeSlateFromClientPack,
+      setOutputPattern,
+      syncSlateWhiteBalanceForActiveCluster,
+      undoOrganizationAction,
+      redoOrganizationAction,
+      undoDevelopAction,
+      redoDevelopAction,
+      pickExportDirectory,
+      estimateExportSize,
+      runBatchExport,
+      minimizeWindow,
+      toggleMaximizeWindow,
+      exitApp,
+      notifyAction,
+    ],
+  );
 
   return <StudioContext.Provider value={value}>{children}</StudioContext.Provider>;
 }

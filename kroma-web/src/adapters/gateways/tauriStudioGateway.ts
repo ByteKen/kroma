@@ -21,6 +21,7 @@ import type {
   ScanProgressUpdate,
   StorageCacheSummary,
   StudioGateway,
+  StudioSessionMode,
   StudioSessionSnapshot,
   ThumbnailRenderProgress,
 } from '../../application/ports/studioGateway';
@@ -33,6 +34,7 @@ import {
   type WhiteBalanceSettings,
 } from '../../domain/develop';
 import {
+  isWebNativeFileName,
   parseDevelopWorkingBuffer,
   type DevelopWorkingBuffer,
   type WorkingBufferPrecision,
@@ -105,6 +107,7 @@ interface AmbiguousCandidateDto {
 }
 
 interface ShootSessionDto {
+  readonly sessionMode?: StudioSessionMode;
   readonly folderPath: string;
   readonly projectName: string;
   readonly isClustered: boolean;
@@ -189,12 +192,16 @@ function mapHistogramDto(dto: HistogramDto): LiveRgbHistogram {
 
 function mapPhotoDto(dto: PhotoDto): PhotoAsset {
   const ext = dto.fileName.split('.').pop()?.toUpperCase() ?? 'IMG';
+  const studioSourceUrl = isWebNativeFileName(dto.fileName)
+    ? toWebViewAssetUrl(dto.sourcePath)
+    : undefined;
   return {
     id: dto.id,
     fileName: dto.fileName,
     directoryId: dto.directoryId,
     virtualFolderId: dto.virtualFolderId ?? null,
     imageUrl: toWebViewAssetUrl(dto.previewPath),
+    studioSourceUrl,
     renderedThumbnailUrl: dto.renderedPreviewPath
       ? toWebViewAssetUrl(dto.renderedPreviewPath)
       : null,
@@ -295,6 +302,7 @@ function mapSessionDto(
   const clusteredFacesCount = clusters.reduce((sum, c) => sum + c.photos.length, 0);
 
   return {
+    sessionMode: dto.sessionMode ?? 'folder',
     isClustered: dto.isClustered,
     folderPath: dto.folderPath,
     telemetry: {
@@ -350,14 +358,27 @@ function mapSessionDto(
  */
 export class TauriStudioGateway implements StudioGateway {
   private static readonly MAX_DEVELOP_BUFFER_LRU = 12;
+  private static readonly MAX_HI_RES_DEVELOP_BUFFER_LRU = 2;
   private hasLoadedLocalShoot = false;
   private cachedRuntimeStatus: RuntimeInfo | null = null;
   private readonly developBufferLru = new Map<string, DevelopWorkingBuffer | null>();
+  private readonly hiResDevelopBufferLru = new Map<string, DevelopWorkingBuffer | null>();
   private readonly inFlightDevelopBuffers = new Map<string, Promise<DevelopWorkingBuffer | null>>();
+  private readonly nativeDimsCache = new Map<
+    string,
+    { readonly width: number; readonly height: number } | null
+  >();
+  private readonly inFlightNativeDims = new Map<
+    string,
+    Promise<{ readonly width: number; readonly height: number } | null>
+  >();
 
   private clearDevelopBufferCache(): void {
     this.developBufferLru.clear();
+    this.hiResDevelopBufferLru.clear();
     this.inFlightDevelopBuffers.clear();
+    this.nativeDimsCache.clear();
+    this.inFlightNativeDims.clear();
   }
 
   isDesktopRuntime(): boolean {
@@ -611,6 +632,46 @@ export class TauriStudioGateway implements StudioGateway {
     return mapSessionDto(dto, this.cachedRuntimeStatus);
   }
 
+  async openPhotoFiles(): Promise<StudioSessionSnapshot | null> {
+    const selected = await openNativeDialog({
+      directory: false,
+      multiple: true,
+      title: 'Open Photo(s)',
+      filters: [
+        {
+          name: 'RAW & Standard Photos',
+          extensions: [
+            'arw', 'cr2', 'cr3', 'nef', 'nrw', 'raf', 'dng', 'orf', 'ori', 'rw2', 'rwl',
+            'pef', 'srw', 'crw', 'dcr', 'dcs', 'erf', 'iiq', 'kdc', 'mef', 'mos', 'mrw',
+            'ari', 'crm', '3fr', 'fff', 'x3f', 'qtk', 'raw',
+            'jpg', 'jpeg', 'png', 'tif', 'tiff', 'webp',
+          ],
+        },
+      ],
+    });
+    if (!selected) {
+      return null;
+    }
+    const paths = Array.isArray(selected) ? selected : [selected];
+    if (paths.length === 0) {
+      return null;
+    }
+    return this.openPhotoFilesAtPaths(paths);
+  }
+
+  async openPhotoFilesAtPaths(
+    filePaths: readonly string[],
+  ): Promise<StudioSessionSnapshot | null> {
+    const cleaned = filePaths.map((p) => p.trim()).filter((p) => p.length > 0);
+    if (cleaned.length === 0) return null;
+    this.clearDevelopBufferCache();
+    const dto = await invoke<ShootSessionDto>('load_photo_files', {
+      filePaths: cleaned,
+    });
+    this.hasLoadedLocalShoot = true;
+    return mapSessionDto(dto, this.cachedRuntimeStatus);
+  }
+
   async runFaceClustering(
     sfaceThreshold: number,
     useTemporalAssist: boolean = true,
@@ -825,13 +886,15 @@ export class TauriStudioGateway implements StudioGateway {
     if (!this.hasLoadedLocalShoot) {
       return null;
     }
+    const isHiRes = maxDim === 0 || maxDim > 2560;
+    const lru = isHiRes ? this.hiResDevelopBufferLru : this.developBufferLru;
     const cacheKey = `${photoId}@${maxDim}@${precision}`;
-    if (!this.developBufferLru.has(cacheKey)) {
+    if (!lru.has(cacheKey)) {
       return null;
     }
-    const hit = this.developBufferLru.get(cacheKey) ?? null;
-    this.developBufferLru.delete(cacheKey);
-    this.developBufferLru.set(cacheKey, hit);
+    const hit = lru.get(cacheKey) ?? null;
+    lru.delete(cacheKey);
+    lru.set(cacheKey, hit);
     return hit;
   }
 
@@ -843,11 +906,16 @@ export class TauriStudioGateway implements StudioGateway {
     if (!this.hasLoadedLocalShoot) {
       return null;
     }
+    const isHiRes = maxDim === 0 || maxDim > 2560;
+    const lru = isHiRes ? this.hiResDevelopBufferLru : this.developBufferLru;
+    const maxEntries = isHiRes
+      ? TauriStudioGateway.MAX_HI_RES_DEVELOP_BUFFER_LRU
+      : TauriStudioGateway.MAX_DEVELOP_BUFFER_LRU;
     const cacheKey = `${photoId}@${maxDim}@${precision}`;
-    if (this.developBufferLru.has(cacheKey)) {
-      const hit = this.developBufferLru.get(cacheKey) ?? null;
-      this.developBufferLru.delete(cacheKey);
-      this.developBufferLru.set(cacheKey, hit);
+    if (lru.has(cacheKey)) {
+      const hit = lru.get(cacheKey) ?? null;
+      lru.delete(cacheKey);
+      lru.set(cacheKey, hit);
       return hit;
     }
     const existing = this.inFlightDevelopBuffers.get(cacheKey);
@@ -862,13 +930,13 @@ export class TauriStudioGateway implements StudioGateway {
     })
       .then((raw) => {
         const parsed = raw instanceof ArrayBuffer ? parseDevelopWorkingBuffer(raw) : null;
-        if (this.developBufferLru.size >= TauriStudioGateway.MAX_DEVELOP_BUFFER_LRU) {
-          const oldestKey = this.developBufferLru.keys().next().value;
+        if (lru.size >= maxEntries) {
+          const oldestKey = lru.keys().next().value;
           if (oldestKey !== undefined) {
-            this.developBufferLru.delete(oldestKey);
+            lru.delete(oldestKey);
           }
         }
-        this.developBufferLru.set(cacheKey, parsed);
+        lru.set(cacheKey, parsed);
         return parsed;
       })
       .catch(() => null)
@@ -877,6 +945,38 @@ export class TauriStudioGateway implements StudioGateway {
       });
 
     this.inFlightDevelopBuffers.set(cacheKey, request);
+    return request;
+  }
+
+  async getPhotoNativeDimensions(
+    photoId: string,
+  ): Promise<{ readonly width: number; readonly height: number } | null> {
+    if (!this.hasLoadedLocalShoot) {
+      return null;
+    }
+    if (this.nativeDimsCache.has(photoId)) {
+      return this.nativeDimsCache.get(photoId) ?? null;
+    }
+    const existing = this.inFlightNativeDims.get(photoId);
+    if (existing) {
+      return existing;
+    }
+
+    const request = invoke<[number, number] | null>('get_photo_native_dimensions', { photoId })
+      .then((tuple) => {
+        const dims =
+          Array.isArray(tuple) && tuple.length === 2 && tuple[0] > 0 && tuple[1] > 0
+            ? { width: tuple[0], height: tuple[1] }
+            : null;
+        this.nativeDimsCache.set(photoId, dims);
+        return dims;
+      })
+      .catch(() => null)
+      .finally(() => {
+        this.inFlightNativeDims.delete(photoId);
+      });
+
+    this.inFlightNativeDims.set(photoId, request);
     return request;
   }
 
@@ -1005,7 +1105,7 @@ export class TauriStudioGateway implements StudioGateway {
     if (!this.hasLoadedLocalShoot) {
       return null;
     }
-    return invoke<MeasuredExportSize>('estimate_export_size', {
+    return invoke<MeasuredExportSize | null>('estimate_export_size', {
       request: {
         excludeSlatePhoto: request.excludeSlatePhoto,
         archiveExcludedSlates: request.archiveExcludedSlates,

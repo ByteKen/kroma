@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 const MAX_ORGANIZATION_HISTORY: usize = 50;
 const MAX_DEVELOP_BUFFER_CACHE: usize = 12;
+const MAX_HI_RES_DEVELOP_BUFFER_CACHE: usize = 2;
 
 /// Cached 16-bit half-float `KR16` / 32-bit float `KR32` working buffer + compact linear
 /// proxies (`384px` histogram proxy + `640px` thumbnail proxy) for instant Studio Develop photo
@@ -100,8 +101,27 @@ impl OrganizationHistory {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShootSessionMode {
+    #[default]
+    Folder,
+    Files,
+    SinglePhoto,
+}
+
+impl ShootSessionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Folder => "folder",
+            Self::Files => "files",
+            Self::SinglePhoto => "single",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ActiveShootContext {
+    pub session_mode: ShootSessionMode,
     pub folder_path: String,
     pub project_name: String,
     pub sidecars_dir: PathBuf,
@@ -140,15 +160,20 @@ pub struct ActiveShootContext {
 pub type CachedOcrEngine = Arc<Mutex<Option<(String, Arc<PpOcrV5Engine>)>>>;
 pub type CachedSegmenterEngine = Arc<Mutex<Option<(String, Arc<OnnxSubjectSegmenter>)>>>;
 pub type CachedYuNetEngine = Arc<Mutex<Option<(String, Arc<YuNetOnnxDetector>)>>>;
+pub type CachedStdHistBuffers = Arc<Mutex<Vec<(String, Arc<DecodedDevelopBuffer>)>>>;
+pub type CachedHiResBuffers = Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>;
+pub type CachedNativeDims = Arc<Mutex<HashMap<String, (u32, u32)>>>;
 
 pub struct AppState {
     pub default_preview_cache_dir: PathBuf,
     pub custom_cache_dir: Arc<Mutex<Option<PathBuf>>>,
     pub managed_models_dir: Arc<Mutex<PathBuf>>,
+    pub managed_single_sidecars_dir: Arc<Mutex<PathBuf>>,
     pub model_download_cancel: Arc<AtomicBool>,
     pub active_shoot: Arc<Mutex<Option<ActiveShootContext>>>,
     pub load_generation: Arc<AtomicU64>,
     pub thumbnail_render_generation: Arc<AtomicU64>,
+    pub export_estimate_generation: Arc<AtomicU64>,
     pub custom_yunet_path: Arc<Mutex<Option<PathBuf>>>,
     pub custom_recognizer_path: Arc<Mutex<Option<PathBuf>>>,
     pub custom_segmenter_path: Arc<Mutex<Option<PathBuf>>>,
@@ -157,23 +182,36 @@ pub struct AppState {
     /// Cached warmed-up ONNX subject segmenter & YuNet detector for instant AI Masking (<200ms)
     pub cached_segmenter_engine: CachedSegmenterEngine,
     pub cached_yunet_engine: CachedYuNetEngine,
-    /// Bounded LRU cache (max 4 entries, ~50 MB) of decoded 16-bit half-float `KR16` Develop
+    /// Bounded LRU cache (max 12 entries) of decoded 16-bit half-float `KR16` Develop
     /// buffers + compact 384px linear histogram proxies for instant RAW switching & live histograms.
     pub develop_buffer_cache: Arc<Mutex<Vec<CachedDevelopBuffer>>>,
+    /// Bounded LRU cache (max 12 entries, ~14 MB total) of 384px sRGB `f32` histogram proxies for
+    /// standard JPEG/PNG/WebP photos so repeated slider adjustments compute live histograms from RAM
+    /// in ~1–2ms without re-decoding disk previews.
+    pub std_hist_buffer_cache: CachedStdHistBuffers,
+    /// Dedicated 2-entry RAM-only LRU for on-demand native 1:1 zoom buffers (`max_dim > 2560`),
+    /// kept separate from `develop_buffer_cache` so high-res loupe inspection never evicts Fit
+    /// browsing buffers or bloats memory/SSD caches.
+    pub hi_res_develop_buffer_cache: CachedHiResBuffers,
+    /// Lightweight header-only `(width, height)` cache for true `1:1` zoom calculations.
+    pub photo_native_dims_cache: CachedNativeDims,
 }
 
 impl AppState {
     pub fn new() -> Self {
         let default_preview_cache_dir = env::temp_dir().join("kroma_preview_cache");
         let default_managed_models_dir = env::temp_dir().join("kroma_models");
+        let default_single_sidecars_dir = env::temp_dir().join("kroma_single_sidecars");
         Self {
             default_preview_cache_dir,
             custom_cache_dir: Arc::new(Mutex::new(None)),
             managed_models_dir: Arc::new(Mutex::new(default_managed_models_dir)),
+            managed_single_sidecars_dir: Arc::new(Mutex::new(default_single_sidecars_dir)),
             model_download_cancel: Arc::new(AtomicBool::new(false)),
             active_shoot: Arc::new(Mutex::new(None)),
             load_generation: Arc::new(AtomicU64::new(0)),
             thumbnail_render_generation: Arc::new(AtomicU64::new(0)),
+            export_estimate_generation: Arc::new(AtomicU64::new(0)),
             custom_yunet_path: Arc::new(Mutex::new(None)),
             custom_recognizer_path: Arc::new(Mutex::new(None)),
             custom_segmenter_path: Arc::new(Mutex::new(None)),
@@ -183,6 +221,13 @@ impl AppState {
             develop_buffer_cache: Arc::new(Mutex::new(Vec::with_capacity(
                 MAX_DEVELOP_BUFFER_CACHE,
             ))),
+            std_hist_buffer_cache: Arc::new(Mutex::new(Vec::with_capacity(
+                MAX_DEVELOP_BUFFER_CACHE,
+            ))),
+            hi_res_develop_buffer_cache: Arc::new(Mutex::new(Vec::with_capacity(
+                MAX_HI_RES_DEVELOP_BUFFER_CACHE,
+            ))),
+            photo_native_dims_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -197,6 +242,19 @@ impl AppState {
             .lock()
             .map(|g| g.clone())
             .unwrap_or_else(|_| env::temp_dir().join("kroma_models"))
+    }
+
+    pub fn set_managed_single_sidecars_dir(&self, dir: PathBuf) {
+        if let Ok(mut guard) = self.managed_single_sidecars_dir.lock() {
+            *guard = dir;
+        }
+    }
+
+    pub fn resolve_managed_single_sidecars_dir(&self) -> PathBuf {
+        self.managed_single_sidecars_dir
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| env::temp_dir().join("kroma_single_sidecars"))
     }
 
     /// Ordered root search directories for bundled or manifest-downloaded AI models.
@@ -276,12 +334,33 @@ impl AppState {
     }
 
     pub fn get_cached_hist_buffer(&self, source_path: &str) -> Option<Arc<DecodedDevelopBuffer>> {
-        let guard = self.develop_buffer_cache.lock().ok()?;
-        guard
+        if let Ok(guard) = self.develop_buffer_cache.lock()
+            && let Some(entry) = guard
+                .iter()
+                .rev()
+                .find(|entry| entry.source_path == source_path)
+        {
+            return Some(Arc::clone(&entry.hist_buffer));
+        }
+        let mut std_guard = self.std_hist_buffer_cache.lock().ok()?;
+        let pos = std_guard
             .iter()
-            .rev()
-            .find(|entry| entry.source_path == source_path)
-            .map(|entry| Arc::clone(&entry.hist_buffer))
+            .position(|(src, _)| src == source_path)?;
+        let (src, buf) = std_guard.remove(pos);
+        let cloned = Arc::clone(&buf);
+        std_guard.push((src, buf));
+        Some(cloned)
+    }
+
+    pub fn insert_std_hist_buffer(&self, source_path: String, buf: Arc<DecodedDevelopBuffer>) {
+        let Ok(mut guard) = self.std_hist_buffer_cache.lock() else {
+            return;
+        };
+        guard.retain(|(existing, _)| existing != &source_path);
+        while guard.len() >= MAX_DEVELOP_BUFFER_CACHE {
+            guard.remove(0);
+        }
+        guard.push((source_path, buf));
     }
 
     pub fn insert_develop_buffer(&self, entry: CachedDevelopBuffer) {
@@ -295,8 +374,50 @@ impl AppState {
         guard.push(entry);
     }
 
+    pub fn get_cached_hi_res_develop_buffer(&self, cache_key: &str) -> Option<Arc<Vec<u8>>> {
+        let mut guard = self.hi_res_develop_buffer_cache.lock().ok()?;
+        let pos = guard.iter().position(|(k, _)| k == cache_key)?;
+        let (k, bytes) = guard.remove(pos);
+        let cloned = Arc::clone(&bytes);
+        guard.push((k, bytes));
+        Some(cloned)
+    }
+
+    pub fn insert_hi_res_develop_buffer(&self, cache_key: String, bytes: Arc<Vec<u8>>) {
+        let Ok(mut guard) = self.hi_res_develop_buffer_cache.lock() else {
+            return;
+        };
+        guard.retain(|(existing, _)| existing != &cache_key);
+        while guard.len() >= MAX_HI_RES_DEVELOP_BUFFER_CACHE {
+            guard.remove(0);
+        }
+        guard.push((cache_key, bytes));
+    }
+
+    pub fn get_cached_native_dims(&self, source_path: &str) -> Option<(u32, u32)> {
+        self.photo_native_dims_cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(source_path).copied())
+    }
+
+    pub fn insert_cached_native_dims(&self, source_path: String, dims: (u32, u32)) {
+        if let Ok(mut guard) = self.photo_native_dims_cache.lock() {
+            guard.insert(source_path, dims);
+        }
+    }
+
     pub fn clear_develop_buffer_cache(&self) {
         if let Ok(mut guard) = self.develop_buffer_cache.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.std_hist_buffer_cache.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.hi_res_develop_buffer_cache.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.photo_native_dims_cache.lock() {
             guard.clear();
         }
     }
@@ -671,5 +792,65 @@ mod tests {
             steps += 1;
         }
         assert_eq!(steps, MAX_ORGANIZATION_HISTORY);
+    }
+
+    #[test]
+    fn std_hist_buffer_cache_enforces_lru_and_clears() {
+        let state = AppState::new();
+        let make_buf = || {
+            Arc::new(DecodedDevelopBuffer {
+                image: image::Rgb32FImage::new(2, 2),
+                is_linear: false,
+                is_wide_gamut: false,
+                bit_depth: 8,
+                is_raw_demosaic: false,
+            })
+        };
+
+        let first = make_buf();
+        state.insert_std_hist_buffer("p0.jpg".to_string(), Arc::clone(&first));
+        for i in 1..MAX_DEVELOP_BUFFER_CACHE {
+            state.insert_std_hist_buffer(format!("p{i}.jpg"), make_buf());
+        }
+
+        // Touch p0.jpg so it becomes MRU, making p1.jpg the LRU entry
+        let hit = state.get_cached_hist_buffer("p0.jpg").expect("p0 hit");
+        assert!(Arc::ptr_eq(&first, &hit));
+
+        // Inserting one more entry must evict p1.jpg while retaining p0.jpg
+        state.insert_std_hist_buffer("p_extra.jpg".to_string(), make_buf());
+        assert!(state.get_cached_hist_buffer("p0.jpg").is_some());
+        assert!(state.get_cached_hist_buffer("p1.jpg").is_none());
+        assert!(state.get_cached_hist_buffer("p_extra.jpg").is_some());
+
+        state.clear_develop_buffer_cache();
+        assert!(state.get_cached_hist_buffer("p0.jpg").is_none());
+        assert!(state.get_cached_hist_buffer("p_extra.jpg").is_none());
+    }
+
+    #[test]
+    fn hi_res_develop_buffer_cache_bounds_to_two_entries_and_clears() {
+        let state = AppState::new();
+        let a = Arc::new(vec![1_u8, 2, 3]);
+        let b = Arc::new(vec![4_u8, 5, 6]);
+        let c = Arc::new(vec![7_u8, 8, 9]);
+
+        state.insert_hi_res_develop_buffer("a@6144".to_string(), Arc::clone(&a));
+        state.insert_hi_res_develop_buffer("b@6144".to_string(), Arc::clone(&b));
+        // Touch `a` so `b` becomes LRU
+        let hit = state.get_cached_hi_res_develop_buffer("a@6144").expect("a hit");
+        assert!(Arc::ptr_eq(&a, &hit));
+
+        state.insert_hi_res_develop_buffer("c@6144".to_string(), Arc::clone(&c));
+        assert!(state.get_cached_hi_res_develop_buffer("a@6144").is_some());
+        assert!(state.get_cached_hi_res_develop_buffer("b@6144").is_none());
+        assert!(state.get_cached_hi_res_develop_buffer("c@6144").is_some());
+
+        state.insert_cached_native_dims("raw.arw".to_string(), (6000, 4000));
+        assert_eq!(state.get_cached_native_dims("raw.arw"), Some((6000, 4000)));
+
+        state.clear_develop_buffer_cache();
+        assert!(state.get_cached_hi_res_develop_buffer("a@6144").is_none());
+        assert!(state.get_cached_native_dims("raw.arw").is_none());
     }
 }

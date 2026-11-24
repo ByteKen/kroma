@@ -1068,6 +1068,7 @@ export function SlateOcrWorkspace() {
                       <img
                         src={inspectedPhoto.imageUrl}
                         alt={inspectedPhoto.fileName}
+                        decoding="async"
                         className="block max-h-[calc(100vh-370px)] max-w-full w-auto h-auto select-none"
                       />
                       {showOcrBoxes &&
@@ -1141,6 +1142,7 @@ export function SlateOcrWorkspace() {
                           src={photo.imageUrl}
                           alt={photo.fileName}
                           loading="lazy"
+                          decoding="async"
                           className="w-full h-full object-cover object-top"
                         />
                         {isDetectedSlate && (

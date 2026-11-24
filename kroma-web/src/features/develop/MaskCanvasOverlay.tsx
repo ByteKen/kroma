@@ -1,6 +1,10 @@
 import { memo, useMemo, useRef, useState } from 'react';
-import { computeObjectFitUvTransform } from '../../domain/developShaderMath';
 import type { CropTransformSettings } from '../../domain/develop';
+import {
+  computeViewportUvTransform,
+  ZERO_VIEWPORT_PAN,
+  type ViewportPan,
+} from '../../domain/viewportZoom';
 import type {
   BrushComponent,
   BrushStroke,
@@ -23,6 +27,9 @@ interface MaskCanvasOverlayProps {
   readonly cropTransform: CropTransformSettings;
   readonly applyCrop: boolean;
   readonly fit: 'cover' | 'contain';
+  readonly viewportPadPx?: number;
+  readonly viewportZoom?: number;
+  readonly viewportPan?: ViewportPan;
   readonly naturalWidth: number;
   readonly naturalHeight: number;
   readonly brushOptions: BrushToolOptions;
@@ -61,6 +68,9 @@ export const MaskCanvasOverlay = memo(function MaskCanvasOverlay({
   cropTransform,
   applyCrop,
   fit,
+  viewportPadPx = 0,
+  viewportZoom = 1,
+  viewportPan = ZERO_VIEWPORT_PAN,
   naturalWidth,
   naturalHeight,
   brushOptions,
@@ -96,13 +106,16 @@ export const MaskCanvasOverlay = memo(function MaskCanvasOverlay({
     activeComponent.type === 'brush';
 
   const getUvTransform = (w: number, h: number) =>
-    computeObjectFitUvTransform(
+    computeViewportUvTransform(
       orientedW,
       orientedH,
       Math.max(1, w),
       Math.max(1, h),
       fit,
       applyCrop ? cropTransform.rect : undefined,
+      viewportPadPx,
+      viewportZoom,
+      viewportPan,
     );
 
   const clientToPhotoUv = (clientX: number, clientY: number): [number, number] | null => {

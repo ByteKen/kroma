@@ -176,6 +176,109 @@ fn extract_exif_datetime_from_tiff_bytes(bytes: &[u8]) -> Option<i64> {
     earliest
 }
 
+/// Reads a photo's upright native pixel dimensions `(width, height)` from container/EXIF headers
+/// without decoding or demosaicing full pixel payloads (~0.5ms, ~0 MB RAM).
+pub fn read_native_photo_dimensions(source_path: &str) -> Result<(u32, u32), AppError> {
+    let path = Path::new(source_path);
+    if !is_raw_photo_path(path) {
+        let reader = ImageReader::open(path)
+            .map_err(|err| {
+                AppError::ImageProcessingFailure(format!("failed to open '{source_path}': {err}"))
+            })?
+            .with_guessed_format()
+            .map_err(|err| {
+                AppError::ImageProcessingFailure(format!(
+                    "failed to detect image format for '{source_path}': {err}"
+                ))
+            })?;
+        let mut decoder = reader.into_decoder().map_err(|err| {
+            AppError::ImageProcessingFailure(format!("failed to decode '{source_path}': {err}"))
+        })?;
+        let (w, h) = decoder.dimensions();
+        if w == 0 || h == 0 {
+            return Err(AppError::ImageProcessingFailure(format!(
+                "zero image dimensions for '{source_path}'"
+            )));
+        }
+        let orientation = decoder
+            .orientation()
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
+        return Ok(oriented_standard_dims(w, h, orientation));
+    }
+
+    let raw_source = RawSource::new(path).map_err(|err| {
+        AppError::ImageProcessingFailure(format!(
+            "failed to open RAW source '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let decoder = rawler::get_decoder(&raw_source).map_err(|err| {
+        AppError::ImageProcessingFailure(format!(
+            "no RAW decoder available for '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let params = RawDecodeParams::default();
+
+    // `dummy = true` parses RAW header/crop geometry without decoding or demosaicing Bayer pixels.
+    if let Ok(raw_image) = decoder.raw_image(&raw_source, &params, true) {
+        let orientation = resolve_raw_orientation(
+            raw_image.orientation,
+            decoder.as_ref(),
+            &raw_source,
+            &params,
+        );
+        let (w, h) = raw_image
+            .crop_area
+            .or(raw_image.active_area)
+            .map(|rect| (rect.d.w as u32, rect.d.h as u32))
+            .filter(|&(w, h)| w > 0 && h > 0)
+            .unwrap_or((raw_image.width as u32, raw_image.height as u32));
+        if w > 0 && h > 0 {
+            return Ok(oriented_raw_dims(w, h, orientation));
+        }
+    }
+
+    let orientation = read_raw_orientation(decoder.as_ref(), &raw_source, &params);
+    if let Some(preview) = try_embedded_preview(decoder.as_ref(), &raw_source, &params) {
+        let (w, h) = (preview.width(), preview.height());
+        if w > 0 && h > 0 {
+            return Ok(oriented_raw_dims(w, h, orientation));
+        }
+    }
+
+    Err(AppError::ImageProcessingFailure(format!(
+        "could not read native RAW dimensions for '{}'",
+        path.display()
+    )))
+}
+
+#[inline]
+fn oriented_standard_dims(
+    w: u32,
+    h: u32,
+    orientation: image::metadata::Orientation,
+) -> (u32, u32) {
+    match orientation {
+        image::metadata::Orientation::Rotate90
+        | image::metadata::Orientation::Rotate270
+        | image::metadata::Orientation::Rotate90FlipH
+        | image::metadata::Orientation::Rotate270FlipH => (h, w),
+        _ => (w, h),
+    }
+}
+
+#[inline]
+fn oriented_raw_dims(w: u32, h: u32, orientation: Orientation) -> (u32, u32) {
+    match orientation {
+        Orientation::Rotate90
+        | Orientation::Rotate270
+        | Orientation::Transpose
+        | Orientation::Transverse => (h, w),
+        _ => (w, h),
+    }
+}
+
 /// Full-quality photo decode for Develop & Export:
 /// - Standard files (`JPEG`, `PNG`, `TIFF`, `WebP`) decode with automatic EXIF orientation uprighting.
 /// - Camera RAW files (`.ARW`, `.CR3`, `.CR2`, `.NEF`, `.DNG`, `.RAF`, etc.) run full
@@ -874,10 +977,126 @@ fn resize_if_larger(img: DynamicImage, max_dim: u32) -> DynamicImage {
     if w.max(h) <= max_dim {
         return img;
     }
-    let scale = (max_dim as f32) / (w.max(h) as f32);
-    let nw = ((w as f32) * scale).round().max(1.0) as u32;
-    let nh = ((h as f32) * scale).round().max(1.0) as u32;
-    img.resize_exact(nw, nh, FilterType::Triangle)
+    match img {
+        DynamicImage::ImageRgb8(rgb) => {
+            DynamicImage::ImageRgb8(downscale_rgb8_area_parallel(&rgb, max_dim))
+        }
+        DynamicImage::ImageRgba8(rgba) => {
+            DynamicImage::ImageRgba8(downscale_rgba8_area_parallel(&rgba, max_dim))
+        }
+        other => {
+            let (nw, nh) = target_scaled_dims(w, h, max_dim);
+            other.resize_exact(nw, nh, FilterType::Triangle)
+        }
+    }
+}
+
+/// Fast multi-threaded integer area-averaging downscaler for 8-bit RGB camera JPEGs and embedded
+/// RAW previews. Eliminates aliasing/moiré on 6:1 camera-to-1024px reductions and scales across
+/// all CPU cores via Rayon without intermediate horizontal/vertical pass allocations.
+pub fn downscale_rgb8_area_parallel(src: &RgbImage, max_dim: u32) -> RgbImage {
+    let (sw, sh) = src.dimensions();
+    if max_dim == 0 || sw.max(sh) <= max_dim || sw == 0 || sh == 0 {
+        return src.clone();
+    }
+    let (dw, dh) = target_scaled_dims(sw, sh, max_dim);
+    let sw_u = sw as usize;
+    let sh_u = sh as usize;
+    let dw_u = dw as usize;
+    let dh_u = dh as usize;
+    let raw = src.as_raw();
+    let x_bounds: Vec<(usize, usize)> = (0..dw_u)
+        .map(|dx| {
+            let x0 = (dx * sw_u) / dw_u;
+            let x1 = (((dx + 1) * sw_u).div_ceil(dw_u)).clamp(x0 + 1, sw_u);
+            (x0, x1)
+        })
+        .collect();
+
+    let mut out = vec![0_u8; dw_u * dh_u * 3];
+    out.par_chunks_exact_mut(dw_u * 3)
+        .enumerate()
+        .for_each(|(dy, row)| {
+            let y0 = (dy * sh_u) / dh_u;
+            let y1 = (((dy + 1) * sh_u).div_ceil(dh_u)).clamp(y0 + 1, sh_u);
+            let y_count = (y1 - y0) as u32;
+            for (dx, &(x0, x1)) in x_bounds.iter().enumerate() {
+                let mut sr = 0_u32;
+                let mut sg = 0_u32;
+                let mut sb = 0_u32;
+                for sy in y0..y1 {
+                    let row_off = sy * sw_u * 3;
+                    for sx in x0..x1 {
+                        let idx = row_off + sx * 3;
+                        sr += raw[idx] as u32;
+                        sg += raw[idx + 1] as u32;
+                        sb += raw[idx + 2] as u32;
+                    }
+                }
+                let count = y_count * (x1 - x0) as u32;
+                let half = count >> 1;
+                let dst = dx * 3;
+                row[dst] = ((sr + half) / count) as u8;
+                row[dst + 1] = ((sg + half) / count) as u8;
+                row[dst + 2] = ((sb + half) / count) as u8;
+            }
+        });
+
+    RgbImage::from_raw(dw, dh, out).expect("downscaled rgb8 dimensions match buffer")
+}
+
+fn downscale_rgba8_area_parallel(src: &image::RgbaImage, max_dim: u32) -> image::RgbaImage {
+    let (sw, sh) = src.dimensions();
+    if max_dim == 0 || sw.max(sh) <= max_dim || sw == 0 || sh == 0 {
+        return src.clone();
+    }
+    let (dw, dh) = target_scaled_dims(sw, sh, max_dim);
+    let sw_u = sw as usize;
+    let sh_u = sh as usize;
+    let dw_u = dw as usize;
+    let dh_u = dh as usize;
+    let raw = src.as_raw();
+    let x_bounds: Vec<(usize, usize)> = (0..dw_u)
+        .map(|dx| {
+            let x0 = (dx * sw_u) / dw_u;
+            let x1 = (((dx + 1) * sw_u).div_ceil(dw_u)).clamp(x0 + 1, sw_u);
+            (x0, x1)
+        })
+        .collect();
+
+    let mut out = vec![0_u8; dw_u * dh_u * 4];
+    out.par_chunks_exact_mut(dw_u * 4)
+        .enumerate()
+        .for_each(|(dy, row)| {
+            let y0 = (dy * sh_u) / dh_u;
+            let y1 = (((dy + 1) * sh_u).div_ceil(dh_u)).clamp(y0 + 1, sh_u);
+            let y_count = (y1 - y0) as u32;
+            for (dx, &(x0, x1)) in x_bounds.iter().enumerate() {
+                let mut sr = 0_u32;
+                let mut sg = 0_u32;
+                let mut sb = 0_u32;
+                let mut sa = 0_u32;
+                for sy in y0..y1 {
+                    let row_off = sy * sw_u * 4;
+                    for sx in x0..x1 {
+                        let idx = row_off + sx * 4;
+                        sr += raw[idx] as u32;
+                        sg += raw[idx + 1] as u32;
+                        sb += raw[idx + 2] as u32;
+                        sa += raw[idx + 3] as u32;
+                    }
+                }
+                let count = y_count * (x1 - x0) as u32;
+                let half = count >> 1;
+                let dst = dx * 4;
+                row[dst] = ((sr + half) / count) as u8;
+                row[dst + 1] = ((sg + half) / count) as u8;
+                row[dst + 2] = ((sb + half) / count) as u8;
+                row[dst + 3] = ((sa + half) / count) as u8;
+            }
+        });
+
+    image::RgbaImage::from_raw(dw, dh, out).expect("downscaled rgba8 dimensions match buffer")
 }
 
 fn decode_standard_upright(path: &Path, source_path: &str) -> Result<DynamicImage, AppError> {
@@ -1193,6 +1412,68 @@ mod tests {
         assert!(p_half[0] > 1.0, "HDR linear highlight >1.0 must remain unclamped");
         for c in 0..3 {
             assert!((p_full[c] - p_half[c]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn oriented_dims_swaps_for_quarter_turn_orientations_and_reads_png_header() {
+        assert_eq!(
+            oriented_standard_dims(6000, 4000, image::metadata::Orientation::NoTransforms),
+            (6000, 4000)
+        );
+        assert_eq!(
+            oriented_standard_dims(6000, 4000, image::metadata::Orientation::Rotate90),
+            (4000, 6000)
+        );
+        assert_eq!(
+            oriented_standard_dims(6000, 4000, image::metadata::Orientation::Rotate270FlipH),
+            (4000, 6000)
+        );
+        assert_eq!(
+            oriented_raw_dims(6000, 4000, Orientation::Rotate270),
+            (4000, 6000)
+        );
+        assert_eq!(
+            oriented_raw_dims(6000, 4000, Orientation::Rotate180),
+            (6000, 4000)
+        );
+
+        let tmp = std::env::temp_dir().join(format!(
+            "kroma_dims_test_{}.png",
+            std::process::id()
+        ));
+        let img = RgbImage::new(320, 180);
+        img.save(&tmp).expect("save temp png");
+        let dims = read_native_photo_dimensions(tmp.to_str().unwrap()).expect("read dims");
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(dims, (320, 180));
+    }
+
+    #[test]
+    fn downscale_rgb8_area_parallel_averages_blocks_and_preserves_uniform_color() {
+        // Uniform 8x4 image downscaled to max_dim=4 -> exact 4x2 with identical RGB
+        let mut uniform = RgbImage::new(8, 4);
+        for px in uniform.pixels_mut() {
+            px.0 = [210, 130, 45];
+        }
+        let down_uniform = downscale_rgb8_area_parallel(&uniform, 4);
+        assert_eq!(down_uniform.dimensions(), (4, 2));
+        for px in down_uniform.pixels() {
+            assert_eq!(px.0, [210, 130, 45]);
+        }
+
+        // 4x4 checkerboard of 0 and 200 downscaled 2x -> 2x2 with exact average 100
+        let mut checker = RgbImage::new(4, 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                let v = if (x + y) % 2 == 0 { 0 } else { 200 };
+                checker.put_pixel(x, y, image::Rgb([v, v, v]));
+            }
+        }
+        let down_checker = downscale_rgb8_area_parallel(&checker, 2);
+        assert_eq!(down_checker.dimensions(), (2, 2));
+        for px in down_checker.pixels() {
+            assert_eq!(px.0, [100, 100, 100]);
         }
     }
 }

@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'framer-motion';
-import { useMemo, useState } from 'react';
+import { memo, useMemo, useState } from 'react';
 import { useStudio, type WorkspaceView } from '../../app/StudioContext';
 import { isRecipeModified } from '../../domain/develop';
 import { isFaceOnlySlateCode } from '../../domain/identity';
@@ -21,7 +21,12 @@ const WORKSPACE_ITEMS: readonly NavItem[] = [
   { id: 'export', label: 'Export', icon: 'account_tree', badge: '4' },
 ];
 
-export function WorkspaceRail() {
+const SINGLE_PHOTO_WORKSPACE_ITEMS: readonly NavItem[] = [
+  { id: 'develop', label: 'Studio', icon: 'tune', badge: '1' },
+  { id: 'export', label: 'Export', icon: 'account_tree', badge: '2' },
+];
+
+export const WorkspaceRail = memo(function WorkspaceRail() {
   const {
     session,
     activeWorkspace,
@@ -127,7 +132,7 @@ export function WorkspaceRail() {
 
         {/* Workspace Navigation */}
         <nav className="flex flex-col gap-1" aria-label="Studio Workspaces">
-          {WORKSPACE_ITEMS.map((item) => {
+          {(session?.sessionMode === 'single' ? SINGLE_PHOTO_WORKSPACE_ITEMS : WORKSPACE_ITEMS).map((item) => {
             const isActive = Boolean(session) && activeWorkspace === item.id;
             const isDisabled = !session;
             const alertCount = item.id === 'review_queue' ? reviewCount : 0;
@@ -255,4 +260,4 @@ export function WorkspaceRail() {
       </div>
     </motion.aside>
   );
-}
+});

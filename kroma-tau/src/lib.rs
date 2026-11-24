@@ -23,6 +23,7 @@ pub fn run() {
             if let Ok(app_data_dir) = app.path().app_data_dir() {
                 let state = app.state::<AppState>();
                 state.set_managed_models_dir(app_data_dir.join("models"));
+                state.set_managed_single_sidecars_dir(app_data_dir.join("single_sidecars"));
             }
             // Failsafe: ensure main window reveals even if WebView startup is unusually delayed
             let app_handle = app.handle().clone();
@@ -55,6 +56,7 @@ pub fn run() {
             commands::inspect_onnx_model,
             commands::set_custom_ai_models,
             commands::load_shoot_folder,
+            commands::load_photo_files,
             commands::run_face_clustering,
             commands::scan_project_slates_ocr,
             commands::cancel_slate_ocr_scan,
@@ -74,6 +76,7 @@ pub fn run() {
             commands::redo_organization_action,
             commands::auto_level_cluster_eyes,
             commands::load_develop_working_buffer,
+            commands::get_photo_native_dimensions,
             commands::render_32bit_thumbnails,
             commands::generate_ai_mask,
             commands::save_photo_develop_recipe,

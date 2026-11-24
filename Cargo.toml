@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 authors = ["ByteKen"]
 license = "GPL-3.0-only"
@@ -53,3 +53,10 @@ opt-level = 3
 
 [profile.dev.package.kroma-infra]
 opt-level = 3
+
+# Enable cross-crate ThinLTO, single codegen unit, and symbol stripping for faster
+# RAW demosaic / pixel grading / preview downscaling and smaller desktop installers.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

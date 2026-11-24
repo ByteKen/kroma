@@ -208,6 +208,8 @@ interface DevelopInspectorPanelProps {
   readonly onApplyRelativeNudge: (delta: RelativeDevelopDelta, label: string) => void;
   readonly onSyncSlateWb: () => void;
   readonly onOpenSyncModal: () => void;
+  readonly isSinglePhoto?: boolean;
+  readonly onOpenExport?: () => void;
   readonly onCopyRecipe: () => void;
   readonly onPasteRecipe: () => void;
 }
@@ -253,6 +255,8 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
   onApplyRelativeNudge,
   onSyncSlateWb,
   onOpenSyncModal,
+  isSinglePhoto = false,
+  onOpenExport,
   onCopyRecipe,
   onPasteRecipe,
 }: DevelopInspectorPanelProps) {
@@ -1882,17 +1886,30 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
           </DarkroomButton>
         </div>
 
-        <DarkroomButton
-          variant="primary"
-          size="md"
-          icon="tune"
-          onClick={onOpenSyncModal}
-          title="Edits on this photo auto-save automatically. Click to copy settings to other photos (Ctrl+Shift+S)"
-          className="w-full justify-between"
-        >
-          <span>Sync to Other Photos</span>
-          <kbd className="tabular-nums-mono text-[9.5px] opacity-75">Ctrl+Shift+S</kbd>
-        </DarkroomButton>
+        {isSinglePhoto ? (
+          <DarkroomButton
+            variant="primary"
+            size="md"
+            icon="download"
+            onClick={onOpenExport}
+            title="Edits auto-save to .kroma.json sidecar. Open Export to save your final image."
+            className="w-full justify-center"
+          >
+            Export Photo
+          </DarkroomButton>
+        ) : (
+          <DarkroomButton
+            variant="primary"
+            size="md"
+            icon="tune"
+            onClick={onOpenSyncModal}
+            title="Edits on this photo auto-save automatically. Click to copy settings to other photos (Ctrl+Shift+S)"
+            className="w-full justify-between"
+          >
+            <span>Sync to Other Photos</span>
+            <kbd className="tabular-nums-mono text-[9.5px] opacity-75">Ctrl+Shift+S</kbd>
+          </DarkroomButton>
+        )}
       </div>
     </aside>
   );

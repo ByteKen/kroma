@@ -80,7 +80,7 @@ impl RayonImageDevelopEngine {
     ) -> Result<(Rgb32FImage, Option<Vec<f32>>), AppError> {
         let loaded_lut = match &recipe.lut_3d {
             Some(lut_ref) if lut_ref.intensity > f32::EPSILON => {
-                Some(CubeLut3D::load_or_builtin(&lut_ref.cube_path)?)
+                Some(CubeLut3D::load_cached(&lut_ref.cube_path)?)
             }
             _ => None,
         };
@@ -90,12 +90,12 @@ impl RayonImageDevelopEngine {
         // automatically to Rayon 32-bit CPU on CPU-only mode or unsupported edge cases.
         if is_gpu_acceleration_enabled()
             && let Some(gpu) = shared_wgpu_develop_engine()
-            && let Ok(res) = gpu.process_buffer_with_alpha_f32(buffer, recipe, loaded_lut.as_ref())
+            && let Ok(res) = gpu.process_buffer_with_alpha_f32(buffer, recipe, loaded_lut.as_deref())
         {
             return Ok(res);
         }
 
-        self.process_buffer_with_alpha_cpu_inner(buffer, recipe, loaded_lut.as_ref())
+        self.process_buffer_with_alpha_cpu_inner(buffer, recipe, loaded_lut.as_deref())
     }
 
     /// Pure 32-bit Rayon CPU implementation (used as automatic fallback, for fast 384px live
@@ -107,11 +107,11 @@ impl RayonImageDevelopEngine {
     ) -> Result<(Rgb32FImage, Option<Vec<f32>>), AppError> {
         let loaded_lut = match &recipe.lut_3d {
             Some(lut_ref) if lut_ref.intensity > f32::EPSILON => {
-                Some(CubeLut3D::load_or_builtin(&lut_ref.cube_path)?)
+                Some(CubeLut3D::load_cached(&lut_ref.cube_path)?)
             }
             _ => None,
         };
-        self.process_buffer_with_alpha_cpu_inner(buffer, recipe, loaded_lut.as_ref())
+        self.process_buffer_with_alpha_cpu_inner(buffer, recipe, loaded_lut.as_deref())
     }
 
     fn process_buffer_with_alpha_cpu_inner(
@@ -185,17 +185,86 @@ impl RayonImageDevelopEngine {
         Ok(compute_rgb_histogram(&graded_rgb8))
     }
 
-    /// Measures the exact encoded output byte size in memory for a single photo using the same
-    /// pixel pipeline and encoder used during batch export (zero disk writes).
+    /// Estimates the output byte size in memory for a single photo without decoding full-res RAW
+    /// payloads or waking up the `wgpu` GPU device:
+    /// - Reads exact native upright dimensions from file headers (~0.5ms, ~0 MB RAM) and applies
+    ///   crop/rotation geometry.
+    /// - Uncompressed 16-bit TIFF size is computed directly from exact output pixel count (`0` pixel decode).
+    /// - JPEG and PNG sample a compact `<=1024px` preview (reusing Kroma's cached fast preview when
+    ///   available), grade on CPU, encode with the target encoder/quality, and scale by pixel-area ratio.
     pub fn measure_rendered_bytes(
         &self,
         source_path: &str,
         recipe: &DevelopRecipe,
         format: OutputImageFormat,
     ) -> Result<u64, AppError> {
-        let decoded = image_decoder::decode_develop_buffer(source_path, 0)?;
-        let graded_f32 = self.process_buffer_to_f32(&decoded, recipe)?;
-        encode_graded_bytes(graded_f32, format)
+        self.measure_rendered_bytes_with_preview(source_path, None, recipe, format)
+    }
+
+    /// Lightweight export size estimator that optionally reuses an already-extracted fast JPEG
+    /// preview for RAW/TIFF sources so estimating output size never triggers full Bayer demosaicing.
+    pub fn measure_rendered_bytes_with_preview(
+        &self,
+        source_path: &str,
+        preview_path: Option<&str>,
+        recipe: &DevelopRecipe,
+        format: OutputImageFormat,
+    ) -> Result<u64, AppError> {
+        const EXPORT_ESTIMATE_SAMPLE_MAX_DIM: u32 = 1024;
+
+        let native_dims = image_decoder::read_native_photo_dimensions(source_path)?;
+        let (out_w, out_h) = compute_cropped_output_dimensions(native_dims, recipe.crop_transform);
+        let full_output_pixels = (out_w as u64).saturating_mul(out_h as u64);
+
+        // 16-bit uncompressed RGB TIFF size is deterministic from pixel dimensions alone.
+        if matches!(format, OutputImageFormat::Tiff) {
+            return Ok(full_output_pixels.saturating_mul(6).saturating_add(4096));
+        }
+
+        let sample_rgb = match preview_path {
+            Some(path) if Path::new(path).is_file() => {
+                image_decoder::decode_fast_preview_max_dim(path, EXPORT_ESTIMATE_SAMPLE_MAX_DIM)
+                    .or_else(|_| {
+                        image_decoder::decode_fast_preview_max_dim(
+                            source_path,
+                            EXPORT_ESTIMATE_SAMPLE_MAX_DIM,
+                        )
+                    })?
+            }
+            _ => image_decoder::decode_fast_preview_max_dim(
+                source_path,
+                EXPORT_ESTIMATE_SAMPLE_MAX_DIM,
+            )?,
+        };
+
+        let sample_buffer = image_decoder::DecodedDevelopBuffer {
+            image: DynamicImage::ImageRgb8(sample_rgb).to_rgb32f(),
+            is_linear: false,
+            is_wide_gamut: false,
+            bit_depth: 8,
+            is_raw_demosaic: false,
+        };
+
+        // Run strictly on CPU (~10ms at <=1024px) so opening Export never initializes DX12/Metal wgpu.
+        let (mut graded_f32, alpha_opt) =
+            self.process_buffer_with_alpha_cpu_f32(&sample_buffer, recipe)?;
+        let sample_pixels = (graded_f32.width() as u64).saturating_mul(graded_f32.height() as u64);
+
+        let sample_bytes = if matches!(format, OutputImageFormat::Png) && alpha_opt.is_some() {
+            encode_graded_bytes_with_alpha(graded_f32, alpha_opt.as_deref(), format)?
+        } else {
+            if let Some(alpha) = alpha_opt {
+                composite_over_white_f32(&mut graded_f32, &alpha);
+            }
+            encode_graded_bytes_with_alpha(graded_f32, None, format)?
+        };
+
+        Ok(scale_sample_encoded_bytes(
+            sample_bytes,
+            sample_pixels,
+            full_output_pixels,
+            format,
+        ))
     }
 
     /// Renders a 32-bit graded JPEG thumbnail directly from a pre-decoded `DecodedDevelopBuffer`
@@ -699,7 +768,57 @@ fn sample_luma_bilinear(plane: &[f32], w: usize, h: usize, fx: f32, fy: f32) -> 
     top * (1.0 - ty) + bot * ty
 }
 
+fn compute_cropped_output_dimensions(native_dims: (u32, u32), crop: CropTransform) -> (u32, u32) {
+    let (mut w, mut h) = native_dims;
+    if w == 0 || h == 0 {
+        return (1, 1);
+    }
+    if crop.quarter_turns % 2 == 1 {
+        std::mem::swap(&mut w, &mut h);
+    }
+    if crop.rect.is_full_frame() {
+        return (w, h);
+    }
+    let x = ((crop.rect.left * w as f32).round() as u32).min(w.saturating_sub(1));
+    let y = ((crop.rect.top * h as f32).round() as u32).min(h.saturating_sub(1));
+    let cw = ((crop.rect.width * w as f32).round() as u32)
+        .max(1)
+        .min(w.saturating_sub(x));
+    let ch = ((crop.rect.height * h as f32).round() as u32)
+        .max(1)
+        .min(h.saturating_sub(y));
+    (cw, ch)
+}
+
+fn scale_sample_encoded_bytes(
+    sample_bytes: u64,
+    sample_pixels: u64,
+    full_output_pixels: u64,
+    format: OutputImageFormat,
+) -> u64 {
+    if sample_pixels == 0 || full_output_pixels <= sample_pixels {
+        return sample_bytes;
+    }
+    let header_bytes: u64 = match format {
+        OutputImageFormat::Jpeg { .. } => 600,
+        OutputImageFormat::Png => 128,
+        OutputImageFormat::Tiff => 4096,
+    };
+    let payload = sample_bytes.saturating_sub(header_bytes) as f64;
+    let area_ratio = (full_output_pixels as f64) / (sample_pixels as f64);
+    ((payload * area_ratio).round() as u64).saturating_add(header_bytes)
+}
+
+#[cfg(test)]
 fn encode_graded_bytes(graded: Rgb32FImage, format: OutputImageFormat) -> Result<u64, AppError> {
+    encode_graded_bytes_with_alpha(graded, None, format)
+}
+
+fn encode_graded_bytes_with_alpha(
+    graded: Rgb32FImage,
+    transparent_alpha: Option<&[f32]>,
+    format: OutputImageFormat,
+) -> Result<u64, AppError> {
     let mut buf = Cursor::new(Vec::<u8>::new());
     match format {
         OutputImageFormat::Jpeg { quality } => {
@@ -710,12 +829,21 @@ fn encode_graded_bytes(graded: Rgb32FImage, format: OutputImageFormat) -> Result
             })?;
         }
         OutputImageFormat::Png => {
-            let rgb8 = finalize_rgb8(graded);
-            DynamicImage::ImageRgb8(rgb8)
-                .write_to(&mut buf, ImageFormat::Png)
-                .map_err(|err| {
-                    AppError::ImageProcessingFailure(format!("PNG encode failed: {err}"))
-                })?;
+            if let Some(alpha) = transparent_alpha {
+                let rgba8 = finalize_rgba8(&graded, alpha);
+                DynamicImage::ImageRgba8(rgba8)
+                    .write_to(&mut buf, ImageFormat::Png)
+                    .map_err(|err| {
+                        AppError::ImageProcessingFailure(format!("PNG RGBA encode failed: {err}"))
+                    })?;
+            } else {
+                let rgb8 = finalize_rgb8(graded);
+                DynamicImage::ImageRgb8(rgb8)
+                    .write_to(&mut buf, ImageFormat::Png)
+                    .map_err(|err| {
+                        AppError::ImageProcessingFailure(format!("PNG encode failed: {err}"))
+                    })?;
+            }
         }
         OutputImageFormat::Tiff => {
             let rgb16 = DynamicImage::ImageRgb32F(graded).to_rgb16();
@@ -988,5 +1116,85 @@ mod tests {
         let diff_after =
             (denoised.get_pixel(12, 12).0[0] as i16 - denoised.get_pixel(13, 12).0[0] as i16).abs();
         assert!(diff_after < diff_before);
+    }
+
+    #[test]
+    fn export_size_estimator_scales_area_accurately_and_handles_tiff_crop_and_preview() {
+        let mut crop = CropTransform::default();
+        assert_eq!(compute_cropped_output_dimensions((6000, 4000), crop), (6000, 4000));
+
+        crop.quarter_turns = 1;
+        assert_eq!(compute_cropped_output_dimensions((6000, 4000), crop), (4000, 6000));
+
+        crop.rect = NormalizedRect::new(0.25, 0.25, 0.5, 0.5).unwrap();
+        assert_eq!(compute_cropped_output_dimensions((6000, 4000), crop), (2000, 3000));
+
+        // No downscaling -> exact bytes returned
+        assert_eq!(
+            scale_sample_encoded_bytes(12_000, 1000, 1000, OutputImageFormat::Jpeg { quality: 92 }),
+            12_000
+        );
+        // 4x pixel area -> ~4x payload + fixed header
+        let scaled = scale_sample_encoded_bytes(
+            10_600,
+            1_000_000,
+            4_000_000,
+            OutputImageFormat::Jpeg { quality: 92 },
+        );
+        assert_eq!(scaled, 40_600);
+
+        // End-to-end lightweight measurement on a real image (with and without preview path)
+        let pid = std::process::id();
+        let src_path = std::env::temp_dir().join(format!("kroma_est_src_{pid}.png"));
+        let prev_path = std::env::temp_dir().join(format!("kroma_est_prev_{pid}.jpg"));
+
+        let mut img = RgbImage::new(240, 160);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = Rgb([
+                ((x * 7 + y * 3) % 255) as u8,
+                ((x * 5 + y * 11) % 255) as u8,
+                ((x * 13 + y * 2) % 255) as u8,
+            ]);
+        }
+        img.save(&src_path).expect("save src");
+        img.save(&prev_path).expect("save preview");
+
+        let engine = RayonImageDevelopEngine::new();
+        let default_recipe = DevelopRecipe::default();
+        let src_str = src_path.to_str().unwrap();
+        let prev_str = prev_path.to_str().unwrap();
+
+        let jpeg80 = engine
+            .measure_rendered_bytes_with_preview(
+                src_str,
+                Some(prev_str),
+                &default_recipe,
+                OutputImageFormat::Jpeg { quality: 80 },
+            )
+            .expect("jpeg80");
+        let jpeg98 = engine
+            .measure_rendered_bytes_with_preview(
+                src_str,
+                Some(prev_str),
+                &default_recipe,
+                OutputImageFormat::Jpeg { quality: 98 },
+            )
+            .expect("jpeg98");
+        let tiff_full = engine
+            .measure_rendered_bytes(src_str, &default_recipe, OutputImageFormat::Tiff)
+            .expect("tiff full");
+
+        let mut cropped_recipe = DevelopRecipe::default();
+        cropped_recipe.crop_transform.rect = NormalizedRect::new(0.25, 0.25, 0.5, 0.5).unwrap();
+        let tiff_cropped = engine
+            .measure_rendered_bytes(src_str, &cropped_recipe, OutputImageFormat::Tiff)
+            .expect("tiff cropped");
+
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&prev_path);
+
+        assert!(jpeg98 > jpeg80);
+        assert_eq!(tiff_full, 240 * 160 * 6 + 4096);
+        assert_eq!(tiff_cropped, 120 * 80 * 6 + 4096);
     }
 }

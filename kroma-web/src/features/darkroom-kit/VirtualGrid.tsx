@@ -1,11 +1,21 @@
 import {
   forwardRef,
+  useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState,
   type ReactNode,
 } from 'react';
+import {
+  areGridWindowsEqual,
+  areLinearWindowsEqual,
+  computeVirtualGridWindow,
+  computeVirtualLinearWindow,
+  type VirtualGridWindow,
+  type VirtualLinearWindow,
+} from './virtualWindow';
 
 export interface VirtualGridHandle {
   scrollToIndex: (index: number, smooth?: boolean) => void;
@@ -47,8 +57,8 @@ function VirtualGridInner<T>(
   ref: React.ForwardedRef<VirtualGridHandle>,
 ) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const rafIdRef = useRef<number | null>(null);
   const [viewport, setViewport] = useState({ width: 960, height: 720 });
-  const [scrollTop, setScrollTop] = useState(0);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -83,6 +93,48 @@ function VirtualGridInner<T>(
   const totalRows = Math.ceil(items.length / cols);
   const totalHeight = Math.max(0, totalRows * rowStride - (totalRows > 0 ? gapPx : 0));
 
+  const computeCurrentWindow = useCallback((): VirtualGridWindow => {
+    const scrollTop = scrollRef.current?.scrollTop ?? 0;
+    return computeVirtualGridWindow({
+      scrollTop,
+      viewportHeight: viewport.height,
+      paddingPx,
+      rowStride,
+      totalRows,
+      cols,
+      itemCount: items.length,
+      overscanRows,
+    });
+  }, [viewport.height, paddingPx, rowStride, totalRows, cols, items.length, overscanRows]);
+
+  const [windowRange, setWindowRange] = useState<VirtualGridWindow>(() => computeCurrentWindow());
+
+  const syncWindow = useCallback(() => {
+    const next = computeCurrentWindow();
+    setWindowRange((prev) => (areGridWindowsEqual(prev, next) ? prev : next));
+  }, [computeCurrentWindow]);
+
+  useLayoutEffect(() => {
+    syncWindow();
+  }, [syncWindow]);
+
+  const scheduleScrollSync = useCallback(() => {
+    if (rafIdRef.current !== null) return;
+    rafIdRef.current = window.requestAnimationFrame(() => {
+      rafIdRef.current = null;
+      syncWindow();
+    });
+  }, [syncWindow]);
+
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current !== null) {
+        window.cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+    };
+  }, []);
+
   useImperativeHandle(
     ref,
     () => ({
@@ -90,27 +142,26 @@ function VirtualGridInner<T>(
         const el = scrollRef.current;
         if (!el || index < 0 || index >= items.length) return;
         const row = Math.floor(index / cols);
-        const targetTop = Math.max(0, paddingPx + row * rowStride - (el.clientHeight - rowHeight) / 2);
+        const targetTop = Math.max(
+          0,
+          paddingPx + row * rowStride - (el.clientHeight - rowHeight) / 2,
+        );
         el.scrollTo({ top: targetTop, behavior: smooth ? 'smooth' : 'auto' });
       },
     }),
     [cols, items.length, paddingPx, rowHeight, rowStride],
   );
 
-  const visibleStartRow = Math.max(0, Math.floor((scrollTop - paddingPx) / rowStride) - overscanRows);
-  const visibleEndRow = Math.min(
-    totalRows,
-    Math.ceil((scrollTop + viewport.height - paddingPx) / rowStride) + overscanRows,
-  );
-
-  const startIdx = visibleStartRow * cols;
-  const endIdx = Math.min(items.length, visibleEndRow * cols);
+  // Clamp synchronously on render when item list shrinks between paints
+  const clampedStartRow = Math.min(windowRange.startRow, totalRows);
+  const startIdx = Math.min(items.length, windowRange.startIdx);
+  const endIdx = Math.min(items.length, Math.max(startIdx, windowRange.endIdx));
   const visibleSlice = items.slice(startIdx, endIdx);
 
   return (
     <div
       ref={scrollRef}
-      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+      onScroll={scheduleScrollSync}
       className={`flex-1 overflow-y-auto ${className}`}
     >
       <div
@@ -124,7 +175,7 @@ function VirtualGridInner<T>(
           <div
             style={{
               position: 'absolute',
-              top: `${visibleStartRow * rowStride}px`,
+              top: `${clampedStartRow * rowStride}px`,
               left: 0,
               right: 0,
               display: 'grid',
@@ -171,8 +222,8 @@ export function VirtualHorizontalStrip<T>({
   className = '',
 }: VirtualHorizontalStripProps<T>) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const rafIdRef = useRef<number | null>(null);
   const [viewportWidth, setViewportWidth] = useState(900);
-  const [scrollLeft, setScrollLeft] = useState(0);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -190,6 +241,46 @@ export function VirtualHorizontalStrip<T>({
 
   const stride = itemWidthPx + gapPx;
   const totalWidth = Math.max(0, items.length * stride - (items.length > 0 ? gapPx : 0));
+  const overscan = 6;
+
+  const computeCurrentWindow = useCallback((): VirtualLinearWindow => {
+    const scrollLeft = scrollRef.current?.scrollLeft ?? 0;
+    return computeVirtualLinearWindow({
+      scrollOffset: scrollLeft,
+      viewportSize: viewportWidth,
+      stride,
+      itemCount: items.length,
+      overscan,
+    });
+  }, [viewportWidth, stride, items.length]);
+
+  const [windowRange, setWindowRange] = useState<VirtualLinearWindow>(() => computeCurrentWindow());
+
+  const syncWindow = useCallback(() => {
+    const next = computeCurrentWindow();
+    setWindowRange((prev) => (areLinearWindowsEqual(prev, next) ? prev : next));
+  }, [computeCurrentWindow]);
+
+  useLayoutEffect(() => {
+    syncWindow();
+  }, [syncWindow]);
+
+  const scheduleScrollSync = useCallback(() => {
+    if (rafIdRef.current !== null) return;
+    rafIdRef.current = window.requestAnimationFrame(() => {
+      rafIdRef.current = null;
+      syncWindow();
+    });
+  }, [syncWindow]);
+
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current !== null) {
+        window.cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+    };
+  }, []);
 
   // Dedicated non-passive wheel listener: maps standard vertical mouse wheel directly
   // to horizontal filmstrip scrolling (no Shift key required) while preserving native
@@ -210,15 +301,14 @@ export function VirtualHorizontalStrip<T>({
       if (dy !== 0 && Math.abs(dy) >= Math.abs(dx)) {
         event.preventDefault();
         event.stopPropagation();
-        const nextLeft = Math.max(0, Math.min(maxScroll, el.scrollLeft + dy));
-        el.scrollLeft = nextLeft;
-        setScrollLeft(nextLeft);
+        el.scrollLeft = Math.max(0, Math.min(maxScroll, el.scrollLeft + dy));
+        scheduleScrollSync();
       }
     };
 
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
-  }, [totalWidth]);
+  }, [totalWidth, scheduleScrollSync]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -237,16 +327,15 @@ export function VirtualHorizontalStrip<T>({
     }
   }, [activeIndex, itemWidthPx, stride, centerActive]);
 
-  const overscan = 6;
-  const startIdx = Math.max(0, Math.floor(scrollLeft / stride) - overscan);
-  const endIdx = Math.min(items.length, Math.ceil((scrollLeft + viewportWidth) / stride) + overscan);
+  const startIdx = Math.min(items.length, windowRange.startIdx);
+  const endIdx = Math.min(items.length, Math.max(startIdx, windowRange.endIdx));
   const visibleSlice = items.slice(startIdx, endIdx);
   const shouldCenterShortStrip = centerActive && totalWidth > 0 && totalWidth < viewportWidth;
 
   return (
     <div
       ref={scrollRef}
-      onScroll={(e) => setScrollLeft(e.currentTarget.scrollLeft)}
+      onScroll={scheduleScrollSync}
       className={`overflow-y-hidden ${className}`}
     >
       <div
@@ -305,8 +394,8 @@ export function VirtualVerticalList<T>({
   onScroll,
 }: VirtualVerticalListProps<T>) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const rafIdRef = useRef<number | null>(null);
   const [viewportHeight, setViewportHeight] = useState(220);
-  const [scrollTop, setScrollTop] = useState(0);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -324,16 +413,56 @@ export function VirtualVerticalList<T>({
 
   const stride = rowHeightPx + gapPx;
   const totalHeight = Math.max(0, items.length * stride - (items.length > 0 ? gapPx : 0));
-  const startIdx = Math.max(0, Math.floor(scrollTop / stride) - overscan);
-  const endIdx = Math.min(items.length, Math.ceil((scrollTop + viewportHeight) / stride) + overscan);
+
+  const computeCurrentWindow = useCallback((): VirtualLinearWindow => {
+    const scrollTop = scrollRef.current?.scrollTop ?? 0;
+    return computeVirtualLinearWindow({
+      scrollOffset: scrollTop,
+      viewportSize: viewportHeight,
+      stride,
+      itemCount: items.length,
+      overscan,
+    });
+  }, [viewportHeight, stride, items.length, overscan]);
+
+  const [windowRange, setWindowRange] = useState<VirtualLinearWindow>(() => computeCurrentWindow());
+
+  const syncWindow = useCallback(() => {
+    const next = computeCurrentWindow();
+    setWindowRange((prev) => (areLinearWindowsEqual(prev, next) ? prev : next));
+  }, [computeCurrentWindow]);
+
+  useLayoutEffect(() => {
+    syncWindow();
+  }, [syncWindow]);
+
+  const scheduleScrollSync = useCallback(() => {
+    if (rafIdRef.current !== null) return;
+    rafIdRef.current = window.requestAnimationFrame(() => {
+      rafIdRef.current = null;
+      syncWindow();
+    });
+  }, [syncWindow]);
+
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current !== null) {
+        window.cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+    };
+  }, []);
+
+  const startIdx = Math.min(items.length, windowRange.startIdx);
+  const endIdx = Math.min(items.length, Math.max(startIdx, windowRange.endIdx));
   const visibleSlice = items.slice(startIdx, endIdx);
 
   return (
     <div
       ref={scrollRef}
       onMouseLeave={onMouseLeave}
-      onScroll={(e) => {
-        setScrollTop(e.currentTarget.scrollTop);
+      onScroll={() => {
+        scheduleScrollSync();
         onScroll?.();
       }}
       className={`overflow-y-auto ${className}`}

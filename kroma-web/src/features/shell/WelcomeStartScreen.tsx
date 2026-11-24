@@ -126,6 +126,7 @@ export function WelcomeStartScreen() {
     sfaceThreshold,
     reviewWarningThreshold,
     openShootFolder,
+    openPhotoFiles,
     openRecentShootFolder,
     removeRecentProjectEntry,
     togglePinRecentProjectEntry,
@@ -134,6 +135,7 @@ export function WelcomeStartScreen() {
 
   const isMac = useMemo(() => isMacPlatform(), []);
   const openShortcutLabel = formatShortcutCombo('Ctrl+O', isMac);
+  const openPhotosShortcutLabel = formatShortcutCombo('Ctrl+Shift+O', isMac);
 
   const [viewMode, setViewMode] = useState<RecentsViewMode>('grid');
   const [filterTab, setFilterTab] = useState<RecentProjectsFilter>('all');
@@ -228,12 +230,16 @@ export function WelcomeStartScreen() {
             <div className="p-3 border-b border-hairline">
               <button
                 type="button"
-                onClick={() => setActiveWorkspace(session.isClustered ? 'culling' : 'develop')}
+                onClick={() =>
+                  setActiveWorkspace(
+                    session.sessionMode !== 'single' && session.isClustered ? 'culling' : 'develop',
+                  )
+                }
                 className="w-full p-2.5 rounded-lg bg-surface border border-emerald-focus/45 hover:border-emerald-bright/70 text-left flex items-center justify-between gap-2 transition-colors cursor-pointer group"
               >
                 <div className="min-w-0 flex flex-col">
                   <span className="tabular-nums-mono text-[9px] uppercase tracking-wider text-emerald-bright font-semibold">
-                    Active Project
+                    {session.sessionMode === 'single' ? 'Active Photo' : 'Active Project'}
                   </span>
                   <span className="font-display text-[12px] font-bold text-ink-primary truncate">
                     {session.telemetry.projectName}
@@ -333,6 +339,18 @@ export function WelcomeStartScreen() {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            <DarkroomButton
+              variant="subtle"
+              size="xs"
+              icon="add_photo_alternate"
+              disabled={isScanningFolder}
+              onClick={() => void openPhotoFiles()}
+              title={`Open one or more specific photos (${openPhotosShortcutLabel})`}
+              className="h-7 px-2.5"
+            >
+              Open Photo(s)
+            </DarkroomButton>
+
             <DarkroomButton
               variant="subtle"
               size="xs"
@@ -500,40 +518,84 @@ export function WelcomeStartScreen() {
           ) : (
             /* Contact-Sheet Project Grid (DaVinci Resolve / Capture One / Figma Recents) */
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-              {/* Optical Viewfinder "+ Open Local Shoot" Tile (always first in All view) */}
+              {/* Unified Optical Viewfinder "Open Folder | Open Photo(s)" Tile (always first in All view) */}
               {showOpenProjectTile && (
-                <button
-                  type="button"
-                  disabled={isScanningFolder}
-                  onClick={() => void openShootFolder()}
-                  className="group relative rounded-lg overflow-hidden bg-surface-low/90 hover:bg-surface border border-hairline hover:border-amber-core/60 transition-colors cursor-pointer text-left flex flex-col disabled:opacity-50"
-                >
-                  <div className="relative aspect-[16/10] bg-surface-lowest/90 flex flex-col items-center justify-center gap-2 overflow-hidden">
-                    {/* Precision Camera Viewfinder Corner Reticles */}
-                    <span className="absolute top-3 left-3 w-3 h-3 border-t border-l border-hairline-strong group-hover:border-amber-core transition-colors" />
-                    <span className="absolute top-3 right-3 w-3 h-3 border-t border-r border-hairline-strong group-hover:border-amber-core transition-colors" />
-                    <span className="absolute bottom-3 left-3 w-3 h-3 border-b border-l border-hairline-strong group-hover:border-amber-core transition-colors" />
-                    <span className="absolute bottom-3 right-3 w-3 h-3 border-b border-r border-hairline-strong group-hover:border-amber-core transition-colors" />
+                <div className="relative rounded-lg overflow-hidden bg-surface-low/90 border border-hairline hover:border-hairline-strong transition-colors flex flex-col">
+                  <div className="relative aspect-[16/10] bg-surface-lowest/90 grid grid-cols-2 divide-x divide-hairline/70 overflow-hidden">
+                    <button
+                      type="button"
+                      disabled={isScanningFolder}
+                      onClick={() => void openShootFolder()}
+                      title={`Open a shoot folder (${openShortcutLabel})`}
+                      className="group/folder relative flex flex-col items-center justify-center gap-2 px-2 hover:bg-surface/75 transition-colors cursor-pointer disabled:opacity-50 focus-visible:outline-none focus-visible:bg-surface/75"
+                    >
+                      {/* Left Viewfinder Corner Reticles */}
+                      <span className="pointer-events-none absolute top-3 left-3 w-3 h-3 border-t border-l border-hairline-strong group-hover/folder:border-amber-core transition-colors" />
+                      <span className="pointer-events-none absolute bottom-3 left-3 w-3 h-3 border-b border-l border-hairline-strong group-hover/folder:border-amber-core transition-colors" />
 
-                    <div className="w-10 h-10 rounded-lg bg-surface border border-hairline-strong group-hover:border-amber-core/70 group-hover:text-amber-core text-ink-secondary flex items-center justify-center transition-colors">
-                      <span className="material-symbols-outlined text-[22px]">
-                        create_new_folder
+                      <div className="w-9 h-9 rounded-lg bg-surface border border-hairline-strong group-hover/folder:border-amber-core/70 group-hover/folder:text-amber-core text-ink-secondary flex items-center justify-center transition-colors">
+                        <span className="material-symbols-outlined text-[20px]">
+                          create_new_folder
+                        </span>
+                      </div>
+                      <span className="font-display text-[11.5px] font-semibold text-ink-primary group-hover/folder:text-amber-soft transition-colors whitespace-nowrap">
+                        Open Folder
                       </span>
-                    </div>
-                    <span className="font-display text-[12px] font-semibold text-ink-primary group-hover:text-amber-soft transition-colors">
-                      Open Project
-                    </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={isScanningFolder}
+                      onClick={() => void openPhotoFiles()}
+                      title={`Open one or more photos (${openPhotosShortcutLabel})`}
+                      className="group/photo relative flex flex-col items-center justify-center gap-2 px-2 hover:bg-surface/75 transition-colors cursor-pointer disabled:opacity-50 focus-visible:outline-none focus-visible:bg-surface/75"
+                    >
+                      {/* Right Viewfinder Corner Reticles */}
+                      <span className="pointer-events-none absolute top-3 right-3 w-3 h-3 border-t border-r border-hairline-strong group-hover/photo:border-amber-core transition-colors" />
+                      <span className="pointer-events-none absolute bottom-3 right-3 w-3 h-3 border-b border-r border-hairline-strong group-hover/photo:border-amber-core transition-colors" />
+
+                      <div className="w-9 h-9 rounded-lg bg-surface border border-hairline-strong group-hover/photo:border-amber-core/70 group-hover/photo:text-amber-core text-ink-secondary flex items-center justify-center transition-colors">
+                        <span className="material-symbols-outlined text-[20px]">
+                          add_photo_alternate
+                        </span>
+                      </div>
+                      <span className="font-display text-[11.5px] font-semibold text-ink-primary group-hover/photo:text-amber-soft transition-colors whitespace-nowrap">
+                        Open Photo(s)
+                      </span>
+                    </button>
                   </div>
 
-                  <div className="px-3 py-2.5 border-t border-hairline flex items-center justify-between gap-2">
-                    <span className="tabular-nums-mono text-[10px] text-ink-telemetry truncate">
-                      RAW • PNG • JPEG • TIFF
-                    </span>
-                    <kbd className="tabular-nums-mono text-[9.5px] px-1.5 py-0.5 rounded bg-canvas border border-hairline text-ink-telemetry shrink-0">
-                      {openShortcutLabel}
-                    </kbd>
+                  <div className="px-3 py-2 border-t border-hairline flex-1 flex flex-col justify-center gap-1">
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      disabled={isScanningFolder}
+                      onClick={() => void openShootFolder()}
+                      className="flex items-center justify-between gap-2 text-left text-ink-telemetry hover:text-amber-soft transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      <span className="tabular-nums-mono text-[10px] truncate">
+                        Folder · Full Shoot &amp; AI
+                      </span>
+                      <kbd className="tabular-nums-mono text-[9.5px] px-1.5 py-0.5 rounded bg-canvas border border-hairline text-ink-telemetry shrink-0">
+                        {openShortcutLabel}
+                      </kbd>
+                    </button>
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      disabled={isScanningFolder}
+                      onClick={() => void openPhotoFiles()}
+                      className="flex items-center justify-between gap-2 text-left text-ink-telemetry hover:text-amber-soft transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      <span className="tabular-nums-mono text-[10px] truncate">
+                        Photo(s) · Single or Multi
+                      </span>
+                      <kbd className="tabular-nums-mono text-[9.5px] px-1.5 py-0.5 rounded bg-canvas border border-hairline text-ink-telemetry shrink-0">
+                        {openPhotosShortcutLabel}
+                      </kbd>
+                    </button>
                   </div>
-                </button>
+                </div>
               )}
 
               {/* User's Real Recent Shoot Cards */}

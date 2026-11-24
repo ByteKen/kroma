@@ -194,14 +194,15 @@ export function BatchExportWorkspace() {
   );
   const [isMeasuringSize, setIsMeasuringSize] = useState(false);
 
-  const exportRootFolderName = `${session?.telemetry.projectName ?? 'Project'}_Export`;
+  const exportRootFolderName = `${(session?.telemetry.projectName ?? 'Project').replace(/\.[a-z0-9]{2,5}$/i, '')}_Export`;
   const defaultDestinationPath = useMemo(
     () =>
       buildDefaultExportLocation(
         session?.folderPath,
         session?.telemetry.projectName ?? 'Kroma_Project',
+        session?.sessionMode ?? 'folder',
       ),
-    [session?.folderPath, session?.telemetry.projectName],
+    [session?.folderPath, session?.telemetry.projectName, session?.sessionMode],
   );
   const resolvedDestinationPath = useMemo(() => {
     if (!customExportBaseDir) return defaultDestinationPath;
@@ -435,12 +436,14 @@ export function BatchExportWorkspace() {
     );
   }, [activeExportScope.activePhotos, deliveryMode, renderFormat, jpegQuality]);
 
-  // Measure actual encoded output bytes in Rust using 5 evenly-spaced sample photos (or exact
-  // on-disk byte sums for Copy/Move) so estimates stay accurate for any PNG/JPEG/RAW resolution.
+  const sessionFolderPath = session?.folderPath ?? null;
+
+  // Measure representative output bytes in Rust using up to 5 evenly-spaced compact previews (or
+  // exact on-disk byte sums for Copy/Move) without re-firing on unrelated thumbnail stream updates.
   useEffect(() => {
     if (
       !isDesktopRuntime ||
-      !session ||
+      !sessionFolderPath ||
       activeExportScope.activePhotoCount === 0
     ) {
       setMeasuredExportSize(null);
@@ -451,7 +454,7 @@ export function BatchExportWorkspace() {
     let cancelled = false;
     setMeasuredExportSize(null);
     setIsMeasuringSize(true);
-    const delayMs = deliveryMode === 'copy' || deliveryMode === 'move' ? 0 : 180;
+    const delayMs = deliveryMode === 'copy' || deliveryMode === 'move' ? 0 : 260;
     const mappedFormat = renderFormat === 'tiff16' ? 'tiff' : renderFormat;
     const photoIds = activeExportScope.selectedPhotoIdsKey
       ? activeExportScope.selectedPhotoIdsKey.split('\0')
@@ -478,8 +481,9 @@ export function BatchExportWorkspace() {
     };
   }, [
     isDesktopRuntime,
-    session,
+    sessionFolderPath,
     activeExportScope.activePhotoCount,
+    activeExportScope.activeGradedCount,
     activeExportScope.selectedPhotoIdsKey,
     outputRule.excludeSlateFromClientPack,
     archiveSlatesSeparately,
@@ -571,8 +575,8 @@ export function BatchExportWorkspace() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3.5">
-          {/* Prompt if user hasn't run Face Organizer yet */}
-          {!session.isClustered && (
+          {/* Prompt if user hasn't run Face Organizer yet (hidden in Single Photo Mode) */}
+          {!session.isClustered && session.sessionMode !== 'single' && (
             <div className="p-3 rounded-lg bg-emerald-focus/10 border border-emerald-focus/35 flex items-center justify-between gap-3 shrink-0">
               <div className="text-[11px] text-ink-primary leading-snug">
                 Run <strong>Organize by Face</strong> first to group photos into subject folders.
@@ -1237,14 +1241,21 @@ export function BatchExportWorkspace() {
                   </div>
                 </div>
 
-                <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-2">
+                <div className="flex-1 min-h-0 flex flex-col p-3 overflow-hidden">
                   {inspectedFolder.mappedFiles.length === 0 ? (
                     <div className="py-10 text-center text-[11.5px] text-ink-telemetry">
                       No client photos in this folder (only excluded name-card frames).
                     </div>
                   ) : (
-                    inspectedFolder.mappedFiles.map(
-                      ({ photo, finalPath, rawCompanionPath, graded }) => {
+                    <VirtualVerticalList
+                      key={inspectedFolder.cluster.anchor.id}
+                      items={inspectedFolder.mappedFiles}
+                      rowHeightPx={deliveryMode === 'develop_and_raw' ? 76 : 68}
+                      gapPx={8}
+                      overscan={6}
+                      getKey={(item) => item.photo.id}
+                      className="flex-1 min-h-0 pr-1"
+                      renderItem={({ photo, finalPath, rawCompanionPath, graded }) => {
                         const shortOut = finalPath.split('/').slice(-2).join('/');
                         const shortRaw = rawCompanionPath
                           ? rawCompanionPath.split('/').slice(-2).join('/')
@@ -1253,13 +1264,12 @@ export function BatchExportWorkspace() {
 
                         return (
                           <button
-                            key={photo.id}
                             type="button"
                             role="checkbox"
                             aria-checked={isPhotoChecked}
                             aria-label={`Select ${photo.fileName} for export`}
                             onClick={() => togglePhotoExportSelection(photo.id)}
-                            className={`w-full text-left shrink-0 p-2 rounded-lg border flex items-center gap-2.5 transition-colors cursor-pointer ${
+                            className={`w-full h-full text-left p-2 rounded-lg border flex items-center gap-2.5 transition-colors cursor-pointer ${
                               isPhotoChecked
                                 ? 'bg-surface-active/60 border-amber-core/50'
                                 : 'bg-surface border-hairline hover:bg-surface-elevated hover:border-hairline-strong'
@@ -1324,8 +1334,8 @@ export function BatchExportWorkspace() {
                             </div>
                           </button>
                         );
-                      },
-                    )
+                      }}
+                    />
                   )}
                 </div>
               </aside>

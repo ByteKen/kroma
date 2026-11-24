@@ -1,4 +1,5 @@
 import { AnimatePresence, motion } from 'framer-motion';
+import { memo } from 'react';
 import { useStudio } from '../../app/StudioContext';
 import { KROMA_FALLBACK_VERSION } from '../../domain/appUpdates';
 import { formatShortcutCombo, isMacPlatform } from '../../domain/platform';
@@ -8,7 +9,7 @@ import { DarkroomButton, DarkroomTooltip, FAST_FADE, TelemetryPill } from '../da
  * Slim 30px darkroom status strip along the bottom edge:
  * - Shows live scan progress, quiet bottom-left action status (+ inline Undo pill), and app version info.
  */
-export function StatusFilmstripBar() {
+export const StatusFilmstripBar = memo(function StatusFilmstripBar() {
   const {
     isDesktopRuntime,
     session,
@@ -79,18 +80,22 @@ export function StatusFilmstripBar() {
       ? developViewportStatus.precision === 'f32'
         ? 'Decoding 32-bit RAW…'
         : 'Decoding 16-bit RAW…'
-      : developViewportStatus.precision === 'f32'
-        ? developViewportStatus.isRawDemosaic
-          ? `32-BIT RAW • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
-          : `32-BIT FLOAT • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
-        : developViewportStatus.isRawDemosaic
-          ? `16-BIT RAW • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
-          : `16-BIT FLOAT • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
+      : developViewportStatus.upgradingHiRes
+        ? 'Loading 1:1 RAW…'
+        : developViewportStatus.precision === 'f32'
+          ? developViewportStatus.isRawDemosaic
+            ? `32-BIT RAW • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
+            : `32-BIT FLOAT • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
+          : developViewportStatus.isRawDemosaic
+            ? `16-BIT RAW • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
+            : `16-BIT FLOAT • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
     : null;
   const developTelemetryTooltip = developViewportStatus
     ? developViewportStatus.state === 'decoding'
       ? `Demosaicing ${developViewportStatus.precision === 'f32' ? '32-bit' : '16-bit'} scene-linear wide-gamut Rec.2020 RAW for Studio…`
-      : `${developViewportStatus.precision === 'f32' ? '32-bit' : '16-bit'} ${developViewportStatus.isRawDemosaic ? 'Scene-Linear Wide-Gamut Rec.2020 RAW' : 'High-Bit-Depth Float'} • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
+      : developViewportStatus.upgradingHiRes
+        ? 'Upgrading active photo to full native 1:1 sensor resolution for crisp loupe inspection…'
+        : `${developViewportStatus.precision === 'f32' ? '32-bit' : '16-bit'} ${developViewportStatus.isRawDemosaic ? 'Scene-Linear Wide-Gamut Rec.2020 RAW' : 'High-Bit-Depth Float'} • ${backendTag}${developViewportStatus.width && developViewportStatus.height ? ` (${developViewportStatus.width}×${developViewportStatus.height})` : ''}`
     : '';
   const appInfoLabel = isDesktopRuntime ? `Kroma v${appVersion}` : `Kroma v${appVersion} • Preview`;
   const appInfoTooltip = isDesktopRuntime
@@ -209,7 +214,7 @@ export function StatusFilmstripBar() {
 
         {isStudio && developViewportStatus && developTelemetryLabel && (
           <DarkroomTooltip content={developTelemetryTooltip} side="top">
-            {developViewportStatus.state === 'decoding' ? (
+            {developViewportStatus.state === 'decoding' || developViewportStatus.upgradingHiRes ? (
               <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-surface-active/80 border border-emerald-focus/35 tabular-nums-mono text-[9.5px] text-emerald-bright shrink-0">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-focus animate-pulse shrink-0" />
                 <span>{developTelemetryLabel}</span>
@@ -237,4 +242,4 @@ export function StatusFilmstripBar() {
       </div>
     </footer>
   );
-}
+});

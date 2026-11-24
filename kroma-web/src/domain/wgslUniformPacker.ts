@@ -17,7 +17,7 @@ import {
 export const GRADE_UNIFORM_FLOATS = 29 * 4; // 464 bytes
 export const MASK_UNIFORM_FLOATS = 17 * 4; // 272 bytes
 export const SPATIAL_UNIFORM_FLOATS = 5 * 4; // 80 bytes
-export const PRESENT_UNIFORM_FLOATS = 2 * 4; // 32 bytes
+export const PRESENT_UNIFORM_FLOATS = 3 * 4; // 48 bytes
 
 export function detectWebGpuAvailable(): boolean {
   return typeof navigator !== 'undefined' && 'gpu' in navigator && Boolean(navigator.gpu);
@@ -371,6 +371,7 @@ export function packPresentUniforms(
   showShadowClip: boolean,
   showHighlightClip: boolean,
   showCheckerboard: boolean,
+  cropBounds: readonly [number, number, number, number] = [0, 0, 1, 1],
 ): Float32Array {
   const out = new Float32Array(PRESENT_UNIFORM_FLOATS);
   out[0] = uv.scaleX;
@@ -381,5 +382,9 @@ export function packPresentUniforms(
   out[5] = showHighlightClip ? 1.0 : 0.0;
   out[6] = showCheckerboard ? 1.0 : 0.0;
   out[7] = 0.0;
+  out[8] = cropBounds[0];
+  out[9] = cropBounds[1];
+  out[10] = cropBounds[2];
+  out[11] = cropBounds[3];
   return out;
 }

@@ -19,6 +19,7 @@ use kroma_domain::masking::{
     decode_matte_rle_b64, BackgroundGradientStyle, BackgroundReplaceMode, MaskCombineOp,
     MaskComponent, MaskLayer,
 };
+use rayon::prelude::*;
 use std::sync::{Mutex, OnceLock};
 
 const GRADE_PASS_WGSL: &str = include_str!("../../../../shaders/develop/grade_pass.wgsl");
@@ -78,6 +79,22 @@ struct SpatialUniforms {
     bg_params: [f32; 4],
 }
 
+/// Reusable GPU textures, uniform buffers, LUT storage buffer, and staging readback buffer
+/// pooled inside `WgpuDevelopEngine`. Camera shoots share identical sensor dimensions across
+/// hundreds of photos, so pooling eliminates hundreds of MB of DX12/Metal VRAM allocation churn
+/// per exported frame while keeping peak GPU memory strictly bounded.
+struct WgpuExportScratch {
+    src_tex: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
+    work_a: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
+    work_b: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
+    staging_buf: Option<(u64, wgpu::Buffer)>,
+    grade_ubo: wgpu::Buffer,
+    spatial_ubo: wgpu::Buffer,
+    tone_lut_tex: wgpu::Texture,
+    tone_lut_view: wgpu::TextureView,
+    lut3d_buf: Option<(u64, wgpu::Buffer)>,
+}
+
 pub struct WgpuDevelopEngine {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -89,11 +106,13 @@ pub struct WgpuDevelopEngine {
     spatial_bgl: wgpu::BindGroupLayout,
     spatial_pipeline: wgpu::ComputePipeline,
     dummy_lut3d_buf: wgpu::Buffer,
-    dummy_white_tex: wgpu::Texture,
-    dummy_tone_lut_tex: wgpu::Texture,
-    /// Serializes GPU dispatch + readback so parallel Rayon exports keep peak VRAM bounded (~150 MB)
-    /// while CPU RAW decoding and JPEG/PNG/TIFF encoding still saturate all CPU cores in parallel.
-    dispatch_lock: Mutex<()>,
+    _dummy_white_tex: wgpu::Texture,
+    dummy_white_view: wgpu::TextureView,
+    _dummy_tone_lut_tex: wgpu::Texture,
+    dummy_tone_lut_view: wgpu::TextureView,
+    /// Serializes GPU dispatch + readback and owns reusable textures/buffers so parallel Rayon
+    /// exports keep peak VRAM bounded (~150 MB) and avoid per-photo GPU heap allocations.
+    scratch: Mutex<WgpuExportScratch>,
 }
 
 #[derive(Clone, Debug)]
@@ -284,6 +303,7 @@ impl WgpuDevelopEngine {
         queue.write_buffer(&dummy_lut3d_buf, 0, bytemuck::cast_slice(&[0.0_f32; 4]));
 
         let dummy_white_tex = upload_rgba8_texture(&device, &queue, 1, 1, &[255, 255, 255, 255]);
+        let dummy_white_view = dummy_white_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut identity_lut = Vec::with_capacity(256 * 4);
         for i in 0..256 {
@@ -291,6 +311,24 @@ impl WgpuDevelopEngine {
             identity_lut.extend_from_slice(&[v, v, v, 1.0]);
         }
         let dummy_tone_lut_tex = upload_rgba32f_texture(&device, &queue, 256, 1, &identity_lut);
+        let dummy_tone_lut_view =
+            dummy_tone_lut_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let tone_lut_tex = upload_rgba32f_texture(&device, &queue, 256, 1, &identity_lut);
+        let tone_lut_view = tone_lut_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let grade_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kroma-grade-ubo-pool"),
+            size: std::mem::size_of::<GradeUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let spatial_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kroma-spatial-ubo-pool"),
+            size: std::mem::size_of::<SpatialUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Some(Self {
             device,
@@ -303,9 +341,21 @@ impl WgpuDevelopEngine {
             spatial_bgl,
             spatial_pipeline,
             dummy_lut3d_buf,
-            dummy_white_tex,
-            dummy_tone_lut_tex,
-            dispatch_lock: Mutex::new(()),
+            _dummy_white_tex: dummy_white_tex,
+            dummy_white_view,
+            _dummy_tone_lut_tex: dummy_tone_lut_tex,
+            dummy_tone_lut_view,
+            scratch: Mutex::new(WgpuExportScratch {
+                src_tex: None,
+                work_a: None,
+                work_b: None,
+                staging_buf: None,
+                grade_ubo,
+                spatial_ubo,
+                tone_lut_tex,
+                tone_lut_view,
+                lut3d_buf: None,
+            }),
         })
     }
 
@@ -380,20 +430,27 @@ impl WgpuDevelopEngine {
             prepared_masks.push((layer, compiled));
         }
 
-        // Pack source RGB32F into RGBA32F on CPU before acquiring GPU lock
+        // Pack source RGB32F into RGBA32F in parallel across CPU cores before acquiring GPU lock
         let src_raw = buffer.image.as_raw();
+        let src_row_in = (src_w as usize) * 3;
+        let src_row_out = (src_w as usize) * 4;
         let mut src_rgba = vec![0.0_f32; (src_w as usize) * (src_h as usize) * 4];
-        for (dst, src) in src_rgba
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(src_raw.as_chunks::<3>().0)
-        {
-            dst[0] = src[0];
-            dst[1] = src[1];
-            dst[2] = src[2];
-            dst[3] = 1.0;
-        }
+        src_rgba
+            .par_chunks_exact_mut(src_row_out)
+            .zip(src_raw.par_chunks_exact(src_row_in))
+            .for_each(|(dst_row, src_row)| {
+                for (dst, src) in dst_row
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(src_row.as_chunks::<3>().0)
+                {
+                    dst[0] = src[0];
+                    dst[1] = src[1];
+                    dst[2] = src[2];
+                    dst[3] = 1.0;
+                }
+            });
 
         // Decode optional AI background matte before locking GPU
         let bg = &recipe.background_removal;
@@ -429,14 +486,8 @@ impl WgpuDevelopEngine {
             || recipe.detail_optics.grain_amount > 0
             || bg_transparent;
 
-        let _guard = self.dispatch_lock.lock().map_err(|_| {
-            AppError::ImageProcessingFailure("wgpu dispatch mutex poisoned".to_string())
-        })?;
-
-        let src_tex = upload_rgba32f_texture(&self.device, &self.queue, src_w, src_h, &src_rgba);
-        let src_view = src_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let tone_lut_tex_owned = if recipe.tone_curve.is_neutral() {
+        // Pre-compute optional tone curve LUT & 3D LUT fingerprint before locking GPU
+        let custom_tone_lut = if recipe.tone_curve.is_neutral() {
             None
         } else {
             let (r_lut, g_lut, b_lut) = build_rgb_tone_curve_luts(&recipe.tone_curve);
@@ -444,49 +495,105 @@ impl WgpuDevelopEngine {
             for i in 0..256 {
                 lut_rgba.extend_from_slice(&[r_lut[i], g_lut[i], b_lut[i], 1.0]);
             }
-            Some(upload_rgba32f_texture(&self.device, &self.queue, 256, 1, &lut_rgba))
+            Some(lut_rgba)
         };
-        let tone_lut_view = tone_lut_tex_owned
+        let lut3d_fp = loaded_lut.map(CubeLut3D::fingerprint);
+
+        let mut scratch = self.scratch.lock().map_err(|_| {
+            AppError::ImageProcessingFailure("wgpu scratch mutex poisoned".to_string())
+        })?;
+
+        // Reuse or allocate pooled source texture (`rgba32float`) matching `(src_w, src_h)`
+        let recreate_src = scratch
+            .src_tex
             .as_ref()
-            .unwrap_or(&self.dummy_tone_lut_tex)
-            .create_view(&wgpu::TextureViewDescriptor::default());
+            .is_none_or(|(w, h, _, _)| *w != src_w || *h != src_h);
+        if recreate_src {
+            let tex = create_rgba32f_upload_texture(&self.device, src_w, src_h);
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            scratch.src_tex = Some((src_w, src_h, tex, view));
+        }
+        {
+            let (_, _, src_tex, _) = scratch.src_tex.as_ref().expect("pooled src_tex");
+            write_rgba32f_texture(&self.queue, src_tex, src_w, src_h, &src_rgba);
+        }
+
+        if let Some(ref lut_rgba) = custom_tone_lut {
+            write_rgba32f_texture(&self.queue, &scratch.tone_lut_tex, 256, 1, lut_rgba);
+        }
 
         let bg_matte_tex_owned = bg_matte_decoded
             .as_ref()
             .map(|(mw, mh, rgba)| upload_rgba8_texture(&self.device, &self.queue, *mw, *mh, rgba));
-        let bg_matte_view = bg_matte_tex_owned
+        let bg_matte_view_owned = bg_matte_tex_owned
             .as_ref()
-            .unwrap_or(&self.dummy_white_tex)
-            .create_view(&wgpu::TextureViewDescriptor::default());
+            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
+        let bg_matte_view = bg_matte_view_owned
+            .as_ref()
+            .unwrap_or(&self.dummy_white_view);
 
-        let lut3d_buf_owned = loaded_lut.map(|lut| {
+        // Reuse or upload pooled 3D LUT storage buffer keyed by content fingerprint
+        if let (Some(lut), Some(fp)) = (loaded_lut, lut3d_fp)
+            && scratch.lut3d_buf.as_ref().is_none_or(|(cached_fp, _)| *cached_fp != fp)
+        {
             let mut packed = Vec::with_capacity(lut.table().len() * 4);
             for rgb in lut.table() {
                 packed.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 1.0]);
             }
             let bytes: &[u8] = bytemuck::cast_slice(&packed);
             let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("kroma-lut3d-storage"),
+                label: Some("kroma-lut3d-storage-pool"),
                 size: bytes.len() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             self.queue.write_buffer(&buf, 0, bytes);
-            buf
-        });
-        let lut3d_buf_ref = lut3d_buf_owned.as_ref().unwrap_or(&self.dummy_lut3d_buf);
+            scratch.lut3d_buf = Some((fp, buf));
+        }
 
-        let tex_a = create_storage_rgba32f_texture(&self.device, out_w, out_h, "kroma-work-a");
-        let view_a = tex_a.create_view(&wgpu::TextureViewDescriptor::default());
-        let need_ping_pong = !prepared_masks.is_empty() || need_spatial;
-        let tex_b = if need_ping_pong {
-            Some(create_storage_rgba32f_texture(&self.device, out_w, out_h, "kroma-work-b"))
-        } else {
-            None
-        };
-        let view_b = tex_b
+        // Reuse or allocate pooled ping-pong work textures (`rgba32float`) matching `(out_w, out_h)`
+        let recreate_a = scratch
+            .work_a
             .as_ref()
-            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
+            .is_none_or(|(w, h, _, _)| *w != out_w || *h != out_h);
+        if recreate_a {
+            let tex = create_storage_rgba32f_texture(&self.device, out_w, out_h, "kroma-work-a");
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            scratch.work_a = Some((out_w, out_h, tex, view));
+        }
+
+        let need_ping_pong = !prepared_masks.is_empty() || need_spatial;
+        if need_ping_pong {
+            let recreate_b = scratch
+                .work_b
+                .as_ref()
+                .is_none_or(|(w, h, _, _)| *w != out_w || *h != out_h);
+            if recreate_b {
+                let tex =
+                    create_storage_rgba32f_texture(&self.device, out_w, out_h, "kroma-work-b");
+                let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+                scratch.work_b = Some((out_w, out_h, tex, view));
+            }
+        }
+
+        // Ensure pooled staging readback buffer is sized cleanly for `readback_size`
+        let unpadded_bytes_per_row = out_w * 16;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+        let readback_size = (padded_bytes_per_row as u64) * (out_h as u64);
+        let recreate_staging = scratch
+            .staging_buf
+            .as_ref()
+            .is_none_or(|(cap, _)| *cap < readback_size || *cap > readback_size.saturating_mul(2));
+        if recreate_staging {
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("kroma-readback-staging-pool"),
+                size: readback_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            scratch.staging_buf = Some((readback_size, buf));
+        }
 
         let grade_uniforms = build_grade_uniforms(
             out_w,
@@ -500,26 +607,47 @@ impl WgpuDevelopEngine {
             loaded_lut,
             bg_opaque_mode,
         );
-        let grade_ubo = create_uniform_buffer(&self.device, &self.queue, &grade_uniforms);
+        self.queue
+            .write_buffer(&scratch.grade_ubo, 0, bytemuck::bytes_of(&grade_uniforms));
+
+        let src_view = &scratch.src_tex.as_ref().expect("pooled src_tex").3;
+        let tone_lut_view = if custom_tone_lut.is_some() {
+            &scratch.tone_lut_view
+        } else {
+            &self.dummy_tone_lut_view
+        };
+        let lut3d_buf_ref = if lut3d_fp.is_some() {
+            scratch
+                .lut3d_buf
+                .as_ref()
+                .map(|(_, b)| b)
+                .unwrap_or(&self.dummy_lut3d_buf)
+        } else {
+            &self.dummy_lut3d_buf
+        };
+        let (_, _, tex_a, view_a) = scratch.work_a.as_ref().expect("pooled work_a");
+        let tex_b_opt = scratch.work_b.as_ref();
+        let view_b = tex_b_opt.map(|(_, _, _, v)| v);
+
         let grade_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("kroma-grade-bg"),
             layout: &self.grade_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: grade_ubo.as_entire_binding(),
+                    resource: scratch.grade_ubo.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&src_view),
+                    resource: wgpu::BindingResource::TextureView(src_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&tone_lut_view),
+                    resource: wgpu::BindingResource::TextureView(tone_lut_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&bg_matte_view),
+                    resource: wgpu::BindingResource::TextureView(bg_matte_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -527,7 +655,7 @@ impl WgpuDevelopEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&view_a),
+                    resource: wgpu::BindingResource::TextureView(view_a),
                 },
             ],
         });
@@ -600,9 +728,9 @@ impl WgpuDevelopEngine {
                 );
                 let mask_ubo = create_uniform_buffer(&self.device, &self.queue, &u_mask);
                 let (src_v, dst_v) = if current_is_a {
-                    (&view_a, view_b.as_ref().expect("ping-pong B"))
+                    (view_a, view_b.expect("ping-pong B"))
                 } else {
-                    (view_b.as_ref().expect("ping-pong B"), &view_a)
+                    (view_b.expect("ping-pong B"), view_a)
                 };
                 let mask_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("kroma-mask-bg"),
@@ -644,7 +772,7 @@ impl WgpuDevelopEngine {
         }
 
         // Pass 3: Global Spatial Detail (Color NR, Luma NR, Texture, Clarity, Sharpening, Grain) + Transparent Cutout Alpha
-        let spatial_resources = if need_spatial {
+        let spatial_bg_keep = if need_spatial {
             let spatial_scale = (out_w.max(out_h) as f32 / 1024.0).max(1.0);
             let u_spatial = SpatialUniforms {
                 dims: [out_w as f32, out_h as f32, spatial_scale, 0.0],
@@ -668,11 +796,12 @@ impl WgpuDevelopEngine {
                     0.0,
                 ],
             };
-            let spatial_ubo = create_uniform_buffer(&self.device, &self.queue, &u_spatial);
+            self.queue
+                .write_buffer(&scratch.spatial_ubo, 0, bytemuck::bytes_of(&u_spatial));
             let (src_v, dst_v) = if current_is_a {
-                (&view_a, view_b.as_ref().expect("ping-pong B"))
+                (view_a, view_b.expect("ping-pong B"))
             } else {
-                (view_b.as_ref().expect("ping-pong B"), &view_a)
+                (view_b.expect("ping-pong B"), view_a)
             };
             let spatial_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("kroma-spatial-bg"),
@@ -680,7 +809,7 @@ impl WgpuDevelopEngine {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: spatial_ubo.as_entire_binding(),
+                        resource: scratch.spatial_ubo.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -688,7 +817,7 @@ impl WgpuDevelopEngine {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&bg_matte_view),
+                        resource: wgpu::BindingResource::TextureView(bg_matte_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
@@ -706,28 +835,18 @@ impl WgpuDevelopEngine {
                 pass.dispatch_workgroups(wg_x, wg_y, 1);
             }
             current_is_a = !current_is_a;
-            Some((spatial_ubo, spatial_bg))
+            Some(spatial_bg)
         } else {
             None
         };
 
         // Readback final `rgba32float` texture into CPU `Rgb32FImage` (+ optional cutout alpha plane)
         let final_tex = if current_is_a {
-            &tex_a
+            tex_a
         } else {
-            tex_b.as_ref().expect("ping-pong B")
+            &tex_b_opt.expect("ping-pong B").2
         };
-        let unpadded_bytes_per_row = out_w * 16;
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
-        let readback_size = (padded_bytes_per_row as u64) * (out_h as u64);
-
-        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("kroma-readback-staging"),
-            size: readback_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let (_, staging_buf) = scratch.staging_buf.as_ref().expect("pooled staging_buf");
 
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -737,7 +856,7 @@ impl WgpuDevelopEngine {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &staging_buf,
+                buffer: staging_buf,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_bytes_per_row),
@@ -754,61 +873,89 @@ impl WgpuDevelopEngine {
         self.queue.submit(Some(encoder.finish()));
 
         // Keep bind groups alive until submit completes
-        drop(spatial_resources);
+        drop(spatial_bg_keep);
         drop(mask_temp_resources);
+        drop(grade_bg);
 
-        let slice = staging_buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        let _ = self.device.poll(wgpu::PollType::Wait);
-        rx.recv()
-            .map_err(|err| {
-                AppError::ImageProcessingFailure(format!("wgpu readback channel failed: {err}"))
-            })?
-            .map_err(|err| {
-                AppError::ImageProcessingFailure(format!("wgpu buffer map failed: {err:?}"))
-            })?;
+        let readback_result: Result<(Vec<f32>, Option<Vec<f32>>), AppError> = (|| {
+            let (_, staging_buf) = scratch.staging_buf.as_ref().expect("pooled staging_buf");
+            let slice = staging_buf.slice(..readback_size);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx.send(res);
+            });
+            let _ = self.device.poll(wgpu::PollType::Wait);
+            rx.recv()
+                .map_err(|err| {
+                    AppError::ImageProcessingFailure(format!("wgpu readback channel failed: {err}"))
+                })
+                .and_then(|res| {
+                    res.map_err(|err| {
+                        AppError::ImageProcessingFailure(format!("wgpu buffer map failed: {err:?}"))
+                    })
+                })?;
 
-        let mapped = slice.get_mapped_range();
-        let w_u = out_w as usize;
-        let h_u = out_h as usize;
-        let row_stride_bytes = padded_bytes_per_row as usize;
-        let mut rgb_out = vec![0.0_f32; w_u * h_u * 3];
-        let mut alpha_out = if bg_transparent {
-            Some(vec![1.0_f32; w_u * h_u])
-        } else {
-            None
-        };
-
-        for y in 0..h_u {
-            let row_bytes = &mapped[y * row_stride_bytes..y * row_stride_bytes + w_u * 16];
-            let floats: &[f32] = bytemuck::cast_slice(row_bytes);
-            let rgb_row = &mut rgb_out[y * w_u * 3..(y + 1) * w_u * 3];
-            if let Some(ref mut a_vec) = alpha_out {
-                let a_row = &mut a_vec[y * w_u..(y + 1) * w_u];
-                for (x, a_slot) in a_row.iter_mut().enumerate().take(w_u) {
-                    let s = x * 4;
-                    let d = x * 3;
-                    rgb_row[d] = floats[s];
-                    rgb_row[d + 1] = floats[s + 1];
-                    rgb_row[d + 2] = floats[s + 2];
-                    *a_slot = floats[s + 3];
-                }
+            let mapped = slice.get_mapped_range();
+            let mapped_bytes: &[u8] = &mapped;
+            let w_u = out_w as usize;
+            let h_u = out_h as usize;
+            let row_stride_bytes = padded_bytes_per_row as usize;
+            let mut rgb_out = vec![0.0_f32; w_u * h_u * 3];
+            let mut alpha_out = if bg_transparent {
+                Some(vec![1.0_f32; w_u * h_u])
             } else {
-                for x in 0..w_u {
-                    let s = x * 4;
-                    let d = x * 3;
-                    rgb_row[d] = floats[s];
-                    rgb_row[d + 1] = floats[s + 1];
-                    rgb_row[d + 2] = floats[s + 2];
-                }
-            }
-        }
+                None
+            };
 
-        drop(mapped);
-        staging_buf.unmap();
+            // Parallel Rayon unpack from mapped GPU staging memory into output RGB32F (+ alpha)
+            if let Some(ref mut a_vec) = alpha_out {
+                rgb_out
+                    .par_chunks_exact_mut(w_u * 3)
+                    .zip(a_vec.par_chunks_exact_mut(w_u))
+                    .enumerate()
+                    .for_each(|(y, (rgb_row, a_row))| {
+                        let row_bytes =
+                            &mapped_bytes[y * row_stride_bytes..y * row_stride_bytes + w_u * 16];
+                        let floats: &[f32] = bytemuck::cast_slice(row_bytes);
+                        for (x, a_slot) in a_row.iter_mut().enumerate().take(w_u) {
+                            let s = x * 4;
+                            let d = x * 3;
+                            rgb_row[d] = floats[s];
+                            rgb_row[d + 1] = floats[s + 1];
+                            rgb_row[d + 2] = floats[s + 2];
+                            *a_slot = floats[s + 3];
+                        }
+                    });
+            } else {
+                rgb_out
+                    .par_chunks_exact_mut(w_u * 3)
+                    .enumerate()
+                    .for_each(|(y, rgb_row)| {
+                        let row_bytes =
+                            &mapped_bytes[y * row_stride_bytes..y * row_stride_bytes + w_u * 16];
+                        let floats: &[f32] = bytemuck::cast_slice(row_bytes);
+                        for x in 0..w_u {
+                            let s = x * 4;
+                            let d = x * 3;
+                            rgb_row[d] = floats[s];
+                            rgb_row[d + 1] = floats[s + 1];
+                            rgb_row[d + 2] = floats[s + 2];
+                        }
+                    });
+            }
+
+            drop(mapped);
+            staging_buf.unmap();
+            Ok((rgb_out, alpha_out))
+        })();
+
+        let (rgb_out, alpha_out) = match readback_result {
+            Ok(pair) => pair,
+            Err(err) => {
+                scratch.staging_buf = None;
+                return Err(err);
+            }
+        };
 
         let img = Rgb32FImage::from_raw(out_w, out_h, rgb_out).ok_or_else(|| {
             AppError::ImageProcessingFailure("wgpu output dimensions mismatch".to_string())
@@ -905,14 +1052,12 @@ fn create_storage_rgba32f_texture(
     })
 }
 
-fn upload_rgba32f_texture(
+fn create_rgba32f_upload_texture(
     device: &wgpu::Device,
-    queue: &wgpu::Queue,
     width: u32,
     height: u32,
-    rgba_f32: &[f32],
 ) -> wgpu::Texture {
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
+    device.create_texture(&wgpu::TextureDescriptor {
         label: Some("kroma-rgba32f-upload"),
         size: wgpu::Extent3d {
             width,
@@ -925,10 +1070,19 @@ fn upload_rgba32f_texture(
         format: wgpu::TextureFormat::Rgba32Float,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
-    });
+    })
+}
+
+fn write_rgba32f_texture(
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    rgba_f32: &[f32],
+) {
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
-            texture: &tex,
+            texture: tex,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
@@ -945,6 +1099,17 @@ fn upload_rgba32f_texture(
             depth_or_array_layers: 1,
         },
     );
+}
+
+fn upload_rgba32f_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+    rgba_f32: &[f32],
+) -> wgpu::Texture {
+    let tex = create_rgba32f_upload_texture(device, width, height);
+    write_rgba32f_texture(queue, &tex, width, height, rgba_f32);
     tex
 }
 

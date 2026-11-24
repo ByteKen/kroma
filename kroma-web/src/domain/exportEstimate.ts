@@ -233,14 +233,23 @@ export function fromMeasuredExportSize(
 }
 
 /**
- * Builds a clean sibling default export folder path beside the source project
- * so exported client deliveries never mix into the untouched source RAW folder.
+ * Builds a clean default export folder path:
+ * - Full folder shoots (`'folder'`): sibling folder beside the shoot (`D:\Shoots\Day1_Export`)
+ *   so client deliveries never mix into the untouched source RAW folder.
+ * - Single-photo / selected-file sessions (`'single' | 'files'`): subfolder inside the photo's
+ *   directory (`C:\Users\me\Downloads\Kroma_Export`) so exporting from `Downloads` or `Desktop`
+ *   never climbs up into the OS user profile root.
  */
 export function buildDefaultExportLocation(
   projectFolderPath: string | undefined,
   projectName: string,
+  sessionMode: 'folder' | 'files' | 'single' = 'folder',
 ): string {
-  const safeName = `${projectName.trim() || 'Kroma_Project'}_Export`;
+  const cleanedName = projectName
+    .trim()
+    .replace(/\.[a-z0-9]{2,5}$/i, '')
+    .trim();
+  const safeName = `${cleanedName || 'Kroma_Project'}_Export`;
   if (!projectFolderPath || !projectFolderPath.trim()) {
     return safeName;
   }
@@ -248,6 +257,9 @@ export function buildDefaultExportLocation(
   const trimmed = projectFolderPath.trim().replace(/[\\/]+$/, '');
   const usesBackslash = trimmed.includes('\\') && !trimmed.includes('/');
   const sep = usesBackslash ? '\\' : '/';
+  if (sessionMode === 'single' || sessionMode === 'files') {
+    return `${trimmed}${sep}Kroma_Export`;
+  }
   const lastSep = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'));
   if (lastSep <= 0) {
     return `${trimmed}${sep}${safeName}`;

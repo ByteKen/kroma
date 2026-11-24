@@ -33,6 +33,12 @@ export interface PhotoAsset {
   readonly directoryId: string;
   readonly virtualFolderId?: string | null;
   readonly imageUrl: string;
+  /**
+   * Optional original asset URL for web-native 8-bit formats (JPEG/PNG/WebP), used exclusively by
+   * the Studio Develop GPU viewport (`BeforeAfterCanvas` + `developBitmapCache`) so zoom remains
+   * full-resolution while `imageUrl` serves lightweight `<=1024px` cached thumbnails across tabs.
+   */
+  readonly studioSourceUrl?: string;
   /** Optional 32-bit Rust/wgpu rendered JPEG thumbnail matching `developRecipe` 1:1. */
   readonly renderedThumbnailUrl?: string | null;
   readonly fileSizeBytes?: number;

@@ -71,6 +71,7 @@ const RAW_EXTENSIONS = new Set([
 ]);
 
 const HIGH_BIT_DEPTH_CANDIDATE_EXTENSIONS = new Set([...RAW_EXTENSIONS, 'tif', 'tiff', 'png']);
+const WEB_NATIVE_IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp']);
 
 function extractExtensionLower(fileName: string): string {
   const dot = fileName.lastIndexOf('.');
@@ -80,6 +81,15 @@ function extractExtensionLower(fileName: string): string {
 
 export function isRawFileName(fileName: string): boolean {
   return RAW_EXTENSIONS.has(extractExtensionLower(fileName));
+}
+
+/**
+ * Returns `true` when Chromium / WebView2 can decode the original file natively (JPEG, PNG, WebP)
+ * so the Studio Develop GPU canvas can load full-resolution source bytes (downscaled via
+ * `developBitmapCache`) while all other UI tabs use compact `<=1024px` cached preview proxies.
+ */
+export function isWebNativeFileName(fileName: string): boolean {
+  return WEB_NATIVE_IMAGE_EXTENSIONS.has(extractExtensionLower(fileName));
 }
 
 /**

@@ -202,7 +202,10 @@ export interface OrganizationHistoryState {
   readonly redoLabel: string | null;
 }
 
+export type StudioSessionMode = 'folder' | 'files' | 'single';
+
 export interface StudioSessionSnapshot {
+  readonly sessionMode?: StudioSessionMode;
   readonly isClustered: boolean;
   readonly folderPath?: string;
   readonly telemetry: EngineTelemetrySnapshot;
@@ -283,6 +286,8 @@ export interface StudioGateway {
   loadSession(): Promise<StudioSessionSnapshot | null>;
   openShootFolder(): Promise<StudioSessionSnapshot | null>;
   openShootFolderAtPath(folderPath: string): Promise<StudioSessionSnapshot | null>;
+  openPhotoFiles?(): Promise<StudioSessionSnapshot | null>;
+  openPhotoFilesAtPaths?(filePaths: readonly string[]): Promise<StudioSessionSnapshot | null>;
   runFaceClustering(
     sfaceThreshold: number,
     useTemporalAssist?: boolean,
@@ -331,6 +336,9 @@ export interface StudioGateway {
     maxDim?: number,
     precision?: WorkingBufferPrecision,
   ): Promise<DevelopWorkingBuffer | null>;
+  getPhotoNativeDimensions?(
+    photoId: string,
+  ): Promise<{ readonly width: number; readonly height: number } | null>;
   render32BitThumbnails?(
     mode: ThumbnailPreviewMode,
     photoIds?: readonly string[],

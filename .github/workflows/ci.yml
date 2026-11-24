@@ -66,6 +66,8 @@ jobs:
           - label: macOS (CoreML)
             os: macos-latest
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.4"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

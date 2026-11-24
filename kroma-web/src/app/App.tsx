@@ -65,7 +65,7 @@ const SlateOcrWorkspace = lazy(loadSlateOcrWorkspace);
 const AmbiguousReviewWorkspace = lazy(loadAmbiguousReviewWorkspace);
 const SettingsWorkspace = lazy(loadSettingsWorkspace);
 
-const WORKSPACE_SKELETON_MS = 230;
+const WORKSPACE_SKELETON_MS = 90;
 
 function StudioShellLayout() {
   const { isBootReady, session, activeWorkspace, settingsOpen, studioFocusMode } = useStudio();
@@ -131,12 +131,22 @@ function StudioShellLayout() {
   const previousViewRef = useRef<WorkspaceView | null>(null);
   const [transitionSkeleton, setTransitionSkeleton] = useState<SkeletonWorkspaceView | null>(null);
 
-  // Trigger layout-matched skeleton synchronously before paint on workspace switches
+  const isTargetAlreadyMounted =
+    effectiveView === 'home' ||
+    (effectiveView === 'develop' &&
+      cachedWorkspaces.sessionKey === sessionKey &&
+      cachedWorkspaces.develop) ||
+    (effectiveView === 'culling' &&
+      cachedWorkspaces.sessionKey === sessionKey &&
+      cachedWorkspaces.culling);
+
+  // Trigger layout-matched skeleton synchronously before paint ONLY for unmounted lazy views;
+  // already-cached workspaces (Home, Studio, Face Organizer) switch instantaneously in 0 ms.
   useLayoutEffect(() => {
     const prev = previousViewRef.current;
     previousViewRef.current = effectiveView;
 
-    if (!shouldShowWorkspaceSkeleton(prev, effectiveView)) {
+    if (!shouldShowWorkspaceSkeleton(prev, effectiveView, isTargetAlreadyMounted)) {
       setTransitionSkeleton(null);
       return;
     }
@@ -147,7 +157,7 @@ function StudioShellLayout() {
     }, WORKSPACE_SKELETON_MS);
 
     return () => window.clearTimeout(timer);
-  }, [effectiveView]);
+  }, [effectiveView, isTargetAlreadyMounted]);
 
   const mountDevelop =
     Boolean(session) &&
@@ -177,7 +187,7 @@ function StudioShellLayout() {
 
           {mountCulling && (
             <div
-              key={`culling-${sessionKey}`}
+              key="culling-workspace"
               className={
                 !showHome && activeWorkspace === 'culling'
                   ? 'flex-1 flex min-w-0 min-h-0 overflow-hidden'
@@ -193,7 +203,7 @@ function StudioShellLayout() {
 
           {mountDevelop && (
             <div
-              key={`develop-${sessionKey}`}
+              key="develop-workspace"
               className={
                 !showHome && activeWorkspace === 'develop'
                   ? 'flex-1 flex min-w-0 min-h-0 overflow-hidden'

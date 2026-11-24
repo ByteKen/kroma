@@ -13,11 +13,20 @@ import {
   buildToneCurveLutRgba32F,
   compileDevelopShaderUniforms,
   compressRec2020ToLinearSrgb,
-  computeObjectFitUvTransform,
   linearToSrgb,
   softClip,
 } from '../../domain/developShaderMath';
+import {
+  computeViewportUvTransform,
+  ZERO_VIEWPORT_PAN,
+  type ViewportPan,
+} from '../../domain/viewportZoom';
 import type { DevelopWorkingBuffer } from '../../domain/developWorkingBuffer';
+import {
+  loadDevelopBitmap,
+  peekDevelopBitmap,
+  type CachedDevelopBitmap,
+} from './developBitmapCache';
 import {
   compileMaskLayerForWebGl,
   decodeMatteRleB64,
@@ -44,7 +53,11 @@ export interface DevelopViewportCanvasProps {
   readonly alt: string;
   readonly recipe: DevelopRecipe;
   readonly workingBuffer?: DevelopWorkingBuffer | null;
+  readonly previewMaxDim?: number;
   readonly fit?: 'cover' | 'contain';
+  readonly viewportZoom?: number;
+  readonly viewportPan?: ViewportPan;
+  readonly viewportPadPx?: number;
   readonly rotationDeg?: number;
   readonly rotationScale?: number;
   readonly applyCrop?: boolean;
@@ -58,13 +71,40 @@ export interface DevelopViewportCanvasProps {
   readonly onSampleColorRangeRgb?: (r: number, g: number, b: number) => void;
   readonly className?: string;
   readonly onNaturalSize?: (width: number, height: number) => void;
+  readonly onMaxTextureDim?: (maxDim: number) => void;
 }
 
 interface WebGpuDevelopCanvasProps extends DevelopViewportCanvasProps {
   readonly onUnavailable?: () => void;
 }
 
-const MAX_WORK_DIM = 2560;
+const DEFAULT_MAX_WORK_DIM = 4096;
+/** Upload raw working textures in 512-row strips (~8-16 MB each) so Chromium/Dawn's GPU IPC ring buffer never overflows. */
+const UPLOAD_CHUNK_ROWS = 512;
+
+function writeTextureRowsChunked(
+  queue: GPUQueue,
+  tex: GPUTexture,
+  data: Uint16Array | Float32Array,
+  width: number,
+  height: number,
+  bytesPerPixel: 8 | 16,
+): void {
+  const elementsPerRow = width * 4;
+  const bytesPerRow = width * bytesPerPixel;
+  for (let y = 0; y < height; y += UPLOAD_CHUNK_ROWS) {
+    const rows = Math.min(UPLOAD_CHUNK_ROWS, height - y);
+    const startElem = y * elementsPerRow;
+    const endElem = (y + rows) * elementsPerRow;
+    const chunk = data.subarray(startElem, endElem);
+    queue.writeTexture(
+      { texture: tex, origin: [0, y, 0] },
+      chunk as Uint16Array<ArrayBuffer> | Float32Array<ArrayBuffer>,
+      { bytesPerRow, rowsPerImage: rows },
+      [width, rows],
+    );
+  }
+}
 
 function f16BitsToF32(h: number): number {
   const sign = (h & 0x8000) !== 0 ? -1 : 1;
@@ -106,7 +146,11 @@ interface SharedWebGpuCore {
   readonly presentPipeline: GPURenderPipeline;
   readonly dummyLut3dBuf: GPUBuffer;
   readonly dummyWhiteTex: GPUTexture;
+  readonly dummyWhiteView: GPUTextureView;
   readonly dummyToneLutTex: GPUTexture;
+  readonly dummyToneLutView: GPUTextureView;
+  readonly lostListeners: Set<() => void>;
+  isLost: boolean;
 }
 
 let sharedCorePromise: Promise<SharedWebGpuCore | null> | null = null;
@@ -125,8 +169,17 @@ function createSharedWebGpuCore(): Promise<SharedWebGpuCore | null> {
         return null;
       }
       const device = await adapter.requestDevice();
+      const lostListeners = new Set<() => void>();
+      let coreRef: SharedWebGpuCore | null = null;
       device.lost.then(() => {
         sharedCorePromise = null;
+        if (coreRef) {
+          coreRef.isLost = true;
+        }
+        for (const listener of [...lostListeners]) {
+          listener();
+        }
+        lostListeners.clear();
       });
 
       const swapFormat = navigator.gpu.getPreferredCanvasFormat();
@@ -294,7 +347,7 @@ function createSharedWebGpuCore(): Promise<SharedWebGpuCore | null> {
         [256, 1],
       );
 
-      return {
+      const core: SharedWebGpuCore = {
         device,
         queue: device.queue,
         swapFormat,
@@ -309,8 +362,14 @@ function createSharedWebGpuCore(): Promise<SharedWebGpuCore | null> {
         presentPipeline,
         dummyLut3dBuf,
         dummyWhiteTex,
+        dummyWhiteView: dummyWhiteTex.createView(),
         dummyToneLutTex,
+        dummyToneLutView: dummyToneLutTex.createView(),
+        lostListeners,
+        isLost: false,
       };
+      coreRef = core;
+      return core;
     } catch {
       return null;
     }
@@ -325,6 +384,15 @@ interface CachedSpatialMaskGpu {
   readonly compiled: CompiledWebGlMaskData;
 }
 
+interface CachedGradeBindGroup {
+  readonly srcView: GPUTextureView;
+  readonly toneView: GPUTextureView;
+  readonly bgMatteView: GPUTextureView;
+  readonly lutBuf: GPUBuffer;
+  readonly outView: GPUTextureView;
+  readonly bg: GPUBindGroup;
+}
+
 interface CanvasGpuResources {
   readonly core: SharedWebGpuCore;
   readonly ctx: GPUCanvasContext;
@@ -332,29 +400,39 @@ interface CanvasGpuResources {
   readonly spatialUbo: GPUBuffer;
   readonly presentUbo: GPUBuffer;
   readonly toneLutTex: GPUTexture;
+  readonly toneLutView: GPUTextureView;
   srcTex: GPUTexture | null;
+  srcView: GPUTextureView | null;
   workTexA: GPUTexture | null;
+  workViewA: GPUTextureView | null;
   workTexB: GPUTexture | null;
+  workViewB: GPUTextureView | null;
   workW: number;
   workH: number;
   lastFinalTex: GPUTexture | null;
   bgMatteTex: GPUTexture | null;
+  bgMatteView: GPUTextureView | null;
   bgMatteSig: string;
   lut3dBuf: GPUBuffer | null;
   lut3dPath: string;
   lut3dParsed: ParsedCubeLut3D | null;
+  gradeBgCache: CachedGradeBindGroup | null;
+  presentBgA: GPUBindGroup | null;
+  presentBgB: GPUBindGroup | null;
   readonly spatialMaskCache: Map<string, CachedSpatialMaskGpu>;
   maskUboPool: GPUBuffer[];
 }
 
-function ensureWorkTextures(res: CanvasGpuResources, w: number, h: number): void {
-  const clampedW = Math.max(1, Math.min(MAX_WORK_DIM, w));
-  const clampedH = Math.max(1, Math.min(MAX_WORK_DIM, h));
-  if (res.workTexA && res.workTexB && res.workW === clampedW && res.workH === clampedH) {
-    return;
-  }
-  res.workTexA?.destroy();
-  res.workTexB?.destroy();
+function ensureWorkTextures(
+  res: CanvasGpuResources,
+  w: number,
+  h: number,
+  needPingPong: boolean,
+): void {
+  const maxDim = Math.min(DEFAULT_MAX_WORK_DIM, res.core.maxTextureDim);
+  const clampedW = Math.max(1, Math.min(maxDim, w));
+  const clampedH = Math.max(1, Math.min(maxDim, h));
+  const sizeChanged = res.workW !== clampedW || res.workH !== clampedH;
   const desc: GPUTextureDescriptor = {
     size: [clampedW, clampedH],
     format: 'rgba32float',
@@ -363,10 +441,33 @@ function ensureWorkTextures(res: CanvasGpuResources, w: number, h: number): void
       GPUTextureUsage.TEXTURE_BINDING |
       GPUTextureUsage.COPY_SRC,
   };
-  res.workTexA = res.core.device.createTexture({ ...desc, label: 'kroma-studio-work-a' });
-  res.workTexB = res.core.device.createTexture({ ...desc, label: 'kroma-studio-work-b' });
-  res.workW = clampedW;
-  res.workH = clampedH;
+
+  if (sizeChanged || !res.workTexA || !res.workViewA) {
+    res.workTexA?.destroy();
+    res.workTexB?.destroy();
+    res.workTexB = null;
+    res.workViewB = null;
+    res.workTexA = res.core.device.createTexture({ ...desc, label: 'kroma-studio-work-a' });
+    res.workViewA = res.workTexA.createView();
+    res.workW = clampedW;
+    res.workH = clampedH;
+    res.lastFinalTex = null;
+    res.gradeBgCache = null;
+    res.presentBgA = null;
+    res.presentBgB = null;
+  }
+
+  if (needPingPong && (!res.workTexB || !res.workViewB)) {
+    res.workTexB = res.core.device.createTexture({ ...desc, label: 'kroma-studio-work-b' });
+    res.workViewB = res.workTexB.createView();
+    res.presentBgB = null;
+  } else if (!needPingPong && res.workTexB && clampedW * clampedH > 2560 * 2560) {
+    // Release high-res ping-pong VRAM immediately when masks/spatial are not active
+    res.workTexB.destroy();
+    res.workTexB = null;
+    res.workViewB = null;
+    res.presentBgB = null;
+  }
 }
 
 function ensureBgMatteTextureGpu(
@@ -375,7 +476,7 @@ function ensureBgMatteTextureGpu(
 ): boolean {
   if (!bg || !isBackgroundRemovalActive(bg)) return false;
   const sig = `${bg.matteWidth}x${bg.matteHeight}:${bg.matteRleB64}`;
-  if (res.bgMatteSig === sig && res.bgMatteTex) return true;
+  if (res.bgMatteSig === sig && res.bgMatteTex && res.bgMatteView) return true;
   const decoded = decodeMatteRleB64(bg.matteRleB64, bg.matteWidth * bg.matteHeight);
   if (!decoded) return false;
 
@@ -403,7 +504,9 @@ function ensureBgMatteTextureGpu(
     [bg.matteWidth, bg.matteHeight],
   );
   res.bgMatteTex = tex;
+  res.bgMatteView = tex.createView();
   res.bgMatteSig = sig;
+  res.gradeBgCache = null;
   return true;
 }
 
@@ -487,9 +590,11 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
   alt,
   recipe,
   workingBuffer = null,
+  previewMaxDim = 2048,
   fit = 'cover',
-  rotationDeg = 0,
-  rotationScale = 1.06,
+  viewportZoom = 1,
+  viewportPan = ZERO_VIEWPORT_PAN,
+  viewportPadPx = 0,
   applyCrop = true,
   showShadowClip = false,
   showHighlightClip = false,
@@ -501,47 +606,76 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
   onSampleColorRangeRgb,
   className = '',
   onNaturalSize,
+  onMaxTextureDim,
   onUnavailable,
 }: WebGpuDevelopCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const resRef = useRef<CanvasGpuResources | null>(null);
   const imgSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
-  const sourceImgRef = useRef<HTMLImageElement | null>(null);
+  const sourceBitmapRef = useRef<CachedDevelopBitmap | null>(null);
+  const loadedSrcRef = useRef<string>('');
   const inputLinearRef = useRef(false);
   const inputWideGamutRef = useRef(false);
   const textureReadyRef = useRef(false);
+  const gradeDirtyRef = useRef(true);
+  const lastFinalIsARef = useRef(true);
+  const lastBgTransparentRef = useRef(false);
   const workingBufferRef = useRef<DevelopWorkingBuffer | null>(workingBuffer);
   const recipeRef = useRef(recipe);
   const fitRef = useRef(fit);
+  const viewportZoomRef = useRef(viewportZoom);
+  const viewportPanRef = useRef(viewportPan);
+  const viewportPadPxRef = useRef(viewportPadPx);
   const applyCropRef = useRef(applyCrop);
   const clipFlagsRef = useRef({ shadow: showShadowClip, highlight: showHighlightClip });
   const maskOverlayRef = useRef({ activeMaskId, showMaskOverlay });
   const onNaturalSizeRef = useRef(onNaturalSize);
+  const onMaxTextureDimRef = useRef(onMaxTextureDim);
   const onUnavailableRef = useRef(onUnavailable);
 
   workingBufferRef.current = workingBuffer;
   recipeRef.current = recipe;
   fitRef.current = fit;
+  viewportZoomRef.current = viewportZoom;
+  viewportPanRef.current = viewportPan;
+  viewportPadPxRef.current = viewportPadPx;
   applyCropRef.current = applyCrop;
   clipFlagsRef.current = { shadow: showShadowClip, highlight: showHighlightClip };
   maskOverlayRef.current = { activeMaskId, showMaskOverlay };
   onNaturalSizeRef.current = onNaturalSize;
+  onMaxTextureDimRef.current = onMaxTextureDim;
   onUnavailableRef.current = onUnavailable;
 
   const [gpuReady, setGpuReady] = useState(false);
   const [textureVersion, setTextureVersion] = useState(0);
+  const renderFrameRef = useRef<() => void>(() => {});
+  const pendingRafRef = useRef<number | null>(null);
+
+  const scheduleRender = () => {
+    if (pendingRafRef.current !== null) return;
+    pendingRafRef.current = window.requestAnimationFrame(() => {
+      pendingRafRef.current = null;
+      renderFrameRef.current();
+    });
+  };
 
   const renderFrame = () => {
     const res = resRef.current;
     const canvas = canvasRef.current;
-    if (!res || !canvas || !textureReadyRef.current || !res.srcTex) return;
+    if (!res || !canvas || !textureReadyRef.current || !res.srcTex || !res.srcView) return;
+    if (res.core.isLost) {
+      onUnavailableRef.current?.();
+      return;
+    }
+    // Skip GPU compute dispatches & swapchain resizes while Studio is hidden (`display: none`)
+    if (canvas.clientWidth === 0 || canvas.clientHeight === 0) return;
 
     const { core, ctx } = res;
     const { device, queue } = core;
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const cssW = Math.max(1, canvas.clientWidth);
-    const cssH = Math.max(1, canvas.clientHeight);
+    const cssW = canvas.clientWidth;
+    const cssH = canvas.clientHeight;
     const pixelW = Math.max(1, Math.round(cssW * dpr));
     const pixelH = Math.max(1, Math.round(cssH * dpr));
 
@@ -558,271 +692,341 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
     const orientedH = swapAxes ? imgSizeRef.current.w : imgSizeRef.current.h;
     if (orientedW <= 0 || orientedH <= 0) return;
 
-    const scaleDown = Math.max(orientedW, orientedH) > MAX_WORK_DIM
-      ? MAX_WORK_DIM / Math.max(orientedW, orientedH)
-      : 1;
+    const maxWorkDim = Math.min(DEFAULT_MAX_WORK_DIM, core.maxTextureDim);
+    const scaleDown =
+      Math.max(orientedW, orientedH) > maxWorkDim
+        ? maxWorkDim / Math.max(orientedW, orientedH)
+        : 1;
     const workW = Math.max(1, Math.round(orientedW * scaleDown));
     const workH = Math.max(1, Math.round(orientedH * scaleDown));
-    ensureWorkTextures(res, workW, workH);
-    if (!res.workTexA || !res.workTexB) return;
 
-    const u = compileDevelopShaderUniforms(curRecipe);
-    const uv = computeObjectFitUvTransform(
+    const uv = computeViewportUvTransform(
       orientedW,
       orientedH,
       cssW,
       cssH,
       fitRef.current,
       applyCropRef.current ? crop.rect : undefined,
+      viewportPadPxRef.current,
+      viewportZoomRef.current,
+      viewportPanRef.current,
     );
 
-    const allMasks = curRecipe.masks ?? [];
-    const effectiveMasks = allMasks.filter(isMaskLayerEffective);
-    const overlayMask = maskOverlayRef.current.showMaskOverlay
-      ? (allMasks.find(
-          (m) =>
-            m.id === maskOverlayRef.current.activeMaskId &&
-            m.enabled &&
-            m.components.length > 0,
-        ) ?? null)
-      : null;
+    const canPresentOnly =
+      !gradeDirtyRef.current &&
+      res.lastFinalTex !== null &&
+      res.workW === workW &&
+      res.workH === workH &&
+      Boolean(lastFinalIsARef.current ? res.workViewA : res.workViewB);
 
-    if (res.spatialMaskCache.size > 0) {
-      const liveIds = new Set(allMasks.map((m) => m.id));
-      for (const [id, entry] of res.spatialMaskCache.entries()) {
-        if (!liveIds.has(id)) {
-          entry.tex.destroy();
-          res.spatialMaskCache.delete(id);
+    const encoder = device.createCommandEncoder({
+      label: canPresentOnly ? 'kroma-studio-present-only' : 'kroma-studio-frame',
+    });
+
+    let currentIsA = lastFinalIsARef.current;
+    let bgTransparent = lastBgTransparentRef.current;
+
+    if (!canPresentOnly) {
+      const u = compileDevelopShaderUniforms(curRecipe);
+      const allMasks = curRecipe.masks ?? [];
+      const effectiveMasks = allMasks.filter(isMaskLayerEffective);
+      const overlayMask = maskOverlayRef.current.showMaskOverlay
+        ? (allMasks.find(
+            (m) =>
+              m.id === maskOverlayRef.current.activeMaskId &&
+              m.enabled &&
+              m.components.length > 0,
+          ) ?? null)
+        : null;
+
+      if (res.spatialMaskCache.size > 0) {
+        const liveIds = new Set(allMasks.map((m) => m.id));
+        for (const [id, entry] of res.spatialMaskCache.entries()) {
+          if (!liveIds.has(id)) {
+            entry.tex.destroy();
+            res.spatialMaskCache.delete(id);
+          }
         }
       }
-    }
 
-    const bgReady = ensureBgMatteTextureGpu(res, curRecipe.backgroundRemoval);
-    const bgCfg = curRecipe.backgroundRemoval;
-    const bgTransparent = Boolean(bgReady && bgCfg?.mode === 'transparent');
+      const bgReady = ensureBgMatteTextureGpu(res, curRecipe.backgroundRemoval);
+      const bgCfg = curRecipe.backgroundRemoval;
+      bgTransparent = Boolean(bgReady && bgCfg?.mode === 'transparent');
 
-    if (u.toneCurveActive) {
-      const lutFloats = buildToneCurveLutRgba32F(curRecipe.toneCurve);
-      queue.writeTexture(
-        { texture: res.toneLutTex },
-        lutFloats as Float32Array<ArrayBuffer>,
-        { bytesPerRow: 256 * 16, rowsPerImage: 1 },
-        [256, 1],
-      );
-    }
+      const needPingPong =
+        effectiveMasks.length > 0 || u.spatialStageActive || bgTransparent || overlayMask !== null;
+      ensureWorkTextures(res, workW, workH, needPingPong);
+      if (!res.workTexA || !res.workViewA) return;
+      if (needPingPong && (!res.workTexB || !res.workViewB)) return;
 
-    let activeLutBuf = core.dummyLut3dBuf;
-    let activeLutMeta: {
-      readonly size: number;
-      readonly intensity: number;
-      readonly domainMin: readonly [number, number, number];
-      readonly domainMax: readonly [number, number, number];
-    } | null = null;
+      if (u.toneCurveActive) {
+        const lutFloats = buildToneCurveLutRgba32F(curRecipe.toneCurve);
+        queue.writeTexture(
+          { texture: res.toneLutTex },
+          lutFloats as Float32Array<ArrayBuffer>,
+          { bytesPerRow: 256 * 16, rowsPerImage: 1 },
+          [256, 1],
+        );
+      }
 
-    if (curRecipe.lut3d && curRecipe.lut3d.intensity > 0) {
-      const cubePath = curRecipe.lut3d.cubePath;
-      const cachedLut = getCachedCubeLut3D(cubePath);
-      if (cachedLut) {
-        activeLutBuf = ensureLut3dBufferGpu(res, cubePath, cachedLut);
-        activeLutMeta = {
-          size: cachedLut.size,
-          intensity: curRecipe.lut3d.intensity / 100,
-          domainMin: cachedLut.domainMin,
-          domainMax: cachedLut.domainMax,
-        };
+      let activeLutBuf = core.dummyLut3dBuf;
+      let activeLutMeta: {
+        readonly size: number;
+        readonly intensity: number;
+        readonly domainMin: readonly [number, number, number];
+        readonly domainMax: readonly [number, number, number];
+      } | null = null;
+
+      if (curRecipe.lut3d && curRecipe.lut3d.intensity > 0) {
+        const cubePath = curRecipe.lut3d.cubePath;
+        const cachedLut = getCachedCubeLut3D(cubePath);
+        if (cachedLut) {
+          activeLutBuf = ensureLut3dBufferGpu(res, cubePath, cachedLut);
+          activeLutMeta = {
+            size: cachedLut.size,
+            intensity: curRecipe.lut3d.intensity / 100,
+            domainMin: cachedLut.domainMin,
+            domainMax: cachedLut.domainMax,
+          };
+        } else {
+          void ensureCubeLut3DLoaded(cubePath).then((loaded) => {
+            if (loaded && resRef.current) {
+              gradeDirtyRef.current = true;
+              scheduleRender();
+            }
+          });
+        }
+      }
+
+      const gradeData = packGradeUniforms({
+        outWidth: workW,
+        outHeight: workH,
+        srcWidth: imgSizeRef.current.w,
+        srcHeight: imgSizeRef.current.h,
+        inputIsLinear: inputLinearRef.current,
+        inputIsWideGamut: inputWideGamutRef.current,
+        recipe: curRecipe,
+        includeFineRotation: true,
+        bgMatteReady: bgReady,
+        lut3d: activeLutMeta,
+      });
+      queue.writeBuffer(res.gradeUbo, 0, gradeData as Float32Array<ArrayBuffer>);
+
+      const srcView = res.srcView;
+      const toneView = u.toneCurveActive ? res.toneLutView : core.dummyToneLutView;
+      const bgMatteView = bgReady && res.bgMatteView ? res.bgMatteView : core.dummyWhiteView;
+      const viewA = res.workViewA;
+      const viewB = res.workViewB;
+
+      const wgX = Math.ceil(workW / 8);
+      const wgY = Math.ceil(workH / 8);
+
+      // Pass 1: 32-Bit Scene-Referred Wide-Gamut Color/Tone/Backdrop (cached bind group across slider frames)
+      let gradeBg: GPUBindGroup;
+      const cachedGrade = res.gradeBgCache;
+      if (
+        cachedGrade &&
+        cachedGrade.srcView === srcView &&
+        cachedGrade.toneView === toneView &&
+        cachedGrade.bgMatteView === bgMatteView &&
+        cachedGrade.lutBuf === activeLutBuf &&
+        cachedGrade.outView === viewA
+      ) {
+        gradeBg = cachedGrade.bg;
       } else {
-        void ensureCubeLut3DLoaded(cubePath).then((loaded) => {
-          if (loaded && resRef.current) {
-            renderFrame();
-          }
-        });
-      }
-    }
-
-    const gradeData = packGradeUniforms({
-      outWidth: workW,
-      outHeight: workH,
-      srcWidth: imgSizeRef.current.w,
-      srcHeight: imgSizeRef.current.h,
-      inputIsLinear: inputLinearRef.current,
-      inputIsWideGamut: inputWideGamutRef.current,
-      recipe: curRecipe,
-      includeFineRotation: false,
-      bgMatteReady: bgReady,
-      lut3d: activeLutMeta,
-    });
-    queue.writeBuffer(res.gradeUbo, 0, gradeData as Float32Array<ArrayBuffer>);
-
-    const srcView = res.srcTex.createView();
-    const toneView = (u.toneCurveActive ? res.toneLutTex : core.dummyToneLutTex).createView();
-    const bgMatteView = (bgReady && res.bgMatteTex ? res.bgMatteTex : core.dummyWhiteTex).createView();
-    const viewA = res.workTexA.createView();
-    const viewB = res.workTexB.createView();
-
-    const wgX = Math.ceil(workW / 8);
-    const wgY = Math.ceil(workH / 8);
-
-    const encoder = device.createCommandEncoder({ label: 'kroma-studio-frame' });
-
-    // Pass 1: 32-Bit Scene-Referred Wide-Gamut Color/Tone/Backdrop
-    const gradeBg = device.createBindGroup({
-      layout: core.gradeBgl,
-      entries: [
-        { binding: 0, resource: { buffer: res.gradeUbo } },
-        { binding: 1, resource: srcView },
-        { binding: 2, resource: toneView },
-        { binding: 3, resource: bgMatteView },
-        { binding: 4, resource: { buffer: activeLutBuf } },
-        { binding: 5, resource: viewA },
-      ],
-    });
-    {
-      const pass = encoder.beginComputePass({ label: 'kroma-grade-compute' });
-      pass.setPipeline(core.gradePipeline);
-      pass.setBindGroup(0, gradeBg);
-      pass.dispatchWorkgroups(wgX, wgY, 1);
-      pass.end();
-    }
-
-    let currentIsA = true;
-    let maskUboIdx = 0;
-    const acquireMaskUbo = (): GPUBuffer => {
-      let buf = res.maskUboPool[maskUboIdx];
-      if (!buf) {
-        buf = device.createBuffer({
-          label: `kroma-mask-ubo-${maskUboIdx}`,
-          size: MASK_UNIFORM_FLOATS * 4,
-          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-        res.maskUboPool.push(buf);
-      }
-      maskUboIdx += 1;
-      return buf;
-    };
-
-    // Pass 1b: Local & AI Masks
-    for (const layer of effectiveMasks) {
-      const cached = getOrUploadSpatialMaskGpu(res, layer, orientedW, orientedH);
-      const adj = layer.adjustments;
-      const hasTone =
-        adj.temperatureShift !== 0 ||
-        adj.tintShift !== 0 ||
-        Math.abs(adj.exposureEv) > 1e-4 ||
-        adj.contrast !== 0 ||
-        adj.highlights !== 0 ||
-        adj.shadows !== 0 ||
-        adj.whites !== 0 ||
-        adj.blacks !== 0 ||
-        adj.dehaze !== 0 ||
-        adj.saturation !== 0;
-      const hasSpatial = adj.texture !== 0 || adj.clarity !== 0 || adj.sharpness !== 0;
-      const stages: readonly (0 | 1 | 2)[] = hasTone && hasSpatial ? [1, 2] : [0];
-
-      const spatialView = cached.tex.createView();
-      for (const passMode of stages) {
-        const maskUbo = acquireMaskUbo();
-        const maskData = packMaskUniforms({
-          outWidth: workW,
-          outHeight: workH,
-          layer,
-          compiled: cached.compiled,
-          overlayOnly: false,
-          passMode,
-        });
-        queue.writeBuffer(maskUbo, 0, maskData as Float32Array<ArrayBuffer>);
-
-        const maskBg = device.createBindGroup({
-          layout: core.maskBgl,
+        gradeBg = device.createBindGroup({
+          layout: core.gradeBgl,
           entries: [
-            { binding: 0, resource: { buffer: maskUbo } },
-            { binding: 1, resource: currentIsA ? viewA : viewB },
-            { binding: 2, resource: spatialView },
-            { binding: 3, resource: currentIsA ? viewB : viewA },
+            { binding: 0, resource: { buffer: res.gradeUbo } },
+            { binding: 1, resource: srcView },
+            { binding: 2, resource: toneView },
+            { binding: 3, resource: bgMatteView },
+            { binding: 4, resource: { buffer: activeLutBuf } },
+            { binding: 5, resource: viewA },
           ],
         });
-        const pass = encoder.beginComputePass({ label: 'kroma-mask-compute' });
-        pass.setPipeline(core.maskPipeline);
-        pass.setBindGroup(0, maskBg);
+        res.gradeBgCache = {
+          srcView,
+          toneView,
+          bgMatteView,
+          lutBuf: activeLutBuf,
+          outView: viewA,
+          bg: gradeBg,
+        };
+      }
+      {
+        const pass = encoder.beginComputePass({ label: 'kroma-grade-compute' });
+        pass.setPipeline(core.gradePipeline);
+        pass.setBindGroup(0, gradeBg);
+        pass.dispatchWorkgroups(wgX, wgY, 1);
+        pass.end();
+      }
+
+      currentIsA = true;
+      let maskUboIdx = 0;
+      const acquireMaskUbo = (): GPUBuffer => {
+        let buf = res.maskUboPool[maskUboIdx];
+        if (!buf) {
+          buf = device.createBuffer({
+            label: `kroma-mask-ubo-${maskUboIdx}`,
+            size: MASK_UNIFORM_FLOATS * 4,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          });
+          res.maskUboPool.push(buf);
+        }
+        maskUboIdx += 1;
+        return buf;
+      };
+
+      // Pass 1b: Local & AI Masks
+      for (const layer of effectiveMasks) {
+        const cached = getOrUploadSpatialMaskGpu(res, layer, orientedW, orientedH);
+        const adj = layer.adjustments;
+        const hasTone =
+          adj.temperatureShift !== 0 ||
+          adj.tintShift !== 0 ||
+          Math.abs(adj.exposureEv) > 1e-4 ||
+          adj.contrast !== 0 ||
+          adj.highlights !== 0 ||
+          adj.shadows !== 0 ||
+          adj.whites !== 0 ||
+          adj.blacks !== 0 ||
+          adj.dehaze !== 0 ||
+          adj.saturation !== 0;
+        const hasSpatial = adj.texture !== 0 || adj.clarity !== 0 || adj.sharpness !== 0;
+        const stages: readonly (0 | 1 | 2)[] = hasTone && hasSpatial ? [1, 2] : [0];
+
+        const spatialView = cached.tex.createView();
+        for (const passMode of stages) {
+          const maskUbo = acquireMaskUbo();
+          const maskData = packMaskUniforms({
+            outWidth: workW,
+            outHeight: workH,
+            layer,
+            compiled: cached.compiled,
+            overlayOnly: false,
+            passMode,
+          });
+          queue.writeBuffer(maskUbo, 0, maskData as Float32Array<ArrayBuffer>);
+
+          const maskBg = device.createBindGroup({
+            layout: core.maskBgl,
+            entries: [
+              { binding: 0, resource: { buffer: maskUbo } },
+              { binding: 1, resource: currentIsA ? viewA : viewB! },
+              { binding: 2, resource: spatialView },
+              { binding: 3, resource: currentIsA ? viewB! : viewA },
+            ],
+          });
+          const pass = encoder.beginComputePass({ label: 'kroma-mask-compute' });
+          pass.setPipeline(core.maskPipeline);
+          pass.setBindGroup(0, maskBg);
+          pass.dispatchWorkgroups(wgX, wgY, 1);
+          pass.end();
+          currentIsA = !currentIsA;
+        }
+      }
+
+      // Pass 2: Global Spatial Detail + Transparent Cutout Alpha
+      if (u.spatialStageActive || bgTransparent) {
+        const spatialData = packSpatialUniforms({
+          outWidth: workW,
+          outHeight: workH,
+          recipe: curRecipe,
+          bgTransparent,
+        });
+        queue.writeBuffer(res.spatialUbo, 0, spatialData as Float32Array<ArrayBuffer>);
+        const spatialBg = device.createBindGroup({
+          layout: core.spatialBgl,
+          entries: [
+            { binding: 0, resource: { buffer: res.spatialUbo } },
+            { binding: 1, resource: currentIsA ? viewA : viewB! },
+            { binding: 2, resource: bgMatteView },
+            { binding: 3, resource: currentIsA ? viewB! : viewA },
+          ],
+        });
+        const pass = encoder.beginComputePass({ label: 'kroma-spatial-compute' });
+        pass.setPipeline(core.spatialPipeline);
+        pass.setBindGroup(0, spatialBg);
         pass.dispatchWorkgroups(wgX, wgY, 1);
         pass.end();
         currentIsA = !currentIsA;
       }
+
+      // Optional Ruby Mask Overlay (O) composited cleanly on top
+      if (overlayMask) {
+        const cached = getOrUploadSpatialMaskGpu(res, overlayMask, orientedW, orientedH);
+        const maskUbo = acquireMaskUbo();
+        const overlayData = packMaskUniforms({
+          outWidth: workW,
+          outHeight: workH,
+          layer: overlayMask,
+          compiled: cached.compiled,
+          overlayOnly: true,
+          passMode: 0,
+        });
+        queue.writeBuffer(maskUbo, 0, overlayData as Float32Array<ArrayBuffer>);
+        const overlayBg = device.createBindGroup({
+          layout: core.maskBgl,
+          entries: [
+            { binding: 0, resource: { buffer: maskUbo } },
+            { binding: 1, resource: currentIsA ? viewA : viewB! },
+            { binding: 2, resource: cached.tex.createView() },
+            { binding: 3, resource: currentIsA ? viewB! : viewA },
+          ],
+        });
+        const pass = encoder.beginComputePass({ label: 'kroma-ruby-overlay' });
+        pass.setPipeline(core.maskPipeline);
+        pass.setBindGroup(0, overlayBg);
+        pass.dispatchWorkgroups(wgX, wgY, 1);
+        pass.end();
+        currentIsA = !currentIsA;
+      }
+
+      res.lastFinalTex = currentIsA ? res.workTexA : res.workTexB;
+      lastFinalIsARef.current = currentIsA;
+      lastBgTransparentRef.current = bgTransparent;
+      gradeDirtyRef.current = false;
     }
 
-    // Pass 2: Global Spatial Detail + Transparent Cutout Alpha
-    if (u.spatialStageActive || bgTransparent) {
-      const spatialData = packSpatialUniforms({
-        outWidth: workW,
-        outHeight: workH,
-        recipe: curRecipe,
-        bgTransparent,
-      });
-      queue.writeBuffer(res.spatialUbo, 0, spatialData as Float32Array<ArrayBuffer>);
-      const spatialBg = device.createBindGroup({
-        layout: core.spatialBgl,
-        entries: [
-          { binding: 0, resource: { buffer: res.spatialUbo } },
-          { binding: 1, resource: currentIsA ? viewA : viewB },
-          { binding: 2, resource: bgMatteView },
-          { binding: 3, resource: currentIsA ? viewB : viewA },
-        ],
-      });
-      const pass = encoder.beginComputePass({ label: 'kroma-spatial-compute' });
-      pass.setPipeline(core.spatialPipeline);
-      pass.setBindGroup(0, spatialBg);
-      pass.dispatchWorkgroups(wgX, wgY, 1);
-      pass.end();
-      currentIsA = !currentIsA;
-    }
-
-    // Optional Ruby Mask Overlay (O) composited cleanly on top
-    if (overlayMask) {
-      const cached = getOrUploadSpatialMaskGpu(res, overlayMask, orientedW, orientedH);
-      const maskUbo = acquireMaskUbo();
-      const overlayData = packMaskUniforms({
-        outWidth: workW,
-        outHeight: workH,
-        layer: overlayMask,
-        compiled: cached.compiled,
-        overlayOnly: true,
-        passMode: 0,
-      });
-      queue.writeBuffer(maskUbo, 0, overlayData as Float32Array<ArrayBuffer>);
-      const overlayBg = device.createBindGroup({
-        layout: core.maskBgl,
-        entries: [
-          { binding: 0, resource: { buffer: maskUbo } },
-          { binding: 1, resource: currentIsA ? viewA : viewB },
-          { binding: 2, resource: cached.tex.createView() },
-          { binding: 3, resource: currentIsA ? viewB : viewA },
-        ],
-      });
-      const pass = encoder.beginComputePass({ label: 'kroma-ruby-overlay' });
-      pass.setPipeline(core.maskPipeline);
-      pass.setBindGroup(0, overlayBg);
-      pass.dispatchWorkgroups(wgX, wgY, 1);
-      pass.end();
-      currentIsA = !currentIsA;
-    }
-
-    res.lastFinalTex = currentIsA ? res.workTexA : res.workTexB;
-
-    // Pass 3: Present Blit to Swapchain
+    // Pass 3: Present Blit to Swapchain (cached bind group per work texture; ~0.2ms on pan/zoom!)
     const presentData = packPresentUniforms(
       uv,
       clipFlagsRef.current.shadow,
       clipFlagsRef.current.highlight,
       bgTransparent,
+      uv.cropBounds,
     );
     queue.writeBuffer(res.presentUbo, 0, presentData as Float32Array<ArrayBuffer>);
 
-    const presentBg = device.createBindGroup({
-      layout: core.presentBgl,
-      entries: [
-        { binding: 0, resource: { buffer: res.presentUbo } },
-        { binding: 1, resource: currentIsA ? viewA : viewB },
-      ],
-    });
+    const presentViewA = res.workViewA;
+    const presentViewB = res.workViewB;
+    let presentBg: GPUBindGroup;
+    if (currentIsA) {
+      if (!presentViewA) return;
+      if (!res.presentBgA) {
+        res.presentBgA = device.createBindGroup({
+          layout: core.presentBgl,
+          entries: [
+            { binding: 0, resource: { buffer: res.presentUbo } },
+            { binding: 1, resource: presentViewA },
+          ],
+        });
+      }
+      presentBg = res.presentBgA;
+    } else {
+      if (!presentViewB) return;
+      if (!res.presentBgB) {
+        res.presentBgB = device.createBindGroup({
+          layout: core.presentBgl,
+          entries: [
+            { binding: 0, resource: { buffer: res.presentUbo } },
+            { binding: 1, resource: presentViewB },
+          ],
+        });
+      }
+      presentBg = res.presentBgB;
+    }
 
     try {
       const swapTex = ctx.getCurrentTexture();
@@ -846,6 +1050,7 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
       onUnavailableRef.current?.();
     }
   };
+  renderFrameRef.current = renderFrame;
 
   const handleCanvasClick = async (event: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
@@ -860,17 +1065,21 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
     const swapAxes = qt % 2 === 1;
     const orientedW = swapAxes ? imgSizeRef.current.h : imgSizeRef.current.w;
     const orientedH = swapAxes ? imgSizeRef.current.w : imgSizeRef.current.h;
-    const uv = computeObjectFitUvTransform(
+    const uv = computeViewportUvTransform(
       orientedW,
       orientedH,
       rect.width,
       rect.height,
       fitRef.current,
       applyCropRef.current ? crop.rect : undefined,
+      viewportPadPxRef.current,
+      viewportZoomRef.current,
+      viewportPanRef.current,
     );
     const uOriented = nx * uv.scaleX + uv.offsetX;
     const vOriented = ny * uv.scaleY + uv.offsetY;
-    if (uOriented < 0 || uOriented > 1 || vOriented < 0 || vOriented > 1) return;
+    const [minU, minV, maxU, maxV] = uv.cropBounds;
+    if (uOriented < minU || uOriented > maxU || vOriented < minV || vOriented > maxV) return;
 
     // Color Range Eyedropper: read exact 5×5 patch from final 32-bit GPU texture
     if (colorPickActive && onSampleColorRangeRgb && resRef.current?.lastFinalTex) {
@@ -981,8 +1190,8 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
       return;
     }
 
-    const img = sourceImgRef.current;
-    if (img && img.naturalWidth > 0 && img.naturalHeight > 0) {
+    const cachedSource = sourceBitmapRef.current;
+    if (cachedSource && cachedSource.width > 0 && cachedSource.height > 0) {
       try {
         const sampleCanvas = document.createElement('canvas');
         sampleCanvas.width = 5;
@@ -990,14 +1199,14 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
         const ctx2d = sampleCanvas.getContext('2d');
         if (!ctx2d) return;
         const sx = Math.min(
-          img.naturalWidth - 5,
-          Math.max(0, Math.round(srcU * img.naturalWidth) - 2),
+          cachedSource.width - 5,
+          Math.max(0, Math.round(srcU * cachedSource.width) - 2),
         );
         const sy = Math.min(
-          img.naturalHeight - 5,
-          Math.max(0, Math.round(srcV * img.naturalHeight) - 2),
+          cachedSource.height - 5,
+          Math.max(0, Math.round(srcV * cachedSource.height) - 2),
         );
-        ctx2d.drawImage(img, sx, sy, 5, 5, 0, 0, 5, 5);
+        ctx2d.drawImage(cachedSource.bitmap, sx, sy, 5, 5, 0, 0, 5, 5);
         const data = ctx2d.getImageData(0, 0, 5, 5).data;
         let sr = 0;
         let sg = 0;
@@ -1023,15 +1232,24 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
     if (!canvas) return;
     let cancelled = false;
     let observer: ResizeObserver | null = null;
+    let unregisterLost: (() => void) | null = null;
 
     void createSharedWebGpuCore().then((core) => {
       if (cancelled) return;
-      if (!core) {
+      if (!core || core.isLost) {
         onUnavailableRef.current?.();
         return;
       }
+      const onDeviceLost = () => {
+        if (!cancelled) {
+          onUnavailableRef.current?.();
+        }
+      };
+      core.lostListeners.add(onDeviceLost);
+      unregisterLost = () => core.lostListeners.delete(onDeviceLost);
       const ctx = canvas.getContext('webgpu');
       if (!ctx) {
+        core.lostListeners.delete(onDeviceLost);
         onUnavailableRef.current?.();
         return;
       }
@@ -1042,6 +1260,7 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
           alphaMode: 'premultiplied',
         });
       } catch {
+        core.lostListeners.delete(onDeviceLost);
         onUnavailableRef.current?.();
         return;
       }
@@ -1076,28 +1295,43 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
         spatialUbo,
         presentUbo,
         toneLutTex,
+        toneLutView: toneLutTex.createView(),
         srcTex: null,
+        srcView: null,
         workTexA: null,
+        workViewA: null,
         workTexB: null,
+        workViewB: null,
         workW: 0,
         workH: 0,
         lastFinalTex: null,
         bgMatteTex: null,
+        bgMatteView: null,
         bgMatteSig: '',
         lut3dBuf: null,
         lut3dPath: '',
         lut3dParsed: null,
+        gradeBgCache: null,
+        presentBgA: null,
+        presentBgB: null,
         spatialMaskCache: new Map(),
         maskUboPool: [],
       };
 
-      observer = new ResizeObserver(() => renderFrame());
+      observer = new ResizeObserver(() => scheduleRender());
       observer.observe(canvas);
+      onMaxTextureDimRef.current?.(core.maxTextureDim);
       setGpuReady(true);
     });
 
     return () => {
       cancelled = true;
+      unregisterLost?.();
+      unregisterLost = null;
+      if (pendingRafRef.current !== null) {
+        window.cancelAnimationFrame(pendingRafRef.current);
+        pendingRafRef.current = null;
+      }
       observer?.disconnect();
       const res = resRef.current;
       resRef.current = null;
@@ -1128,161 +1362,192 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
     if (!res) return;
 
     const { device, queue, maxTextureDim } = res.core;
+    if (res.core.isLost) {
+      onUnavailableRef.current?.();
+      return;
+    }
     if (workingBuffer.width > maxTextureDim || workingBuffer.height > maxTextureDim) {
       return;
     }
 
+    let cancelled = false;
     try {
+      device.pushErrorScope('out-of-memory');
+      device.pushErrorScope('validation');
+
       let tex: GPUTexture;
       if (workingBuffer.halfFloatRgba) {
-        res.srcTex?.destroy();
         tex = device.createTexture({
           label: 'kroma-src-rgba16f',
           size: [workingBuffer.width, workingBuffer.height],
           format: 'rgba16float',
           usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
         });
-        queue.writeTexture(
-          { texture: tex },
-          workingBuffer.halfFloatRgba as Uint16Array<ArrayBuffer>,
-          { bytesPerRow: workingBuffer.width * 8, rowsPerImage: workingBuffer.height },
-          [workingBuffer.width, workingBuffer.height],
+        writeTextureRowsChunked(
+          queue,
+          tex,
+          workingBuffer.halfFloatRgba,
+          workingBuffer.width,
+          workingBuffer.height,
+          8,
         );
       } else if (workingBuffer.float32Rgba) {
-        res.srcTex?.destroy();
         tex = device.createTexture({
           label: 'kroma-src-rgba32f',
           size: [workingBuffer.width, workingBuffer.height],
           format: 'rgba32float',
           usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
         });
-        queue.writeTexture(
-          { texture: tex },
-          workingBuffer.float32Rgba as Float32Array<ArrayBuffer>,
-          { bytesPerRow: workingBuffer.width * 16, rowsPerImage: workingBuffer.height },
-          [workingBuffer.width, workingBuffer.height],
+        writeTextureRowsChunked(
+          queue,
+          tex,
+          workingBuffer.float32Rgba,
+          workingBuffer.width,
+          workingBuffer.height,
+          16,
         );
       } else {
+        void device.popErrorScope();
+        void device.popErrorScope();
         return;
       }
 
+      const prevTex = res.srcTex;
       res.srcTex = tex;
+      res.srcView = tex.createView();
+      res.gradeBgCache = null;
+      prevTex?.destroy();
+
       imgSizeRef.current = { w: workingBuffer.width, h: workingBuffer.height };
       inputLinearRef.current = workingBuffer.isLinear;
       inputWideGamutRef.current = workingBuffer.isWideGamut;
       textureReadyRef.current = true;
+      gradeDirtyRef.current = true;
       if (workingBuffer.width > 0 && workingBuffer.height > 0) {
         onNaturalSizeRef.current?.(workingBuffer.width, workingBuffer.height);
       }
-      renderFrame();
+      scheduleRender();
       setTextureVersion((v) => v + 1);
+
+      void Promise.all([device.popErrorScope(), device.popErrorScope()]).then(
+        ([valErr, oomErr]) => {
+          if (!cancelled && (valErr || oomErr)) {
+            onUnavailableRef.current?.();
+          }
+        },
+      );
     } catch {
       onUnavailableRef.current?.();
     }
+    return () => {
+      cancelled = true;
+    };
   }, [workingBuffer, gpuReady]);
 
-  // Upload 8-bit preview/source photo texture when no high-bit-depth working buffer is active
+  // Upload 8-bit preview/source photo texture when no high-bit-depth working buffer is active.
+  // Uses the shared downscaled ImageBitmap LRU cache so pre-decoded neighbors upload synchronously (<3ms),
+  // and keeps the previous tier visible when upgrading to full native zoom resolution (zero flash).
   const hasWorkingBuffer = workingBuffer !== null;
+  const clampedPreviewMaxDim = Math.min(DEFAULT_MAX_WORK_DIM, Math.max(640, previewMaxDim));
   useEffect(() => {
     if (!gpuReady || !src || hasWorkingBuffer) return;
     const res = resRef.current;
     if (!res) return;
 
     let cancelled = false;
-    textureReadyRef.current = false;
 
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.decoding = 'async';
-    img.onload = () => {
-      if (cancelled || !resRef.current) return;
-      sourceImgRef.current = img;
-      if (workingBufferRef.current) return;
-
+    const uploadCachedBitmap = (entry: CachedDevelopBitmap) => {
+      if (cancelled || !resRef.current || workingBufferRef.current) return;
       const curRes = resRef.current;
       const { device, queue, maxTextureDim } = curRes.core;
-      if (img.naturalWidth > maxTextureDim || img.naturalHeight > maxTextureDim) {
+      if (entry.width > maxTextureDim || entry.height > maxTextureDim) {
         onUnavailableRef.current?.();
         return;
       }
-
-      void createImageBitmap(img)
-        .then((bitmap) => {
-          if (cancelled || !resRef.current || workingBufferRef.current) {
-            bitmap.close();
-            return;
-          }
-          try {
-            curRes.srcTex?.destroy();
-            const tex = device.createTexture({
-              label: 'kroma-src-rgba8',
-              size: [bitmap.width, bitmap.height],
-              format: 'rgba8unorm',
-              usage:
-                GPUTextureUsage.TEXTURE_BINDING |
-                GPUTextureUsage.COPY_DST |
-                GPUTextureUsage.RENDER_ATTACHMENT,
-            });
-            queue.copyExternalImageToTexture(
-              { source: bitmap },
-              { texture: tex },
-              [bitmap.width, bitmap.height],
-            );
-            curRes.srcTex = tex;
-            imgSizeRef.current = { w: bitmap.width, h: bitmap.height };
-            inputLinearRef.current = false;
-            inputWideGamutRef.current = false;
-            textureReadyRef.current = true;
-            onNaturalSizeRef.current?.(bitmap.width, bitmap.height);
-            renderFrame();
-            setTextureVersion((v) => v + 1);
-          } catch {
-            onUnavailableRef.current?.();
-          } finally {
-            bitmap.close();
-          }
-        })
-        .catch(() => {
-          if (!cancelled) {
-            onUnavailableRef.current?.();
-          }
+      try {
+        sourceBitmapRef.current = entry;
+        loadedSrcRef.current = src;
+        curRes.srcTex?.destroy();
+        const tex = device.createTexture({
+          label: 'kroma-src-rgba8',
+          size: [entry.width, entry.height],
+          format: 'rgba8unorm',
+          usage:
+            GPUTextureUsage.TEXTURE_BINDING |
+            GPUTextureUsage.COPY_DST |
+            GPUTextureUsage.RENDER_ATTACHMENT,
         });
-    };
-    img.onerror = () => {
-      if (!cancelled) {
+        queue.copyExternalImageToTexture(
+          { source: entry.bitmap },
+          { texture: tex },
+          [entry.width, entry.height],
+        );
+        curRes.srcTex = tex;
+        curRes.srcView = tex.createView();
+        curRes.gradeBgCache = null;
+        imgSizeRef.current = { w: entry.width, h: entry.height };
+        inputLinearRef.current = false;
+        inputWideGamutRef.current = false;
+        textureReadyRef.current = true;
+        gradeDirtyRef.current = true;
+        onNaturalSizeRef.current?.(entry.naturalWidth, entry.naturalHeight);
+        scheduleRender();
+        setTextureVersion((v) => v + 1);
+      } catch {
         onUnavailableRef.current?.();
       }
     };
-    img.src = src;
+
+    const syncHit = peekDevelopBitmap(src, clampedPreviewMaxDim);
+    if (syncHit) {
+      uploadCachedBitmap(syncHit);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    // Only blank out while switching to a different photo — preserve existing texture during 1:1 tier upgrades
+    if (loadedSrcRef.current !== src) {
+      textureReadyRef.current = false;
+    }
+    void loadDevelopBitmap(src, clampedPreviewMaxDim).then((entry) => {
+      if (cancelled) return;
+      if (!entry) {
+        onUnavailableRef.current?.();
+        return;
+      }
+      uploadCachedBitmap(entry);
+    });
 
     return () => {
       cancelled = true;
     };
-  }, [src, hasWorkingBuffer, gpuReady]);
+  }, [src, hasWorkingBuffer, gpuReady, clampedPreviewMaxDim]);
 
-  // Redraw immediately on any recipe/mask/clipping/crop/fit change
+  // Mark GPU compute grade dirty only when recipe, masks, overlay, or source texture changes
   useEffect(() => {
     if (gpuReady) {
-      renderFrame();
+      gradeDirtyRef.current = true;
+      scheduleRender();
+    }
+  }, [gpuReady, recipe, activeMaskId, showMaskOverlay, textureVersion]);
+
+  // Pan, zoom, padding, fit, crop preview bounds, and clipping warnings run Pass 3 present-only (~0.2ms!)
+  useEffect(() => {
+    if (gpuReady) {
+      scheduleRender();
     }
   }, [
     gpuReady,
-    recipe,
     fit,
+    viewportZoom,
+    viewportPan.x,
+    viewportPan.y,
+    viewportPadPx,
     applyCrop,
     showShadowClip,
     showHighlightClip,
-    activeMaskId,
-    showMaskOverlay,
-    textureVersion,
   ]);
-
-  const transformStyle =
-    rotationDeg !== 0
-      ? rotationScale !== 1
-        ? `rotate(${rotationDeg}deg) scale(${rotationScale})`
-        : `rotate(${rotationDeg}deg)`
-      : undefined;
 
   return (
     <canvas
@@ -1292,7 +1557,6 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
       onClick={(e) => {
         void handleCanvasClick(e);
       }}
-      style={{ transform: transformStyle }}
       className={`block w-full h-full ${eyedropperActive || colorPickActive ? 'cursor-crosshair' : ''} ${className}`}
     />
   );

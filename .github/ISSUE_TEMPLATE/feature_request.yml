@@ -1,0 +1,55 @@
+name: Feature Request
+description: Propose a new workflow tool, develop adjustment, or improvement for Kroma
+title: 'feat: '
+labels:
+  - enhancement
+  - needs triage
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before Submitting
+      description: Quick alignment checks before opening a new proposal.
+      options:
+        - label: I searched existing [issues](https://github.com/ByteKen/kroma/issues) to verify this hasn't been proposed already
+          required: true
+        - label: This fits Kroma's local-first, offline, non-destructive desktop workflow
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Target Workspace
+      options:
+        - Studio Develop & Color Engine
+        - Face Organizer & Culling
+        - Slate OCR
+        - AI Masking & Backdrop Tools
+        - Batch Export & Naming
+        - Performance & Hardware Acceleration
+        - UI, Shortcuts & Ergonomics
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Photographer Workflow / Problem
+      description: Explain the real-world shoot or editing bottleneck you want Kroma to solve.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Behavior
+      description: Describe how you envision the feature working, including any shortcuts, UI ideas, or technical notes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context or Examples (optional)
+      description: Mockups, shoot volume details, or comparisons with darkroom tools you already use.

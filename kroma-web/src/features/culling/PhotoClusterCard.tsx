@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'framer-motion';
-import { useRef, useState, type CSSProperties } from 'react';
+import { memo, useCallback, useMemo, useRef, useState, type CSSProperties, type SyntheticEvent } from 'react';
 import { isRecipeModified } from '../../domain/develop';
 import { formatSimilarityPercent, needsVisualMatchReview } from '../../domain/identity';
 import type { PhotoAsset } from '../../domain/photo';
@@ -44,7 +44,7 @@ interface PhotoClusterCardProps {
   readonly onManualMatch?: (photo: PhotoAsset) => void;
 }
 
-export function PhotoClusterCard({
+export const PhotoClusterCard = memo(function PhotoClusterCard({
   photo,
   isSelected,
   dragPhotoIds,
@@ -66,6 +66,22 @@ export function PhotoClusterCard({
   const edited = isRecipeModified(photo.developRecipe);
   const rotation = photo.developRecipe.cropTransform.rotationDeg;
   const coverOverlayStyle = computeCoverOverlayStyle(naturalAspect);
+
+  const handleImgLoad = useCallback((e: SyntheticEvent<HTMLImageElement>) => {
+    const img = e.currentTarget;
+    if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+      const nextAspect = img.naturalWidth / img.naturalHeight;
+      setNaturalAspect((prev) => (prev === nextAspect ? prev : nextAspect));
+    }
+  }, []);
+
+  const imgStyle = useMemo<CSSProperties | undefined>(
+    () =>
+      !photo.renderedThumbnailUrl && rotation !== 0
+        ? { transform: `rotate(${rotation}deg) scale(1.05)` }
+        : undefined,
+    [photo.renderedThumbnailUrl, rotation],
+  );
 
   const cardBorderClass = photo.isSlateAnchor
     ? 'border-amber-core/60'
@@ -113,18 +129,8 @@ export function PhotoClusterCard({
           draggable={false}
           loading="lazy"
           decoding="async"
-          onLoad={(e) => {
-            const img = e.currentTarget;
-            if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-              setNaturalAspect(img.naturalWidth / img.naturalHeight);
-            }
-          }}
-          style={{
-            transform:
-              !photo.renderedThumbnailUrl && rotation !== 0
-                ? `rotate(${rotation}deg) scale(1.05)`
-                : undefined,
-          }}
+          onLoad={handleImgLoad}
+          style={imgStyle}
           className="w-full h-full object-cover transition-transform duration-200 group-hover:scale-[1.02]"
         />
 
@@ -322,4 +328,4 @@ export function PhotoClusterCard({
       )}
     </article>
   );
-}
+});

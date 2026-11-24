@@ -1,7 +1,7 @@
 {
   "name": "kroma-web",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.2.0",
   "license": "GPL-3.0-only",
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "preview": "vite preview",
+    "icons:subset": "node ./scripts/subset-material-symbols.mjs",
     "tauri:dev": "node ./scripts/run-tauri.mjs dev",
     "tauri:build": "node ./scripts/run-tauri.mjs build"
   },

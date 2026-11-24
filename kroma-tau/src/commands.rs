@@ -16,6 +16,7 @@ use crate::model_manager::{
 };
 use crate::state::{
     ActiveShootContext, AppState, CachedDevelopBuffer, CachedOcrEngine, OrganizationHistory,
+    ShootSessionMode,
 };
 use image::codecs::jpeg::JpegEncoder;
 use kroma_app::ports::develop_engine::{ImageDevelopPort, OutputImageFormat};
@@ -51,7 +52,7 @@ use kroma_infra::develop::image_decoder::{
     decode_kr16_downscaled_rgb32f, downscale_rgb32f_unclamped, encode_kr16_rgba16f,
     encode_kr32_rgba32f, extract_exif_capture_timestamp_epoch_sec, is_16bit_png_path,
     is_raw_photo_path, is_supported_photo_path, is_tiff_photo_path, is_web_native_image_path,
-    supported_raw_extensions, DecodedDevelopBuffer,
+    read_native_photo_dimensions, supported_raw_extensions, DecodedDevelopBuffer,
 };
 use kroma_infra::develop::pixel_engine::RayonImageDevelopEngine;
 use kroma_infra::develop::wgpu_engine::{
@@ -93,6 +94,10 @@ const MAX_DISK_WORK_CACHE_FILES: usize = 24;
 const OCR_HIGH_RES_RETRY_CONFIDENCE: f32 = 0.85;
 const INITIAL_SYNC_RAW_PREVIEWS: usize = 36;
 const BACKGROUND_PREVIEW_BATCH_SIZE: usize = 32;
+/// Standard JPEG/PNG/WebP files at or above this byte size are downscaled into cached `1024px`
+/// JPEG preview thumbnails (`v3_web_*_preview.jpg`) so WebView2 never decodes 24–60 MP originals
+/// inside contact sheets, filmstrips, export lists, or Home recent cards.
+const WEB_NATIVE_PREVIEW_PROXY_MIN_BYTES: u64 = 300_000;
 
 fn emit_progress(app: &AppHandle, phase: &'static str, completed: usize, total: usize, msg: String) {
     let _ = app.emit(
@@ -107,7 +112,9 @@ fn emit_progress(app: &AppHandle, phase: &'static str, completed: usize, total: 
 }
 
 fn persist_organization_plan(ctx: &ActiveShootContext) -> Result<(), String> {
-    if !ctx.is_clustered {
+    // Only full folder shoots own the folder's organization_plan.json; single-photo or ad-hoc
+    // selected-file sessions must never overwrite a parent folder's saved clustering plan.
+    if !ctx.is_clustered || ctx.session_mode != ShootSessionMode::Folder {
         return Ok(());
     }
     JsonOrganizationPlanStore::new(&ctx.sidecars_dir)
@@ -713,8 +720,9 @@ pub async fn set_custom_ai_models(
 }
 
 /// Fast Step 1: Opens folders of 2,000+ PNG/JPEG or camera RAW photos nearly instantaneously.
-/// - PNG/JPEG/WebP render directly in WebView2 with zero upfront re-encoding.
-/// - Camera RAWs/TIFFs render the first 36 uncached previews immediately and stream the rest in background.
+/// - Small web-native files (<300 KB) render directly in WebView2 with zero proxy encode.
+/// - Camera RAWs, TIFFs, and large camera JPEGs/PNGs (>=300 KB) build compact cached `1024px`
+///   thumbnails for the first 36 uncached photos immediately and stream the rest in the background.
 #[tauri::command]
 pub async fn load_shoot_folder(
     folder_path: String,
@@ -723,14 +731,20 @@ pub async fn load_shoot_folder(
 ) -> Result<ShootSessionDto, String> {
     state.clear_develop_buffer_cache();
     state.thumbnail_render_generation.fetch_add(1, Ordering::SeqCst);
+    state.export_estimate_generation.fetch_add(1, Ordering::SeqCst);
     let preview_cache_dir = state.resolve_cache_dir();
+    let single_sidecars_dir = state.resolve_managed_single_sidecars_dir();
     let active_shoot = state.active_shoot.clone();
     let load_generation = state.load_generation.clone();
     let my_gen = load_generation.fetch_add(1, Ordering::SeqCst) + 1;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let (ctx, pending_bg_jobs) =
-            run_instant_folder_load(folder_path, &preview_cache_dir, &app)?;
+        let (ctx, pending_bg_jobs) = run_instant_folder_load(
+            folder_path,
+            &preview_cache_dir,
+            &single_sidecars_dir,
+            &app,
+        )?;
         let dto = build_session_dto(&ctx);
         {
             let mut guard = active_shoot
@@ -753,6 +767,55 @@ pub async fn load_shoot_folder(
     })
     .await
     .map_err(|err| format!("folder loader worker failed: {err}"))?
+}
+
+/// Opens 1 specific photo (entering distraction-free Single Photo Mode) or a curated selection
+/// of specific photo files without scanning the rest of their parent folder.
+/// Sidecar `.kroma.json` recipes still load and auto-save inside the parent folder's `.kroma_sidecars/`.
+#[tauri::command]
+pub async fn load_photo_files(
+    file_paths: Vec<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ShootSessionDto, String> {
+    state.clear_develop_buffer_cache();
+    state.thumbnail_render_generation.fetch_add(1, Ordering::SeqCst);
+    state.export_estimate_generation.fetch_add(1, Ordering::SeqCst);
+    let preview_cache_dir = state.resolve_cache_dir();
+    let single_sidecars_dir = state.resolve_managed_single_sidecars_dir();
+    let active_shoot = state.active_shoot.clone();
+    let load_generation = state.load_generation.clone();
+    let my_gen = load_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let (ctx, pending_bg_jobs) = run_instant_files_load(
+            file_paths,
+            &preview_cache_dir,
+            &single_sidecars_dir,
+            &app,
+        )?;
+        let dto = build_session_dto(&ctx);
+        {
+            let mut guard = active_shoot
+                .lock()
+                .map_err(|_| "active_shoot state mutex poisoned".to_string())?;
+            *guard = Some(ctx);
+        }
+
+        if !pending_bg_jobs.is_empty() {
+            spawn_background_preview_worker(
+                pending_bg_jobs,
+                active_shoot,
+                load_generation,
+                my_gen,
+                app,
+            );
+        }
+
+        Ok(dto)
+    })
+    .await
+    .map_err(|err| format!("photo file loader worker failed: {err}"))?
 }
 
 /// Step 2 (On-Demand): Runs parallel YuNet 2026 + batched ArcFace 512-D (DirectML GPU / CPU)
@@ -2045,17 +2108,30 @@ pub async fn load_develop_working_buffer(
     };
 
     let use_f32 = matches!(precision.as_deref(), Some("f32"));
-    let clamped_max_dim = max_dim.unwrap_or(1600).clamp(256, 2560);
+    // `max_dim == Some(0)` requests full native sensor resolution (capped to 8192 for GPU safety).
+    // Standard Fit/scrub buffers (`<= 2560`) use the 12-entry LRU + bounded SSD cache;
+    // on-demand 1:1 loupe zoom buffers (`> 2560`) use a dedicated 2-entry RAM-only cache so
+    // zooming in never bloats RAM or writes 150-250 MB files to disk.
+    let clamped_max_dim = match max_dim {
+        Some(0) => 8192,
+        Some(d) => d.clamp(256, 8192),
+        None => 1600,
+    };
+    let is_hi_res = clamped_max_dim > 2560;
     let cache_key = format!(
         "{source_path}@{clamped_max_dim}@{}",
         if use_f32 { "f32" } else { "f16" }
     );
-    if let Some(cached_bytes) = state.get_cached_develop_buffer(&cache_key) {
+    if is_hi_res {
+        if let Some(cached_bytes) = state.get_cached_hi_res_develop_buffer(&cache_key) {
+            return Ok(tauri::ipc::Response::new((*cached_bytes).clone()));
+        }
+    } else if let Some(cached_bytes) = state.get_cached_develop_buffer(&cache_key) {
         return Ok(tauri::ipc::Response::new((*cached_bytes).clone()));
     }
 
     let cache_dir = state.resolve_cache_dir();
-    let disk_cache_path = if !use_f32 {
+    let disk_cache_path = if !use_f32 && !is_hi_res {
         Some(compute_working_buffer_cache_path(
             &cache_dir,
             &source_path,
@@ -2083,9 +2159,10 @@ pub async fn load_develop_working_buffer(
                 bit_depth: thumb_buffer.bit_depth,
                 is_raw_demosaic: thumb_buffer.is_raw_demosaic,
             };
-            return Ok::<Option<(Vec<u8>, DecodedDevelopBuffer, DecodedDevelopBuffer)>, String>(
-                Some((cached_kr16, hist_buffer, thumb_buffer)),
-            );
+            return Ok::<
+                Option<(Vec<u8>, Option<(DecodedDevelopBuffer, DecodedDevelopBuffer)>)>,
+                String,
+            >(Some((cached_kr16, Some((hist_buffer, thumb_buffer)))));
         }
 
         let Some(decoded) =
@@ -2104,6 +2181,10 @@ pub async fn load_develop_working_buffer(
             persist_working_kr16_cache_bounded(&cache_dir, disk_path, &wire_bytes);
         }
 
+        if is_hi_res {
+            return Ok(Some((wire_bytes, None)));
+        }
+
         let thumb_image = downscale_rgb32f_unclamped(&decoded.image, THUMBNAIL_32BIT_MAX_DIM);
         let hist_image = downscale_rgb32f_unclamped(&thumb_image, 384);
         let hist_buffer = DecodedDevelopBuffer {
@@ -2120,26 +2201,69 @@ pub async fn load_develop_working_buffer(
             bit_depth: decoded.bit_depth,
             is_raw_demosaic: decoded.is_raw_demosaic,
         };
-        Ok(Some((wire_bytes, hist_buffer, thumb_buffer)))
+        Ok(Some((wire_bytes, Some((hist_buffer, thumb_buffer)))))
     })
     .await
     .map_err(|err| format!("high-bit-depth develop decode worker failed: {err}"))??;
 
-    let Some((wire_bytes, hist_buffer, thumb_buffer)) = decoded_result else {
+    let Some((wire_bytes, proxies)) = decoded_result else {
         return Ok(tauri::ipc::Response::new(Vec::new()));
     };
 
     let shared_bytes = Arc::new(wire_bytes);
     let response_bytes = (*shared_bytes).clone();
-    state.insert_develop_buffer(CachedDevelopBuffer {
-        cache_key,
-        source_path,
-        kr16_bytes: shared_bytes,
-        hist_buffer: Arc::new(hist_buffer),
-        thumb_buffer: Arc::new(thumb_buffer),
-    });
+    if is_hi_res {
+        state.insert_hi_res_develop_buffer(cache_key, shared_bytes);
+    } else if let Some((hist_buffer, thumb_buffer)) = proxies {
+        state.insert_develop_buffer(CachedDevelopBuffer {
+            cache_key,
+            source_path,
+            kr16_bytes: shared_bytes,
+            hist_buffer: Arc::new(hist_buffer),
+            thumb_buffer: Arc::new(thumb_buffer),
+        });
+    }
 
     Ok(tauri::ipc::Response::new(response_bytes))
+}
+
+/// Returns the EXIF-oriented native pixel dimensions `(width, height)` of a photo using fast
+/// header-only metadata inspection (<1ms, cached in `AppState`) so Studio's `100%` (1:1) zoom
+/// always reflects real sensor pixels even before decoding a full-resolution working buffer.
+#[tauri::command]
+pub async fn get_photo_native_dimensions(
+    photo_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<(u32, u32)>, String> {
+    let source_path = {
+        let guard = state
+            .active_shoot
+            .lock()
+            .map_err(|_| "active_shoot state mutex poisoned".to_string())?;
+        let Some(ctx) = guard.as_ref() else {
+            return Ok(None);
+        };
+        match ctx.photo_sources.get(&photo_id) {
+            Some(src) => src.clone(),
+            None => return Ok(None),
+        }
+    };
+
+    if let Some(dims) = state.get_cached_native_dims(&source_path) {
+        return Ok(Some(dims));
+    }
+
+    let source_for_worker = source_path.clone();
+    let dims = tauri::async_runtime::spawn_blocking(move || {
+        read_native_photo_dimensions(&source_for_worker).ok()
+    })
+    .await
+    .map_err(|err| format!("native dimension probe failed: {err}"))?;
+
+    if let Some(d) = dims {
+        state.insert_cached_native_dims(source_path, d);
+    }
+    Ok(dims)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2707,6 +2831,42 @@ pub async fn generate_ai_mask(
     .map_err(|err| format!("AI mask worker failed: {err}"))?
 }
 
+/// Decodes a compact 384px sRGB `f32` histogram proxy buffer for standard photos (JPEG/PNG/WebP)
+/// once and returns it alongside the computed histogram so subsequent slider pauses compute live
+/// histograms in ~1–2ms straight from RAM with zero disk I/O.
+fn compute_histogram_for_photo(
+    engine: &RayonImageDevelopEngine,
+    cached_hist_buf: Option<Arc<DecodedDevelopBuffer>>,
+    preview_path: &str,
+    recipe: &DevelopRecipe,
+) -> Result<(kroma_domain::develop::RgbHistogram, Option<Arc<DecodedDevelopBuffer>>), String> {
+    if let Some(hist_buf) = cached_hist_buf {
+        let hist = engine
+            .compute_histogram_from_buffer(&hist_buf, recipe)
+            .map_err(|e| e.to_string())?;
+        return Ok((hist, None));
+    }
+
+    if let Ok(rgb) = decode_fast_preview_max_dim(preview_path, 384) {
+        let fresh_buf = Arc::new(DecodedDevelopBuffer {
+            image: image::DynamicImage::ImageRgb8(rgb).to_rgb32f(),
+            is_linear: false,
+            is_wide_gamut: false,
+            bit_depth: 8,
+            is_raw_demosaic: false,
+        });
+        let hist = engine
+            .compute_histogram_from_buffer(&fresh_buf, recipe)
+            .map_err(|e| e.to_string())?;
+        return Ok((hist, Some(fresh_buf)));
+    }
+
+    let hist = engine
+        .compute_histogram(preview_path, recipe)
+        .map_err(|e| e.to_string())?;
+    Ok((hist, None))
+}
+
 #[tauri::command]
 pub async fn save_photo_develop_recipe(
     photo_id: String,
@@ -2734,8 +2894,9 @@ pub async fn save_photo_develop_recipe(
         (ctx.sidecars_dir.clone(), preview, source)
     };
     let cached_hist_buf = state.get_cached_hist_buffer(&source_path);
+    let source_path_for_cache = source_path.clone();
 
-    tauri::async_runtime::spawn_blocking(move || {
+    let (hist_dto, new_std_hist_buf) = tauri::async_runtime::spawn_blocking(move || {
         let pid = PhotoId::new(&photo_id).map_err(|e| e.to_string())?;
         let store = JsonSidecarRecipeStore::new(&sidecars_dir);
         let save_uc = SavePhotoDevelopRecipeUseCase::new(&store);
@@ -2754,19 +2915,25 @@ pub async fn save_photo_develop_recipe(
         }
 
         let engine = RayonImageDevelopEngine::new();
-        let histogram = if let Some(ref hist_buf) = cached_hist_buf {
-            engine
-                .compute_histogram_from_buffer(hist_buf, &saved.clamped_recipe)
-                .map_err(|e| e.to_string())?
-        } else {
-            engine
-                .compute_histogram(&preview_path, &saved.clamped_recipe)
-                .map_err(|e| e.to_string())?
-        };
-        Ok(HistogramDto::from(&histogram))
+        let (histogram, fresh_buf) = compute_histogram_for_photo(
+            &engine,
+            cached_hist_buf,
+            &preview_path,
+            &saved.clamped_recipe,
+        )?;
+        Ok::<(HistogramDto, Option<Arc<DecodedDevelopBuffer>>), String>((
+            HistogramDto::from(&histogram),
+            fresh_buf,
+        ))
     })
     .await
-    .map_err(|err| format!("recipe save worker failed: {err}"))?
+    .map_err(|err| format!("recipe save worker failed: {err}"))??;
+
+    if let Some(fresh_buf) = new_std_hist_buf {
+        state.insert_std_hist_buffer(source_path_for_cache, fresh_buf);
+    }
+
+    Ok(hist_dto)
 }
 
 /// Coarse-grained batch persistence for Develop Undo/Redo, Paste, and pre-Export flushes:
@@ -2805,7 +2972,7 @@ pub async fn save_photo_develop_recipes_batch(
         .as_deref()
         .and_then(|src| state.get_cached_hist_buffer(src));
 
-    tauri::async_runtime::spawn_blocking(move || {
+    let (histogram, new_std_hist_buf) = tauri::async_runtime::spawn_blocking(move || {
         let store = JsonSidecarRecipeStore::new(&sidecars_dir);
         let save_uc = SavePhotoDevelopRecipeUseCase::new(&store);
         let mut saved_pairs: Vec<(String, DevelopRecipe)> = Vec::with_capacity(items.len());
@@ -2835,30 +3002,38 @@ pub async fn save_photo_develop_recipes_batch(
             }
         }
 
-        let histogram = match active_saved_recipe {
-            Some(recipe) => {
+        let (histogram, fresh_buf) = match (active_saved_recipe, active_preview_path) {
+            (Some(recipe), Some(preview_path)) => {
                 let engine = RayonImageDevelopEngine::new();
-                if let Some(ref hist_buf) = cached_hist_buf {
-                    engine
-                        .compute_histogram_from_buffer(hist_buf, &recipe)
-                        .ok()
-                        .map(|h| HistogramDto::from(&h))
-                } else if let Some(preview_path) = active_preview_path {
-                    engine
-                        .compute_histogram(&preview_path, &recipe)
-                        .ok()
-                        .map(|h| HistogramDto::from(&h))
-                } else {
-                    None
+                match compute_histogram_for_photo(&engine, cached_hist_buf, &preview_path, &recipe) {
+                    Ok((h, buf)) => (Some(HistogramDto::from(&h)), buf),
+                    Err(_) => (None, None),
                 }
             }
-            None => None,
+            (Some(recipe), None) => {
+                let engine = RayonImageDevelopEngine::new();
+                let h = cached_hist_buf
+                    .as_ref()
+                    .and_then(|buf| engine.compute_histogram_from_buffer(buf, &recipe).ok())
+                    .map(|h| HistogramDto::from(&h));
+                (h, None)
+            }
+            _ => (None, None),
         };
 
-        Ok(histogram)
+        Ok::<(Option<HistogramDto>, Option<Arc<DecodedDevelopBuffer>>), String>((
+            histogram,
+            fresh_buf,
+        ))
     })
     .await
-    .map_err(|err| format!("batch recipe save worker failed: {err}"))?
+    .map_err(|err| format!("batch recipe save worker failed: {err}"))??;
+
+    if let (Some(src), Some(fresh_buf)) = (active_source_path, new_std_hist_buf) {
+        state.insert_std_hist_buffer(src, fresh_buf);
+    }
+
+    Ok(histogram)
 }
 
 #[tauri::command]
@@ -3068,8 +3243,28 @@ fn parse_selected_photo_ids(photo_ids: Option<&[String]>) -> Option<HashSet<Phot
 pub async fn estimate_export_size(
     request: EstimateExportSizeRequestDto,
     state: State<'_, AppState>,
-) -> Result<EstimateExportSizeResponseDto, String> {
-    let (plan, photo_file_sizes, recipes) = {
+) -> Result<Option<EstimateExportSizeResponseDto>, String> {
+    let estimate_gen = state.export_estimate_generation.clone();
+    let my_gen = estimate_gen.fetch_add(1, Ordering::SeqCst) + 1;
+
+    struct SampleJob {
+        source_path: String,
+        preview_path: Option<String>,
+        recipe: DevelopRecipe,
+    }
+
+    let selected_ids = parse_selected_photo_ids(request.photo_ids.as_deref());
+    let mode = request.mode.to_ascii_lowercase();
+    let needs_render_sampling = mode != "move" && mode != "hardlink" && mode != "copy";
+
+    let (
+        total_photos,
+        mut total_source_bytes,
+        mut companion_raw_bytes,
+        companion_count,
+        missing_size_paths,
+        samples,
+    ) = {
         let guard = state
             .active_shoot
             .lock()
@@ -3077,103 +3272,143 @@ pub async fn estimate_export_size(
         let ctx = guard
             .as_ref()
             .ok_or_else(|| "no active shoot loaded".to_string())?;
-        (
-            ctx.plan.clone(),
-            ctx.photo_file_sizes.clone(),
-            ctx.recipes.clone(),
-        )
-    };
 
-    tauri::async_runtime::spawn_blocking(move || {
-        struct ExportCandidate {
-            photo_id: String,
-            source_path: String,
-            file_size_bytes: u64,
+        struct CandidateRef<'a> {
+            photo_id: &'a str,
+            source_path: &'a str,
             has_raw_companion: bool,
         }
 
-        let lookup_size = |photo_id: &str, source_path: &str| -> u64 {
-            photo_file_sizes
-                .get(photo_id)
-                .copied()
-                .filter(|&bytes| bytes > 0)
-                .unwrap_or_else(|| fs::metadata(source_path).map(|m| m.len()).unwrap_or(0))
-        };
-
-        let mut candidates = Vec::new();
-        for cluster in &plan.clusters {
+        let mut candidates: Vec<CandidateRef<'_>> = Vec::new();
+        for cluster in &ctx.plan.clusters {
             for entry in &cluster.entries {
                 if entry.is_slate_photo && request.exclude_slate_photo {
                     if request.archive_excluded_slates {
-                        let pid = entry.photo_id.as_str();
-                        candidates.push(ExportCandidate {
-                            photo_id: pid.to_string(),
-                            source_path: entry.source_path.clone(),
-                            file_size_bytes: lookup_size(pid, &entry.source_path),
+                        candidates.push(CandidateRef {
+                            photo_id: entry.photo_id.as_str(),
+                            source_path: entry.source_path.as_str(),
                             has_raw_companion: false,
                         });
                     }
                     continue;
                 }
-                let pid = entry.photo_id.as_str();
-                candidates.push(ExportCandidate {
-                    photo_id: pid.to_string(),
-                    source_path: entry.source_path.clone(),
-                    file_size_bytes: lookup_size(pid, &entry.source_path),
+                candidates.push(CandidateRef {
+                    photo_id: entry.photo_id.as_str(),
+                    source_path: entry.source_path.as_str(),
                     has_raw_companion: true,
                 });
             }
         }
-        for group in &plan.group_photos {
-            let pid = group.photo_id.as_str();
-            candidates.push(ExportCandidate {
-                photo_id: pid.to_string(),
-                source_path: group.source_path.clone(),
-                file_size_bytes: lookup_size(pid, &group.source_path),
+        for group in &ctx.plan.group_photos {
+            candidates.push(CandidateRef {
+                photo_id: group.photo_id.as_str(),
+                source_path: group.source_path.as_str(),
                 has_raw_companion: true,
             });
         }
-        for nf in &plan.no_face_photos {
-            let pid = nf.photo_id.as_str();
-            candidates.push(ExportCandidate {
-                photo_id: pid.to_string(),
-                source_path: nf.source_path.clone(),
-                file_size_bytes: lookup_size(pid, &nf.source_path),
+        for nf in &ctx.plan.no_face_photos {
+            candidates.push(CandidateRef {
+                photo_id: nf.photo_id.as_str(),
+                source_path: nf.source_path.as_str(),
                 has_raw_companion: true,
             });
         }
 
-        if let Some(selected_ids) = parse_selected_photo_ids(request.photo_ids.as_deref()) {
+        if let Some(ref filter) = selected_ids {
             candidates.retain(|c| {
-                PhotoId::new(c.photo_id.clone())
-                    .map(|id| selected_ids.contains(&id))
+                PhotoId::new(c.photo_id.to_string())
+                    .map(|id| filter.contains(&id))
                     .unwrap_or(false)
             });
         }
 
         let total_photos = candidates.len();
-        let total_source_bytes: u64 = candidates.iter().map(|c| c.file_size_bytes).sum();
-        let companion_raw_bytes: u64 = candidates
-            .iter()
-            .filter(|c| c.has_raw_companion)
-            .map(|c| c.file_size_bytes)
-            .sum();
+        let mut total_source_bytes: u64 = 0;
+        let mut companion_raw_bytes: u64 = 0;
+        let mut companion_count: usize = 0;
+        let mut missing_size_paths: Vec<(String, bool)> = Vec::new();
 
-        let mode = request.mode.to_ascii_lowercase();
-        if total_photos == 0 {
-            return Ok(EstimateExportSizeResponseDto {
-                extra_disk_bytes: 0,
-                edited_bytes: 0,
-                originals_bytes: 0,
-                total_source_bytes: 0,
-                file_count: 0,
-                sampled_photo_count: 0,
-                is_exact: true,
-            });
+        for item in &candidates {
+            if item.has_raw_companion {
+                companion_count += 1;
+            }
+            match ctx.photo_file_sizes.get(item.photo_id).copied() {
+                Some(bytes) if bytes > 0 => {
+                    total_source_bytes = total_source_bytes.saturating_add(bytes);
+                    if item.has_raw_companion {
+                        companion_raw_bytes = companion_raw_bytes.saturating_add(bytes);
+                    }
+                }
+                _ => {
+                    missing_size_paths.push((item.source_path.to_string(), item.has_raw_companion));
+                }
+            }
+        }
+
+        // Only clone the <=5 sampled recipes and preview paths instead of cloning the full shoot.
+        let samples: Vec<SampleJob> = if needs_render_sampling && total_photos > 0 {
+            let sample_indices = pick_evenly_spaced_indices(total_photos, 5);
+            sample_indices
+                .into_iter()
+                .map(|idx| {
+                    let item = &candidates[idx];
+                    let preview_path = ctx
+                        .source_to_preview
+                        .get(item.source_path)
+                        .filter(|p| p.as_str() != item.source_path)
+                        .cloned();
+                    let recipe = ctx
+                        .recipes
+                        .get(item.photo_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    SampleJob {
+                        source_path: item.source_path.to_string(),
+                        preview_path,
+                        recipe,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        (
+            total_photos,
+            total_source_bytes,
+            companion_raw_bytes,
+            companion_count,
+            missing_size_paths,
+            samples,
+        )
+    };
+
+    if total_photos == 0 {
+        return Ok(Some(EstimateExportSizeResponseDto {
+            extra_disk_bytes: 0,
+            edited_bytes: 0,
+            originals_bytes: 0,
+            total_source_bytes: 0,
+            file_count: 0,
+            sampled_photo_count: 0,
+            is_exact: true,
+        }));
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        for (path, has_companion) in missing_size_paths {
+            if estimate_gen.load(Ordering::SeqCst) != my_gen {
+                return Ok(None);
+            }
+            let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            total_source_bytes = total_source_bytes.saturating_add(bytes);
+            if has_companion {
+                companion_raw_bytes = companion_raw_bytes.saturating_add(bytes);
+            }
         }
 
         if mode == "move" || mode == "hardlink" {
-            return Ok(EstimateExportSizeResponseDto {
+            return Ok(Some(EstimateExportSizeResponseDto {
                 extra_disk_bytes: 0,
                 edited_bytes: 0,
                 originals_bytes: total_source_bytes,
@@ -3181,11 +3416,11 @@ pub async fn estimate_export_size(
                 file_count: total_photos,
                 sampled_photo_count: 0,
                 is_exact: true,
-            });
+            }));
         }
 
         if mode == "copy" {
-            return Ok(EstimateExportSizeResponseDto {
+            return Ok(Some(EstimateExportSizeResponseDto {
                 extra_disk_bytes: total_source_bytes,
                 edited_bytes: 0,
                 originals_bytes: total_source_bytes,
@@ -3193,7 +3428,7 @@ pub async fn estimate_export_size(
                 file_count: total_photos,
                 sampled_photo_count: 0,
                 is_exact: true,
-            });
+            }));
         }
 
         let format = match request.format.to_ascii_lowercase().as_str() {
@@ -3204,20 +3439,28 @@ pub async fn estimate_export_size(
             },
         };
 
-        let sample_indices = pick_evenly_spaced_indices(total_photos, 5);
         let engine = RayonImageDevelopEngine::new();
-        let default_recipe = DevelopRecipe::default();
+        let mut measured: Vec<u64> = Vec::with_capacity(samples.len());
 
-        let measured: Vec<u64> = sample_indices
-            .par_iter()
-            .filter_map(|&idx| {
-                let item = &candidates[idx];
-                let recipe = recipes.get(&item.photo_id).unwrap_or(&default_recipe);
-                engine
-                    .measure_rendered_bytes(&item.source_path, recipe, format)
-                    .ok()
-            })
-            .collect();
+        // Measure samples sequentially (1 compact preview at a time) and bail immediately if a newer
+        // settings change superseded this request, keeping RAM <~25 MB and CPU burst minimal.
+        for sample in &samples {
+            if estimate_gen.load(Ordering::SeqCst) != my_gen {
+                return Ok(None);
+            }
+            if let Ok(bytes) = engine.measure_rendered_bytes_with_preview(
+                &sample.source_path,
+                sample.preview_path.as_deref(),
+                &sample.recipe,
+                format,
+            ) {
+                measured.push(bytes);
+            }
+        }
+
+        if estimate_gen.load(Ordering::SeqCst) != my_gen {
+            return Ok(None);
+        }
 
         let sampled_photo_count = measured.len();
         let edited_bytes = if sampled_photo_count > 0 {
@@ -3229,23 +3472,21 @@ pub async fn estimate_export_size(
         };
 
         let is_dual = mode == "develop_and_raw";
-        let companion_count = if is_dual {
-            candidates.iter().filter(|c| c.has_raw_companion).count()
-        } else {
-            0
-        };
+        let extra_companion_count = if is_dual { companion_count } else { 0 };
         let originals_bytes = if is_dual { companion_raw_bytes } else { 0 };
         let extra_disk_bytes = edited_bytes.saturating_add(originals_bytes);
 
-        Ok(EstimateExportSizeResponseDto {
+        Ok(Some(EstimateExportSizeResponseDto {
             extra_disk_bytes,
             edited_bytes,
             originals_bytes,
             total_source_bytes,
-            file_count: total_photos + companion_count,
+            file_count: total_photos + extra_companion_count,
             sampled_photo_count,
-            is_exact: sampled_photo_count == total_photos && sampled_photo_count > 0,
-        })
+            is_exact: sampled_photo_count == total_photos
+                && sampled_photo_count > 0
+                && matches!(format, OutputImageFormat::Tiff),
+        }))
     })
     .await
     .map_err(|err| format!("export size estimate worker failed: {err}"))?
@@ -3367,14 +3608,163 @@ struct BackgroundPreviewJob {
     photo_id: String,
     source_path: String,
     preview_dest: PathBuf,
+    needs_exif: bool,
+}
+
+fn should_generate_preview_proxy(path: &Path, file_size_bytes: u64) -> bool {
+    if !is_web_native_image_path(path) {
+        return true;
+    }
+    file_size_bytes >= WEB_NATIVE_PREVIEW_PROXY_MIN_BYTES
+}
+
+fn build_preview_cache_path(
+    preview_cache_dir: &Path,
+    path: &Path,
+    stem: &str,
+    source_str: &str,
+    file_size_bytes: u64,
+    mtime_sec: i64,
+) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    source_str.hash(&mut hasher);
+    if is_web_native_image_path(path) {
+        file_size_bytes.hash(&mut hasher);
+        mtime_sec.hash(&mut hasher);
+        let path_hash = hasher.finish();
+        preview_cache_dir.join(format!("v3_web_{stem}_{path_hash:016x}_preview.jpg"))
+    } else {
+        let path_hash = hasher.finish();
+        preview_cache_dir.join(format!("v3_{stem}_{path_hash:016x}_preview.jpg"))
+    }
+}
+
+fn resolve_common_parent_dir(files: &[PathBuf]) -> Option<PathBuf> {
+    let first_parent = files.first()?.parent()?.to_path_buf();
+    let mut prefix: Vec<std::path::Component<'_>> = first_parent.components().collect();
+    for path in files.iter().skip(1) {
+        let Some(parent) = path.parent() else {
+            return Some(first_parent);
+        };
+        let next_components: Vec<std::path::Component<'_>> = parent.components().collect();
+        let common_len = prefix
+            .iter()
+            .zip(next_components.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        prefix.truncate(common_len);
+        if prefix.is_empty() {
+            return Some(first_parent);
+        }
+    }
+    let candidate: PathBuf = prefix.into_iter().collect();
+    if candidate.is_dir() {
+        Some(candidate)
+    } else {
+        Some(first_parent)
+    }
+}
+
+fn filter_supported_photo_file_paths(raw_paths: Vec<String>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    for raw in raw_paths {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(trimmed);
+        if !path.is_file() || !is_supported_photo_path(&path) {
+            continue;
+        }
+        let dedup_key = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        if seen.insert(dedup_key) {
+            files.push(path);
+        }
+    }
+    files
+}
+
+fn managed_single_sidecars_bucket(root: &Path, managed_single_sidecars_dir: &Path) -> PathBuf {
+    let normalized = root
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    let mut hasher = DefaultHasher::new();
+    normalized.hash(&mut hasher);
+    managed_single_sidecars_dir.join(format!("dir_{:016x}", hasher.finish()))
+}
+
+/// Chooses where `.kroma.json` Develop sidecars are stored for a session:
+/// - Full folder shoots always store portable sidecars in `<folder>/.kroma_sidecars`.
+/// - Single-photo / selected-file sessions reuse `<parent>/.kroma_sidecars` ONLY if that shoot
+///   directory already exists; otherwise they store sidecars in Kroma's managed app-data directory
+///   so opening a photo from `Downloads` or `Desktop` never leaves visible stray folders behind.
+fn resolve_sidecars_dir(
+    root: &Path,
+    session_mode: ShootSessionMode,
+    managed_single_sidecars_dir: &Path,
+) -> PathBuf {
+    let local_sidecars = root.join(".kroma_sidecars");
+    if session_mode == ShootSessionMode::Folder || local_sidecars.is_dir() {
+        local_sidecars
+    } else {
+        managed_single_sidecars_bucket(root, managed_single_sidecars_dir)
+    }
+}
+
+fn run_instant_files_load(
+    file_paths: Vec<String>,
+    preview_cache_dir: &Path,
+    managed_single_sidecars_dir: &Path,
+    app: &AppHandle,
+) -> Result<(ActiveShootContext, Vec<BackgroundPreviewJob>), String> {
+    let files = filter_supported_photo_file_paths(file_paths);
+    if files.is_empty() {
+        return Err("no supported RAW or standard image files selected".to_string());
+    }
+
+    let root = resolve_common_parent_dir(&files)
+        .ok_or_else(|| "could not resolve parent directory for selected photo(s)".to_string())?;
+    let folder_path = root.to_string_lossy().to_string();
+
+    let (session_mode, project_name) = if files.len() == 1 {
+        let name = files[0]
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Photo")
+            .to_string();
+        (ShootSessionMode::SinglePhoto, name)
+    } else {
+        let parent_name = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Selected Photos");
+        (
+            ShootSessionMode::Files,
+            format!("{parent_name} ({} selected)", files.len()),
+        )
+    };
+
+    run_instant_paths_load(
+        folder_path,
+        project_name,
+        files,
+        session_mode,
+        preview_cache_dir,
+        managed_single_sidecars_dir,
+        app,
+    )
 }
 
 fn run_instant_folder_load(
     folder_path: String,
     preview_cache_dir: &Path,
+    managed_single_sidecars_dir: &Path,
     app: &AppHandle,
 ) -> Result<(ActiveShootContext, Vec<BackgroundPreviewJob>), String> {
-    let started = Instant::now();
     let root = Path::new(&folder_path);
     if !root.is_dir() {
         return Err(format!("directory '{}' does not exist", root.display()));
@@ -3391,12 +3781,42 @@ fn run_instant_folder_load(
         ));
     }
 
+    let project_name = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Shoot")
+        .to_string();
+
+    run_instant_paths_load(
+        folder_path,
+        project_name,
+        files,
+        ShootSessionMode::Folder,
+        preview_cache_dir,
+        managed_single_sidecars_dir,
+        app,
+    )
+}
+
+fn run_instant_paths_load(
+    folder_path: String,
+    project_name: String,
+    files: Vec<PathBuf>,
+    session_mode: ShootSessionMode,
+    preview_cache_dir: &Path,
+    managed_single_sidecars_dir: &Path,
+    app: &AppHandle,
+) -> Result<(ActiveShootContext, Vec<BackgroundPreviewJob>), String> {
+    let started = Instant::now();
+    let root = Path::new(&folder_path);
+
     fs::create_dir_all(preview_cache_dir)
         .map_err(|err| format!("failed to create preview cache dir: {err}"))?;
 
     let root_name = root
         .file_name()
         .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
         .unwrap_or("Shoot")
         .to_string();
 
@@ -3417,6 +3837,7 @@ fn run_instant_folder_load(
         file_size_bytes: u64,
         preview_dest: Option<PathBuf>,
         already_cached: bool,
+        needs_exif: bool,
         fallback_ts: i64,
         exact_ts: Option<i64>,
     }
@@ -3451,14 +3872,19 @@ fn run_instant_folder_load(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
 
-            // Web-native images (PNG/JPEG/WebP) render directly via WebView2 with zero proxy encode!
-            let needs_proxy = !is_web_native_image_path(path);
+            // RAW/TIFF files always use a 1024px cached JPEG proxy; large web-native files
+            // (e.g. 24–60 MP camera JPEGs/PNGs >= 300 KB) also get cached 1024px UI thumbnails
+            // so switching tabs never triggers bursts of full-resolution image decodes in WebView2.
+            let needs_proxy = should_generate_preview_proxy(path, file_size_bytes);
             let (preview_dest, already_cached) = if needs_proxy {
-                let mut hasher = DefaultHasher::new();
-                source_str.hash(&mut hasher);
-                let path_hash = hasher.finish();
-                let dest =
-                    preview_cache_dir.join(format!("v3_{stem}_{path_hash:016x}_preview.jpg"));
+                let dest = build_preview_cache_path(
+                    preview_cache_dir,
+                    path,
+                    stem,
+                    &source_str,
+                    file_size_bytes,
+                    fallback_ts,
+                );
                 let exists = dest.exists();
                 (Some(dest), exists)
             } else {
@@ -3467,14 +3893,16 @@ fn run_instant_folder_load(
 
             // Fast shutter time: filename timestamp immediately + EXIF for JPEGs & already-cached RAWs
             // (uncached RAW EXIF is extracted alongside its background preview so open stays <0.5s!)
+            let is_raw = is_raw_photo_path(path);
             let filename_ts = parse_filename_capture_hints(&source_str).filename_timestamp_epoch_sec;
             let exact_ts = filename_ts.or_else(|| {
-                if !is_raw_photo_path(path) || already_cached {
+                if !is_raw || already_cached {
                     extract_exif_capture_timestamp_epoch_sec(&source_str)
                 } else {
                     None
                 }
             });
+            let needs_exif = is_raw && exact_ts.is_none();
 
             Some(IndexedFile {
                 raw_id,
@@ -3483,13 +3911,14 @@ fn run_instant_folder_load(
                 file_size_bytes,
                 preview_dest,
                 already_cached,
+                needs_exif,
                 fallback_ts,
                 exact_ts,
             })
         })
         .collect();
 
-    // Assign deterministic unique IDs and split initial immediate RAW previews (first 36) from background stream
+    // Assign deterministic unique IDs and split initial immediate previews (first 36) from background stream
     let mut photo_sources = HashMap::with_capacity(indexed.len());
     let mut photo_file_sizes = HashMap::with_capacity(indexed.len());
     let mut preview_paths = HashMap::with_capacity(indexed.len());
@@ -3498,8 +3927,8 @@ fn run_instant_folder_load(
     let mut photo_capture_timestamps = HashMap::with_capacity(indexed.len());
     let mut dir_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut scan_targets = Vec::with_capacity(indexed.len());
-    let mut immediate_raw_jobs: Vec<BackgroundPreviewJob> = Vec::new();
-    let mut background_raw_jobs: Vec<BackgroundPreviewJob> = Vec::new();
+    let mut immediate_preview_jobs: Vec<BackgroundPreviewJob> = Vec::new();
+    let mut background_preview_jobs: Vec<BackgroundPreviewJob> = Vec::new();
     let mut used_safe_sidecar_ids: HashSet<String> = HashSet::with_capacity(indexed.len());
 
     for item in indexed {
@@ -3526,11 +3955,12 @@ fn run_instant_folder_load(
                     photo_id: unique_id.clone(),
                     source_path: item.source_str.clone(),
                     preview_dest: dest,
+                    needs_exif: item.needs_exif,
                 };
-                if immediate_raw_jobs.len() < INITIAL_SYNC_RAW_PREVIEWS {
-                    immediate_raw_jobs.push(job);
+                if immediate_preview_jobs.len() < INITIAL_SYNC_RAW_PREVIEWS {
+                    immediate_preview_jobs.push(job);
                 } else {
-                    background_raw_jobs.push(job);
+                    background_preview_jobs.push(job);
                 }
                 item.source_str.clone()
             }
@@ -3553,22 +3983,26 @@ fn run_instant_folder_load(
         });
     }
 
-    // Generate the first screenful (up to 36) of uncached RAW previews synchronously in parallel (~0.3s)
-    if !immediate_raw_jobs.is_empty() {
+    // Generate the first screenful (up to 36) of uncached previews synchronously in parallel (~0.3s)
+    if !immediate_preview_jobs.is_empty() {
         emit_progress(
             app,
             "loading",
             0,
-            immediate_raw_jobs.len(),
+            immediate_preview_jobs.len(),
             format!(
-                "Preparing initial {} RAW preview(s)...",
-                immediate_raw_jobs.len()
+                "Preparing initial {} photo preview(s)...",
+                immediate_preview_jobs.len()
             ),
         );
-        let ready: Vec<(String, String, String, Option<i64>)> = immediate_raw_jobs
+        let ready: Vec<(String, String, String, Option<i64>)> = immediate_preview_jobs
             .into_par_iter()
             .filter_map(|job| {
-                let ts = extract_exif_capture_timestamp_epoch_sec(&job.source_path);
+                let ts = if job.needs_exif {
+                    extract_exif_capture_timestamp_epoch_sec(&job.source_path)
+                } else {
+                    None
+                };
                 let _ = generate_cached_preview(&job.source_path, &job.preview_dest);
                 if job.preview_dest.exists() {
                     Some((
@@ -3604,18 +4038,32 @@ fn run_instant_folder_load(
         })
         .collect();
 
-    let sidecars_dir = root.join(".kroma_sidecars");
-    let recipes = load_existing_recipes_once(&sidecars_dir, &scan_targets);
+    let sidecars_dir = resolve_sidecars_dir(root, session_mode, managed_single_sidecars_dir);
+    let mut recipes = load_existing_recipes_once(&sidecars_dir, &scan_targets);
+    // If opening a full folder after previously grading an individual photo in Single Photo Mode,
+    // inherit those managed sidecars seamlessly when no local `.kroma_sidecars` override exists yet.
+    if session_mode == ShootSessionMode::Folder {
+        let managed_bucket = managed_single_sidecars_bucket(root, managed_single_sidecars_dir);
+        if managed_bucket.is_dir() {
+            for (pid, recipe) in load_existing_recipes_once(&managed_bucket, &scan_targets) {
+                recipes.entry(pid).or_insert(recipe);
+            }
+        }
+    }
 
     let discovered_pairs: Vec<(PhotoId, String)> = scan_targets
         .iter()
         .map(|t| (t.photo_id.clone(), t.source_path.clone()))
         .collect();
-    let restored_plan = JsonOrganizationPlanStore::new(&sidecars_dir)
-        .load_plan()
-        .ok()
-        .flatten()
-        .and_then(|saved| saved.reconcile_with_disk(&discovered_pairs));
+    let restored_plan = if session_mode == ShootSessionMode::Folder {
+        JsonOrganizationPlanStore::new(&sidecars_dir)
+            .load_plan()
+            .ok()
+            .flatten()
+            .and_then(|saved| saved.reconcile_with_disk(&discovered_pairs))
+    } else {
+        None
+    };
 
     let (is_clustered, plan) = if let Some(reconciled) = restored_plan {
         let is_unclustered_placeholder = reconciled.clusters.len() == 1
@@ -3691,8 +4139,9 @@ fn run_instant_folder_load(
 
     let total = scan_targets.len();
     let ctx = ActiveShootContext {
+        session_mode,
         folder_path,
-        project_name: root_name,
+        project_name,
         sidecars_dir,
         is_clustered,
         total_photos: total,
@@ -3713,7 +4162,7 @@ fn run_instant_folder_load(
         directory_summaries,
     };
 
-    Ok((ctx, background_raw_jobs))
+    Ok((ctx, background_preview_jobs))
 }
 
 fn spawn_background_preview_worker(
@@ -3737,7 +4186,11 @@ fn spawn_background_preview_worker(
                     if load_generation.load(Ordering::Relaxed) != expected_gen {
                         return None;
                     }
-                    let ts = extract_exif_capture_timestamp_epoch_sec(&job.source_path);
+                    let ts = if job.needs_exif {
+                        extract_exif_capture_timestamp_epoch_sec(&job.source_path)
+                    } else {
+                        None
+                    };
                     let _ = generate_cached_preview(&job.source_path, &job.preview_dest);
                     if job.preview_dest.exists() {
                         Some((
@@ -4143,6 +4596,7 @@ fn build_session_dto(ctx: &ActiveShootContext) -> ShootSessionDto {
         .collect();
 
     ShootSessionDto {
+        session_mode: ctx.session_mode.as_str().to_string(),
         folder_path: ctx.folder_path.clone(),
         project_name: ctx.project_name.clone(),
         is_clustered: ctx.is_clustered,
@@ -4333,5 +4787,156 @@ mod tests {
         assert_eq!(loaded.white_balance.temperature_kelvin, 6100);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filter_supported_photo_files_and_common_parent_handles_single_and_multi_files() {
+        let base = std::env::temp_dir().join(format!(
+            "kroma_open_files_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sub_a = base.join("day1");
+        let sub_b = base.join("day2");
+        fs::create_dir_all(&sub_a).unwrap();
+        fs::create_dir_all(&sub_b).unwrap();
+
+        let p1 = sub_a.join("IMG_001.jpg");
+        let p2 = sub_b.join("IMG_002.CR2");
+        let ignored = sub_a.join("notes.txt");
+        fs::write(&p1, b"fake").unwrap();
+        fs::write(&p2, b"fake").unwrap();
+        fs::write(&ignored, b"text").unwrap();
+
+        let single = filter_supported_photo_file_paths(vec![
+            p1.to_string_lossy().to_string(),
+            p1.to_string_lossy().to_string(),
+            ignored.to_string_lossy().to_string(),
+        ]);
+        assert_eq!(single.len(), 1);
+        assert_eq!(resolve_common_parent_dir(&single), Some(sub_a.clone()));
+
+        let multi = filter_supported_photo_file_paths(vec![
+            p1.to_string_lossy().to_string(),
+            p2.to_string_lossy().to_string(),
+        ]);
+        assert_eq!(multi.len(), 2);
+        assert_eq!(resolve_common_parent_dir(&multi), Some(base.clone()));
+        assert_eq!(ShootSessionMode::SinglePhoto.as_str(), "single");
+        assert_eq!(ShootSessionMode::Files.as_str(), "files");
+        assert_eq!(ShootSessionMode::Folder.as_str(), "folder");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_sidecars_dir_keeps_downloads_clean_until_local_shoot_sidecars_exist() {
+        let base = std::env::temp_dir().join(format!(
+            "kroma_sidecars_dir_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let downloads_dir = base.join("Downloads");
+        let managed_dir = base.join("managed_single_sidecars");
+        fs::create_dir_all(&downloads_dir).unwrap();
+        fs::create_dir_all(&managed_dir).unwrap();
+
+        // Single photo in Downloads with no existing .kroma_sidecars -> managed app-data bucket
+        let single_dir =
+            resolve_sidecars_dir(&downloads_dir, ShootSessionMode::SinglePhoto, &managed_dir);
+        assert!(single_dir.starts_with(&managed_dir));
+        assert!(!downloads_dir.join(".kroma_sidecars").exists());
+
+        // Full folder shoot always uses local .kroma_sidecars
+        let folder_dir =
+            resolve_sidecars_dir(&downloads_dir, ShootSessionMode::Folder, &managed_dir);
+        assert_eq!(folder_dir, downloads_dir.join(".kroma_sidecars"));
+
+        // If .kroma_sidecars already exists in the parent shoot folder, SinglePhoto shares it
+        fs::create_dir_all(&folder_dir).unwrap();
+        let shared_single =
+            resolve_sidecars_dir(&downloads_dir, ShootSessionMode::SinglePhoto, &managed_dir);
+        assert_eq!(shared_single, folder_dir);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preview_proxy_policy_handles_raw_and_large_web_images() {
+        let cache_dir = Path::new("cache_root");
+        let raw_path = Path::new("D:/Shoot/DSC0001.ARW");
+        let tiff_path = Path::new("D:/Shoot/scan.tiff");
+        let small_jpg = Path::new("D:/Shoot/web_small.jpg");
+        let camera_jpg = Path::new("D:/Shoot/IMG_4821.JPG");
+        let large_png = Path::new("D:/Shoot/render.png");
+
+        // RAW and TIFF always get cached previews regardless of size
+        assert!(should_generate_preview_proxy(raw_path, 10_000));
+        assert!(should_generate_preview_proxy(tiff_path, 10_000));
+
+        // Small web-native files (<300 KB) skip proxy encoding; large camera JPEGs/PNGs get proxied
+        assert!(!should_generate_preview_proxy(small_jpg, 120_000));
+        assert!(should_generate_preview_proxy(
+            camera_jpg,
+            WEB_NATIVE_PREVIEW_PROXY_MIN_BYTES
+        ));
+        assert!(should_generate_preview_proxy(large_png, 8_500_000));
+
+        // RAW cache path keeps its stable v3_ key; web-native cache path uses v3_web_ and
+        // invalidates automatically if file size or mtime changes while staying recognized by cache cleanup
+        let raw_cache_a = build_preview_cache_path(
+            cache_dir,
+            raw_path,
+            "DSC0001",
+            "D:/Shoot/DSC0001.ARW",
+            25_000_000,
+            1000,
+        );
+        let raw_cache_b = build_preview_cache_path(
+            cache_dir,
+            raw_path,
+            "DSC0001",
+            "D:/Shoot/DSC0001.ARW",
+            25_000_000,
+            2000,
+        );
+        assert_eq!(raw_cache_a, raw_cache_b);
+        assert!(is_preview_cache_file(
+            raw_cache_a.file_name().unwrap().to_str().unwrap()
+        ));
+
+        let jpg_cache_a = build_preview_cache_path(
+            cache_dir,
+            camera_jpg,
+            "IMG_4821",
+            "D:/Shoot/IMG_4821.JPG",
+            6_400_000,
+            1000,
+        );
+        let jpg_cache_b = build_preview_cache_path(
+            cache_dir,
+            camera_jpg,
+            "IMG_4821",
+            "D:/Shoot/IMG_4821.JPG",
+            6_400_000,
+            2000,
+        );
+        let jpg_cache_c = build_preview_cache_path(
+            cache_dir,
+            camera_jpg,
+            "IMG_4821",
+            "D:/Shoot/IMG_4821.JPG",
+            6_500_000,
+            1000,
+        );
+        assert_ne!(jpg_cache_a, jpg_cache_b);
+        assert_ne!(jpg_cache_a, jpg_cache_c);
+        assert!(is_preview_cache_file(
+            jpg_cache_a.file_name().unwrap().to_str().unwrap()
+        ));
     }
 }

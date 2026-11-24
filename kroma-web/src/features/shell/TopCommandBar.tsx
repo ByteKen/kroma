@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { memo, useEffect, useMemo, useRef } from 'react';
 import { useStudio } from '../../app/StudioContext';
 import kromaLogo from '../../assets/kroma-logo.png';
-import { formatShortcutCombo, isMacPlatform } from '../../domain/platform';
+import { formatShortcutCombo, isMacPlatform, isSharedSystemFolder } from '../../domain/platform';
 import { DarkroomTooltip } from '../darkroom-kit';
 
-export function TopCommandBar() {
+export const TopCommandBar = memo(function TopCommandBar() {
   const {
     session,
     activeWorkspace,
@@ -12,6 +12,8 @@ export function TopCommandBar() {
     searchQuery,
     setSearchQuery,
     setActiveWorkspace,
+    openParentFolder,
+    isScanningFolder,
     isWindowMaximized,
     minimizeWindow,
     toggleMaximizeWindow,
@@ -138,27 +140,53 @@ export function TopCommandBar() {
         <div className="h-4 w-px bg-hairline shrink-0" />
 
         {session ? (
-          <button
-            type="button"
-            onClick={() => {
-              if (activeWorkspace === 'home') {
-                setActiveWorkspace(session.isClustered ? 'culling' : 'develop');
-              }
-            }}
-            className={`flex items-center gap-2 min-w-0 text-left ${
-              activeWorkspace === 'home'
-                ? 'hover:text-amber-soft cursor-pointer transition-colors'
-                : 'cursor-default'
-            }`}
-          >
-            <span className="font-display text-[13px] font-semibold text-ink-primary truncate">
-              {session.telemetry.projectName}
-            </span>
-            <span className="tabular-nums-mono text-[11px] text-ink-telemetry shrink-0">
-              {totalLoadedPhotos} photos
-              {session.isClustered ? ` • ${session.clusters.length} groups` : ' • Unclustered'}
-            </span>
-          </button>
+          <div className="flex items-center gap-2.5 min-w-0">
+            <button
+              type="button"
+              onClick={() => {
+                if (activeWorkspace === 'home') {
+                  setActiveWorkspace(
+                    session.sessionMode !== 'single' && session.isClustered ? 'culling' : 'develop',
+                  );
+                }
+              }}
+              className={`flex items-center gap-2 min-w-0 text-left ${
+                activeWorkspace === 'home'
+                  ? 'hover:text-amber-soft cursor-pointer transition-colors'
+                  : 'cursor-default'
+              }`}
+            >
+              <span className="font-display text-[13px] font-semibold text-ink-primary truncate">
+                {session.telemetry.projectName}
+              </span>
+              <span className="tabular-nums-mono text-[11px] text-ink-telemetry shrink-0">
+                {session.sessionMode === 'single'
+                  ? 'Single Photo'
+                  : session.sessionMode === 'files'
+                    ? `${totalLoadedPhotos} selected${session.isClustered ? ` • ${session.clusters.length} groups` : ''}`
+                    : `${totalLoadedPhotos} photos${session.isClustered ? ` • ${session.clusters.length} groups` : ' • Unclustered'}`}
+              </span>
+            </button>
+
+            {(session.sessionMode === 'single' || session.sessionMode === 'files') &&
+              session.folderPath &&
+              !isSharedSystemFolder(session.folderPath) && (
+                <DarkroomTooltip
+                  content={`Load all photos in ${session.folderPath}`}
+                  side="bottom"
+                >
+                  <button
+                    type="button"
+                    disabled={isScanningFolder}
+                    onClick={() => void openParentFolder()}
+                    className="h-6 px-2 rounded-md bg-surface hover:bg-surface-active border border-hairline hover:border-amber-core/50 text-ink-secondary hover:text-amber-soft tabular-nums-mono text-[10px] flex items-center gap-1 transition-colors cursor-pointer shrink-0 disabled:opacity-40"
+                  >
+                    <span className="material-symbols-outlined text-[13px]">folder_open</span>
+                    <span className="hidden md:inline">Open Parent Folder</span>
+                  </button>
+                </DarkroomTooltip>
+              )}
+          </div>
         ) : (
           <span className="font-display text-[12px] font-medium text-ink-secondary">
             Home &amp; Recent Projects
@@ -284,4 +312,4 @@ export function TopCommandBar() {
       )}
     </header>
   );
-}
+});

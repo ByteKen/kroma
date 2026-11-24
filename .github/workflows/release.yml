@@ -179,6 +179,8 @@ jobs:
     name: Build macOS Installers & Portable Archives (Apple Silicon arm64)
     needs: verify
     runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.4"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -208,6 +210,8 @@ jobs:
 
       - name: Build Kroma Desktop macOS App & DMG (aarch64-apple-darwin)
         run: npm --prefix kroma-web run tauri:build -- --target aarch64-apple-darwin --bundles app,dmg
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.4"
 
       - name: Stage macOS DMG, ZIP, and TAR.GZ archives
         shell: bash

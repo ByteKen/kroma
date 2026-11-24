@@ -1,6 +1,21 @@
 use kroma_app::error::AppError;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
+
+const MAX_CACHED_CUBE_LUTS: usize = 16;
+
+struct CachedCubeLutEntry {
+    file_size: u64,
+    mtime_ns: u128,
+    lut: Arc<CubeLut3D>,
+}
+
+static CUBE_LUT_CACHE: OnceLock<Mutex<HashMap<String, CachedCubeLutEntry>>> = OnceLock::new();
 
 /// Parsed standard Adobe `.cube` 3D Lookup Table with trilinear RGB interpolation.
 #[derive(Debug, Clone)]
@@ -13,6 +28,32 @@ pub struct CubeLut3D {
 }
 
 impl CubeLut3D {
+    /// Returns a fast deterministic content fingerprint for GPU buffer cache invalidation.
+    pub fn fingerprint(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.size.hash(&mut h);
+        for v in self.domain_min {
+            v.to_bits().hash(&mut h);
+        }
+        for v in self.domain_max {
+            v.to_bits().hash(&mut h);
+        }
+        self.table.len().hash(&mut h);
+        // Sample evenly across the table so identical sizes with different grades never collide
+        let step = (self.table.len() / 64).max(1);
+        for rgb in self.table.iter().step_by(step) {
+            rgb[0].to_bits().hash(&mut h);
+            rgb[1].to_bits().hash(&mut h);
+            rgb[2].to_bits().hash(&mut h);
+        }
+        if let Some(last) = self.table.last() {
+            last[0].to_bits().hash(&mut h);
+            last[1].to_bits().hash(&mut h);
+            last[2].to_bits().hash(&mut h);
+        }
+        h.finish()
+    }
+
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, AppError> {
         let content = fs::read_to_string(path.as_ref()).map_err(|err| {
             AppError::ImageProcessingFailure(format!(
@@ -21,6 +62,50 @@ impl CubeLut3D {
             ))
         })?;
         Self::parse(&content)
+    }
+
+    /// Cached loader for batch exports and repeated previews: returns an `Arc<CubeLut3D>` from a
+    /// bounded process-wide cache keyed by path + `(file_size, mtime)` so exporting 500 photos with
+    /// the same `.cube` LUT parses it once instead of 500 times.
+    pub fn load_cached(path_or_id: &str) -> Result<Arc<Self>, AppError> {
+        let p = Path::new(path_or_id);
+        let (file_size, mtime_ns) = match fs::metadata(p) {
+            Ok(meta) if meta.is_file() => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                (meta.len(), mtime)
+            }
+            _ => (0, 0),
+        };
+
+        let cache = CUBE_LUT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(guard) = cache.lock()
+            && let Some(entry) = guard.get(path_or_id)
+            && entry.file_size == file_size
+            && entry.mtime_ns == mtime_ns
+        {
+            return Ok(Arc::clone(&entry.lut));
+        }
+
+        let parsed = Arc::new(Self::load_or_builtin(path_or_id)?);
+        if let Ok(mut guard) = cache.lock() {
+            if guard.len() >= MAX_CACHED_CUBE_LUTS && !guard.contains_key(path_or_id) {
+                guard.clear();
+            }
+            guard.insert(
+                path_or_id.to_string(),
+                CachedCubeLutEntry {
+                    file_size,
+                    mtime_ns,
+                    lut: Arc::clone(&parsed),
+                },
+            );
+        }
+        Ok(parsed)
     }
 
     /// Loads a `.cube` 3D LUT from disk, or synthesizes one of Kroma's 4 built-in Studio `.cube`
@@ -319,5 +404,16 @@ LUT_3D_SIZE 2
         assert!((out[0] - 0.25).abs() < 1e-5);
         assert!((out[1] - 0.50).abs() < 1e-5);
         assert!((out[2] - 0.75).abs() < 1e-5);
+    }
+
+    #[test]
+    fn load_cached_returns_shared_arc_and_distinct_fingerprints() {
+        let portra_a = CubeLut3D::load_cached("Kodak_Portra_400.cube").expect("builtin portra");
+        let portra_b = CubeLut3D::load_cached("Kodak_Portra_400.cube").expect("cached portra");
+        let fuji = CubeLut3D::load_cached("Fuji_Pro_400H.cube").expect("builtin fuji");
+
+        assert!(Arc::ptr_eq(&portra_a, &portra_b));
+        assert_eq!(portra_a.fingerprint(), portra_b.fingerprint());
+        assert_ne!(portra_a.fingerprint(), fuji.fingerprint());
     }
 }

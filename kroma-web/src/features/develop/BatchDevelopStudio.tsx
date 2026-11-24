@@ -44,16 +44,16 @@ import {
   BeforeAfterCanvas,
   DEVELOP_WORKING_MAX_DIM,
   type CompareViewportMode,
-  type ViewportZoomLevel,
 } from './BeforeAfterCanvas';
+import { formatViewportZoomLabel } from '../../domain/viewportZoom';
 import { DevelopInspectorPanel, type DevelopToolMode } from './DevelopInspectorPanel';
+import { preloadDevelopBitmap } from './developBitmapCache';
 import { FloatingMasksLayersPanel } from './FloatingMasksLayersPanel';
 import { GradedThumbnailImg } from './GradedThumbnailImg';
+import { useLiveDevelopRecipe } from './liveDevelopDraftStore';
 import type { BrushToolOptions } from './MaskCanvasOverlay';
 import { createManualMaskComponent } from './MaskingPanel';
 import { SyncSettingsModal } from './SyncSettingsModal';
-
-const MAX_PRELOADED_PREVIEW_URLS = 48;
 
 interface BatchDevelopStudioProps {
   readonly isActive?: boolean;
@@ -82,7 +82,7 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
     activeDevelopFolderId,
     developPhotos,
     activeDevelopScopeLabel,
-    activeDevelopPhoto,
+    activeDevelopPhoto: committedActiveDevelopPhoto,
     liveHistogram,
     selectedPhotoIds,
     copiedRecipe,
@@ -114,6 +114,20 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
     notifyAction,
   } = useStudio();
 
+  const liveActiveRecipe = useLiveDevelopRecipe(
+    committedActiveDevelopPhoto?.id,
+    committedActiveDevelopPhoto?.developRecipe,
+  );
+  const activeDevelopPhoto = useMemo(
+    () =>
+      committedActiveDevelopPhoto &&
+      liveActiveRecipe &&
+      liveActiveRecipe !== committedActiveDevelopPhoto.developRecipe
+        ? { ...committedActiveDevelopPhoto, developRecipe: liveActiveRecipe }
+        : committedActiveDevelopPhoto,
+    [committedActiveDevelopPhoto, liveActiveRecipe],
+  );
+
   const [showFocusHint, setShowFocusHint] = useState(false);
 
   useEffect(() => {
@@ -127,7 +141,8 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
   }, [studioFocusMode]);
 
   const [compareMode, setCompareMode] = useState<CompareViewportMode>('single');
-  const [zoomLevel, setZoomLevel] = useState<ViewportZoomLevel>(1);
+  const [zoomFactor, setZoomFactor] = useState<number>(1);
+  const [oneToOneZoom, setOneToOneZoom] = useState<number>(2);
   const [showShadowClip, setShowShadowClip] = useState(false);
   const [showHighlightClip, setShowHighlightClip] = useState(false);
   const [eyedropperActive, setEyedropperActive] = useState(false);
@@ -153,7 +168,6 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
   const [subjectQuery, setSubjectQuery] = useState('');
   const [subjectFilter, setSubjectFilter] = useState<SubjectFilterMode>('all');
   const subjectSearchInputRef = useRef<HTMLInputElement>(null);
-  const preloadedUrlsRef = useRef<Set<string>>(new Set());
   const leftPanel = useResizableWidth({
     storageKey: 'studio-left',
     defaultWidth: 264,
@@ -241,11 +255,19 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
   useEffect(() => {
     setSubjectQuery('');
     setSubjectFilter('all');
+    setZoomFactor(1);
+    setCompareMode('single');
+    setActiveMaskId(null);
+    setActiveMaskComponentId(null);
+    setCreatingNewMask(false);
+    setEyedropperActive(false);
+    setColorPickActive(false);
   }, [session?.folderPath]);
 
+  const committedActivePhotoId = committedActiveDevelopPhoto?.id ?? null;
   const activePhotoIndex = useMemo(
-    () => (activeDevelopPhoto ? developPhotos.findIndex((p) => p.id === activeDevelopPhoto.id) : -1),
-    [developPhotos, activeDevelopPhoto],
+    () => (committedActivePhotoId ? developPhotos.findIndex((p) => p.id === committedActivePhotoId) : -1),
+    [developPhotos, committedActivePhotoId],
   );
 
   const stepPhoto = useCallback(
@@ -264,29 +286,28 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
     }
   }, [isActive, clearSubjectHover]);
 
-  // Pre-warm neighboring frames (+/- 2) into WebView2's image cache for instant arrow stepping
+  const workingMaxDim = preferences.studioPreviewMaxDim ?? DEVELOP_WORKING_MAX_DIM;
+
+  // Quietly pre-decode neighboring JPEG/PNG frames (+1, -1, +2, -2) into the shared downscaled
+  // ImageBitmap LRU cache so stepping between standard photos uploads synchronously in <3 ms.
   useEffect(() => {
     if (!isActive || activePhotoIndex < 0 || developPhotos.length <= 1) return;
-    const cache = preloadedUrlsRef.current;
-    for (const offset of [-1, 1, -2, 2]) {
-      const idx = activePhotoIndex + offset;
-      if (idx < 0 || idx >= developPhotos.length) continue;
-      const url = developPhotos[idx]?.imageUrl;
-      if (!url || cache.has(url)) continue;
-      if (cache.size >= MAX_PRELOADED_PREVIEW_URLS) {
-        const oldest = cache.values().next().value;
-        if (oldest) cache.delete(oldest);
+    const timer = window.setTimeout(() => {
+      for (const offset of [1, -1, 2, -2]) {
+        const idx = activePhotoIndex + offset;
+        if (idx < 0 || idx >= developPhotos.length) continue;
+        const neighbor = developPhotos[idx];
+        const neighborSrc = neighbor?.studioSourceUrl ?? neighbor?.imageUrl;
+        if (!neighborSrc) continue;
+        if (isDesktopRuntime && shouldProbeHighBitDepthBuffer(neighbor.fileName)) continue;
+        preloadDevelopBitmap(neighborSrc, workingMaxDim);
       }
-      cache.add(url);
-      const img = new Image();
-      img.decoding = 'async';
-      img.src = url;
-    }
-  }, [isActive, activePhotoIndex, developPhotos]);
+    }, 60);
+    return () => window.clearTimeout(timer);
+  }, [isActive, isDesktopRuntime, activePhotoIndex, developPhotos, workingMaxDim]);
 
   // Quietly pre-decode adjacent RAW working buffers (+1, -1, +2) after a brief dwell so stepping
   // forward or back in Studio hits the in-memory LRU cache in 0 ms without competing with the active frame.
-  const workingMaxDim = preferences.studioPreviewMaxDim ?? DEVELOP_WORKING_MAX_DIM;
   useEffect(() => {
     if (!isActive || !isDesktopRuntime || activePhotoIndex < 0 || developPhotos.length <= 1) {
       return;
@@ -367,6 +388,7 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
       if ((event.ctrlKey || event.metaKey) && event.shiftKey) {
         const key = event.key.toLowerCase();
         if (key === 's') {
+          if (session?.sessionMode === 'single') return;
           event.preventDefault();
           setSyncModalOpen(true);
         } else if (key === 'c') {
@@ -425,6 +447,11 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
           setShowMaskOverlay((prev) => !prev);
           return;
         }
+        if (lower === 'z') {
+          event.preventDefault();
+          setZoomFactor((z) => (z > 1.02 ? 1 : Number(oneToOneZoom.toFixed(4))));
+          return;
+        }
         if (toolMode === 'mask' && (event.key === '[' || event.key === ']')) {
           event.preventDefault();
           setBrushOptions((prev) => ({
@@ -463,12 +490,14 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
         }
       }
 
-      if (event.key === 'ArrowRight') {
-        event.preventDefault();
-        stepPhoto(1);
-      } else if (event.key === 'ArrowLeft') {
-        event.preventDefault();
-        stepPhoto(-1);
+      if (session?.sessionMode !== 'single') {
+        if (event.key === 'ArrowRight') {
+          event.preventDefault();
+          stepPhoto(1);
+        } else if (event.key === 'ArrowLeft') {
+          event.preventDefault();
+          stepPhoto(-1);
+        }
       }
     };
 
@@ -476,6 +505,7 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [
     isActive,
+    session?.sessionMode,
     developSourceMode,
     copyActiveRecipe,
     pasteRecipeToClusterSelection,
@@ -492,6 +522,7 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
     studioFocusMode,
     setStudioFocusMode,
     toggleStudioFocusMode,
+    oneToOneZoom,
   ]);
 
   const activePhotoId = activeDevelopPhoto?.id ?? null;
@@ -518,6 +549,7 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
 
   useEffect(() => {
     setColorPickActive(false);
+    setZoomFactor(1);
     setCreatingNewMask(false);
     activeStrokeTargetRef.current = null;
   }, [activePhotoId]);
@@ -815,7 +847,13 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
 
   if (!session || !activeDevelopPhoto) return null;
 
+  const isSinglePhoto = session.sessionMode === 'single';
+  const hideLeftSidebar =
+    studioFocusMode || isSinglePhoto || (session.sessionMode === 'files' && !session.isClustered);
+  const hideFilmstrip = studioFocusMode || isSinglePhoto;
+
   const hasSlateAnchor =
+    !isSinglePhoto &&
     developSourceMode === 'subjects' &&
     activeCluster !== null &&
     !isFaceOnlySlateCode(activeCluster.anchor.slateCode);
@@ -823,8 +861,8 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
 
   return (
     <div className="flex-1 flex min-w-0 min-h-0 overflow-hidden bg-canvas">
-      {/* Left Sidebar: Full-Height RAW Folders & Subjects Browser (hidden in Tab Focus Mode) */}
-      {!studioFocusMode && (
+      {/* Left Sidebar: Full-Height RAW Folders & Subjects Browser (hidden in Focus / Single Photo Mode) */}
+      {!hideLeftSidebar && (
         <>
           <aside
             aria-label="RAW Folders and Subjects"
@@ -1091,23 +1129,27 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
         {!studioFocusMode && (
         <div className="h-10 px-4 bg-surface border-b border-hairline flex items-center justify-between gap-3 shrink-0">
           <div className="flex items-center gap-2 min-w-0">
-            <DarkroomButton
-              variant="ghost"
-              size="xs"
-              icon="grid_view"
-              onClick={() => setActiveWorkspace('culling')}
-              title="Back to Grid"
-              aria-label="Back to Grid"
-            />
+            {!isSinglePhoto && (
+              <DarkroomButton
+                variant="ghost"
+                size="xs"
+                icon="grid_view"
+                onClick={() => setActiveWorkspace('culling')}
+                title="Back to Grid"
+                aria-label="Back to Grid"
+              />
+            )}
             <span className="tabular-nums-mono text-[12px] font-semibold text-ink-primary truncate">
               {activeDevelopPhoto.fileName}
             </span>
             <TelemetryPill tone={modified ? 'amber' : 'neutral'}>
               {modified ? 'EDITED' : 'RAW'}
             </TelemetryPill>
-            <span className="hidden xl:inline tabular-nums-mono text-[10px] text-ink-telemetry truncate">
-              {activeDevelopScopeLabel} • {activePhotoIndex + 1} / {developPhotos.length}
-            </span>
+            {!isSinglePhoto && (
+              <span className="hidden xl:inline tabular-nums-mono text-[10px] text-ink-telemetry truncate">
+                {activeDevelopScopeLabel} • {activePhotoIndex + 1} / {developPhotos.length}
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
@@ -1136,26 +1178,30 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
               />
             </div>
 
-            <div className="h-4 w-px bg-hairline shrink-0" />
+            {!isSinglePhoto && (
+              <>
+                <div className="h-4 w-px bg-hairline shrink-0" />
 
-            <div className="flex items-center gap-1">
-              <DarkroomButton
-                variant="subtle"
-                size="xs"
-                icon="chevron_left"
-                onClick={() => stepPhoto(-1)}
-                title="Previous frame (←)"
-                aria-label="Previous photo"
-              />
-              <DarkroomButton
-                variant="subtle"
-                size="xs"
-                icon="chevron_right"
-                onClick={() => stepPhoto(1)}
-                title="Next frame (→)"
-                aria-label="Next photo"
-              />
-            </div>
+                <div className="flex items-center gap-1">
+                  <DarkroomButton
+                    variant="subtle"
+                    size="xs"
+                    icon="chevron_left"
+                    onClick={() => stepPhoto(-1)}
+                    title="Previous frame (←)"
+                    aria-label="Previous photo"
+                  />
+                  <DarkroomButton
+                    variant="subtle"
+                    size="xs"
+                    icon="chevron_right"
+                    onClick={() => stepPhoto(1)}
+                    title="Next frame (→)"
+                    aria-label="Next photo"
+                  />
+                </div>
+              </>
+            )}
           </div>
         </div>
         )}
@@ -1182,12 +1228,13 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
           </>
         )}
 
-        {/* Interactive Split-Wipe / Side-by-Side / Single Loupe + Floating Lightroom Masks Layers Card */}
+        {/* Interactive Full-Stage Loupe / Split-Wipe / Side-by-Side + Floating Lightroom Masks Layers Card */}
         <BeforeAfterCanvas
           photo={activeDevelopPhoto}
           compareMode={compareMode}
-          zoomLevel={zoomLevel}
-          onChangeZoom={setZoomLevel}
+          zoomFactor={zoomFactor}
+          onChangeZoomFactor={setZoomFactor}
+          onOneToOneZoomChange={setOneToOneZoom}
           showShadowClip={showShadowClip}
           showHighlightClip={showHighlightClip}
           cropModeActive={cropModeActive && !studioFocusMode}
@@ -1290,13 +1337,19 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
               <span className="hidden sm:inline">Clipping</span>
             </DarkroomButton>
             <DarkroomButton
-              variant={zoomLevel > 1 ? 'secondary' : 'subtle'}
+              variant={zoomFactor > 1.02 ? 'secondary' : 'subtle'}
               size="xs"
-              onClick={() => setZoomLevel((z) => (z === 1 ? 2 : z === 2 ? 3 : 1))}
-              title="Cycle Zoom (Fit / 100% / 200% • Ctrl+Scroll)"
-              className="tabular-nums-mono min-w-[44px] justify-center"
+              onClick={() => {
+                setZoomFactor((z) => {
+                  if (z <= 1.02) return Number(oneToOneZoom.toFixed(4));
+                  if (z < oneToOneZoom * 1.6) return Number((oneToOneZoom * 2).toFixed(4));
+                  return 1;
+                });
+              }}
+              title="Cycle Zoom (Fit / 100% 1:1 / 200% • Z, Double-Click, or Ctrl+Scroll)"
+              className="tabular-nums-mono min-w-[48px] justify-center"
             >
-              {zoomLevel === 1 ? 'Fit' : zoomLevel === 2 ? '100%' : '200%'}
+              {formatViewportZoomLabel(zoomFactor, oneToOneZoom)}
             </DarkroomButton>
             <DarkroomButton
               variant="subtle"
@@ -1309,7 +1362,8 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
           </div>
         </div>
 
-        {/* Bottom Virtualized Live-Graded Filmstrip */}
+        {/* Bottom Virtualized Live-Graded Filmstrip (hidden in Single Photo & Focus Mode) */}
+        {!hideFilmstrip && (
         <VirtualHorizontalStrip
           items={developPhotos}
           activeIndex={activePhotoIndex}
@@ -1369,6 +1423,7 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
             );
           }}
         />
+        )}
         </>
         )}
       </section>
@@ -1429,6 +1484,8 @@ export const BatchDevelopStudio = memo(function BatchDevelopStudio({
             onApplyRelativeNudge={applyRelativeNudgeToClusterSelection}
             onSyncSlateWb={syncSlateWhiteBalanceForActiveCluster}
             onOpenSyncModal={handleOpenSyncModal}
+            isSinglePhoto={isSinglePhoto}
+            onOpenExport={() => setActiveWorkspace('export')}
             onCopyRecipe={copyActiveRecipe}
             onPasteRecipe={pasteRecipeToClusterSelection}
           />

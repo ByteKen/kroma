@@ -4,10 +4,14 @@ import {
   buildToneCurveLutRgba,
   compileDevelopShaderUniforms,
   compressRec2020ToLinearSrgb,
-  computeObjectFitUvTransform,
   linearToSrgb,
   softClip,
 } from '../../domain/developShaderMath';
+import {
+  computeViewportUvTransform,
+  ZERO_VIEWPORT_PAN,
+  type ViewportPan,
+} from '../../domain/viewportZoom';
 import type { DevelopWorkingBuffer } from '../../domain/developWorkingBuffer';
 import {
   compileMaskLayerForWebGl,
@@ -20,6 +24,11 @@ import {
   type MaskLayer,
 } from '../../domain/masking';
 import { isToneCurveModified, sampleToneCurveSvgTableValues } from '../../domain/toneCurve';
+import {
+  loadDevelopBitmap,
+  peekDevelopBitmap,
+  type CachedDevelopBitmap,
+} from './developBitmapCache';
 
 interface WebGlDevelopCanvasProps {
   readonly src: string;
@@ -27,7 +36,11 @@ interface WebGlDevelopCanvasProps {
   readonly recipe: DevelopRecipe;
   /** Optional 16-bit half-float working buffer (`RGBA16F`) decoded directly from Camera RAW / 16-bit TIFF/PNG. */
   readonly workingBuffer?: DevelopWorkingBuffer | null;
+  readonly previewMaxDim?: number;
   readonly fit?: 'cover' | 'contain';
+  readonly viewportZoom?: number;
+  readonly viewportPan?: ViewportPan;
+  readonly viewportPadPx?: number;
   readonly rotationDeg?: number;
   readonly rotationScale?: number;
   readonly applyCrop?: boolean;
@@ -41,9 +54,10 @@ interface WebGlDevelopCanvasProps {
   readonly onSampleColorRangeRgb?: (r: number, g: number, b: number) => void;
   readonly className?: string;
   readonly onNaturalSize?: (width: number, height: number) => void;
+  readonly onMaxTextureDim?: (maxDim: number) => void;
 }
 
-const MAX_FBO_DIM = 2048;
+const MAX_FBO_DIM = 4096;
 
 function f16BitsToF32(h: number): number {
   const sign = (h & 0x8000) !== 0 ? -1 : 1;
@@ -73,7 +87,9 @@ precision highp float;
 uniform sampler2D u_image;
 uniform sampler2D u_toneLut;
 uniform vec4 u_uvTransform; // (scaleX, scaleY, offsetX, offsetY)
-uniform vec3 u_orient;      // (flipH, flipV, quarterTurns)
+uniform vec4 u_cropBounds;  // (minU, minV, maxU, maxV)
+uniform vec4 u_orient;      // (flipH, flipV, quarterTurns, rotationRad)
+uniform vec2 u_orientedDims;
 
 uniform float u_inputLinear;
 uniform float u_inputWideGamut;
@@ -345,13 +361,38 @@ vec2 orientSourceUv(vec2 uv) {
 
 void main() {
   vec2 uv = v_texCoord * u_uvTransform.xy + u_uvTransform.zw;
-  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+  if (
+    uv.x < u_cropBounds.x || uv.x > u_cropBounds.z ||
+    uv.y < u_cropBounds.y || uv.y > u_cropBounds.w
+  ) {
     gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
     return;
   }
 
-  vec2 srcUv = orientSourceUv(uv);
-  vec4 texel = texture2D(u_image, srcUv);
+  vec2 sampleUv = uv;
+  bool outOfBounds = false;
+  float rotRad = u_orient.w;
+  if (abs(rotRad) > 1e-5) {
+    float oriW = max(u_orientedDims.x, 1.0);
+    float oriH = max(u_orientedDims.y, 1.0);
+    float px = uv.x * oriW - 0.5;
+    float py = uv.y * oriH - 0.5;
+    float cx = (oriW - 1.0) * 0.5;
+    float cy = (oriH - 1.0) * 0.5;
+    float dx = px - cx;
+    float dy = py - cy;
+    float cosA = cos(-rotRad);
+    float sinA = sin(-rotRad);
+    float sx = dx * cosA - dy * sinA + cx;
+    float sy = dx * sinA + dy * cosA + cy;
+    if (sx < 0.0 || sy < 0.0 || sx >= oriW - 1.0 || sy >= oriH - 1.0) {
+      outOfBounds = true;
+    } else {
+      sampleUv = vec2((sx + 0.5) / oriW, (sy + 0.5) / oriH);
+    }
+  }
+
+  vec4 texel = outOfBounds ? vec4(0.0, 0.0, 0.0, 1.0) : texture2D(u_image, orientSourceUv(sampleUv));
   vec3 rgb = texel.rgb;
 
   // 1-2. Linear White Balance + Exposure EV + HDR Highlight Recovery + Smooth Wide-Gamut Compression
@@ -547,6 +588,7 @@ precision highp float;
 uniform sampler2D u_graded;
 uniform sampler2D u_bgMatte;
 uniform vec4 u_uvTransform;
+uniform vec4 u_cropBounds;
 uniform vec2 u_texelSize;
 uniform float u_spatialScale;
 
@@ -581,7 +623,10 @@ float grainHash12(vec2 pIn) {
 
 void main() {
   vec2 uv = v_texCoord * u_uvTransform.xy + u_uvTransform.zw;
-  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+  if (
+    uv.x < u_cropBounds.x || uv.x > u_cropBounds.z ||
+    uv.y < u_cropBounds.y || uv.y > u_cropBounds.w
+  ) {
     gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
     return;
   }
@@ -833,6 +878,7 @@ precision highp float;
 uniform sampler2D u_prevImage;
 uniform sampler2D u_spatialMask;
 uniform vec4 u_uvTransform;
+uniform vec4 u_cropBounds;
 uniform vec2 u_texelSize;
 uniform float u_spatialScale;
 
@@ -939,7 +985,10 @@ float sampleLuma(vec2 coord) {
 
 void main() {
   vec2 uv = v_texCoord * u_uvTransform.xy + u_uvTransform.zw;
-  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+  if (
+    uv.x < u_cropBounds.x || uv.x > u_cropBounds.z ||
+    uv.y < u_cropBounds.y || uv.y > u_cropBounds.w
+  ) {
     gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
     return;
   }
@@ -1174,7 +1223,9 @@ interface GlPipeline {
     readonly image: WebGLUniformLocation | null;
     readonly toneLut: WebGLUniformLocation | null;
     readonly uvTransform: WebGLUniformLocation | null;
+    readonly cropBounds: WebGLUniformLocation | null;
     readonly orient: WebGLUniformLocation | null;
+    readonly orientedDims: WebGLUniformLocation | null;
     readonly inputLinear: WebGLUniformLocation | null;
     readonly inputWideGamut: WebGLUniformLocation | null;
     readonly linearActive: WebGLUniformLocation | null;
@@ -1220,6 +1271,7 @@ interface GlPipeline {
     readonly flipY: WebGLUniformLocation | null;
     readonly graded: WebGLUniformLocation | null;
     readonly uvTransform: WebGLUniformLocation | null;
+    readonly cropBounds: WebGLUniformLocation | null;
     readonly texelSize: WebGLUniformLocation | null;
     readonly spatialScale: WebGLUniformLocation | null;
     readonly nr: WebGLUniformLocation | null;
@@ -1239,6 +1291,7 @@ interface GlPipeline {
     readonly prevImage: WebGLUniformLocation | null;
     readonly spatialMask: WebGLUniformLocation | null;
     readonly uvTransform: WebGLUniformLocation | null;
+    readonly cropBounds: WebGLUniformLocation | null;
     readonly texelSize: WebGLUniformLocation | null;
     readonly spatialScale: WebGLUniformLocation | null;
     readonly hasSpatial: WebGLUniformLocation | null;
@@ -1404,7 +1457,9 @@ function initGlPipeline(canvas: HTMLCanvasElement): GlPipeline | null {
       image: gl.getUniformLocation(colorProgram, 'u_image'),
       toneLut: gl.getUniformLocation(colorProgram, 'u_toneLut'),
       uvTransform: gl.getUniformLocation(colorProgram, 'u_uvTransform'),
+      cropBounds: gl.getUniformLocation(colorProgram, 'u_cropBounds'),
       orient: gl.getUniformLocation(colorProgram, 'u_orient'),
+      orientedDims: gl.getUniformLocation(colorProgram, 'u_orientedDims'),
       inputLinear: gl.getUniformLocation(colorProgram, 'u_inputLinear'),
       inputWideGamut: gl.getUniformLocation(colorProgram, 'u_inputWideGamut'),
       linearActive: gl.getUniformLocation(colorProgram, 'u_linearActive'),
@@ -1452,6 +1507,7 @@ function initGlPipeline(canvas: HTMLCanvasElement): GlPipeline | null {
       flipY: gl.getUniformLocation(spatialProgram, 'u_flipY'),
       graded: gl.getUniformLocation(spatialProgram, 'u_graded'),
       uvTransform: gl.getUniformLocation(spatialProgram, 'u_uvTransform'),
+      cropBounds: gl.getUniformLocation(spatialProgram, 'u_cropBounds'),
       texelSize: gl.getUniformLocation(spatialProgram, 'u_texelSize'),
       spatialScale: gl.getUniformLocation(spatialProgram, 'u_spatialScale'),
       nr: gl.getUniformLocation(spatialProgram, 'u_nr'),
@@ -1471,6 +1527,7 @@ function initGlPipeline(canvas: HTMLCanvasElement): GlPipeline | null {
       prevImage: gl.getUniformLocation(maskProgram, 'u_prevImage'),
       spatialMask: gl.getUniformLocation(maskProgram, 'u_spatialMask'),
       uvTransform: gl.getUniformLocation(maskProgram, 'u_uvTransform'),
+      cropBounds: gl.getUniformLocation(maskProgram, 'u_cropBounds'),
       texelSize: gl.getUniformLocation(maskProgram, 'u_texelSize'),
       spatialScale: gl.getUniformLocation(maskProgram, 'u_spatialScale'),
       hasSpatial: gl.getUniformLocation(maskProgram, 'u_hasSpatial'),
@@ -1706,7 +1763,11 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
   alt,
   recipe,
   workingBuffer = null,
+  previewMaxDim = 2560,
   fit = 'cover',
+  viewportZoom = 1,
+  viewportPan = ZERO_VIEWPORT_PAN,
+  viewportPadPx = 0,
   rotationDeg = 0,
   rotationScale = 1.06,
   applyCrop = true,
@@ -1720,31 +1781,51 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
   onSampleColorRangeRgb,
   className = '',
   onNaturalSize,
+  onMaxTextureDim,
 }: WebGlDevelopCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const pipelineRef = useRef<GlPipeline | null>(null);
   const imgSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
-  const sourceImgRef = useRef<HTMLImageElement | null>(null);
+  const sourceBitmapRef = useRef<CachedDevelopBitmap | null>(null);
+  const loadedSrcRef = useRef<string>('');
   const inputLinearRef = useRef(false);
   const inputWideGamutRef = useRef(false);
   const textureReadyRef = useRef(false);
   const workingBufferRef = useRef<DevelopWorkingBuffer | null>(workingBuffer);
   const recipeRef = useRef(recipe);
   const fitRef = useRef(fit);
+  const viewportZoomRef = useRef(viewportZoom);
+  const viewportPanRef = useRef(viewportPan);
+  const viewportPadPxRef = useRef(viewportPadPx);
   const applyCropRef = useRef(applyCrop);
   const clipFlagsRef = useRef({ shadow: showShadowClip, highlight: showHighlightClip });
   const maskOverlayRef = useRef({ activeMaskId, showMaskOverlay });
   const onNaturalSizeRef = useRef(onNaturalSize);
+  const onMaxTextureDimRef = useRef(onMaxTextureDim);
   workingBufferRef.current = workingBuffer;
   recipeRef.current = recipe;
   fitRef.current = fit;
+  viewportZoomRef.current = viewportZoom;
+  viewportPanRef.current = viewportPan;
+  viewportPadPxRef.current = viewportPadPx;
   applyCropRef.current = applyCrop;
   clipFlagsRef.current = { shadow: showShadowClip, highlight: showHighlightClip };
   maskOverlayRef.current = { activeMaskId, showMaskOverlay };
   onNaturalSizeRef.current = onNaturalSize;
+  onMaxTextureDimRef.current = onMaxTextureDim;
 
   const [fallbackMode, setFallbackMode] = useState(false);
   const [textureVersion, setTextureVersion] = useState(0);
+  const renderFrameRef = useRef<() => void>(() => {});
+  const pendingRafRef = useRef<number | null>(null);
+  const scheduleRender = () => {
+    if (pendingRafRef.current !== null) return;
+    pendingRafRef.current = window.requestAnimationFrame(() => {
+      pendingRafRef.current = null;
+      renderFrameRef.current();
+    });
+  };
+
   const rawFilterId = useId();
   const curveFilterId = `kroma-fb-curve-${rawFilterId.replace(/[^a-zA-Z0-9_-]/g, '')}`;
 
@@ -1752,6 +1833,8 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
     const pipeline = pipelineRef.current;
     const canvas = canvasRef.current;
     if (!pipeline || !canvas || !textureReadyRef.current) return;
+    // Skip GPU grading & swapchain resize while the Studio tab is hidden (`display: none`)
+    if (canvas.clientWidth === 0 || canvas.clientHeight === 0) return;
 
     const {
       gl,
@@ -1775,8 +1858,8 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
     } = pipeline;
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const cssW = Math.max(1, canvas.clientWidth);
-    const cssH = Math.max(1, canvas.clientHeight);
+    const cssW = canvas.clientWidth;
+    const cssH = canvas.clientHeight;
     const pixelW = Math.max(1, Math.round(cssW * dpr));
     const pixelH = Math.max(1, Math.round(cssH * dpr));
 
@@ -1793,13 +1876,16 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
     const orientedH = swapAxes ? imgSizeRef.current.w : imgSizeRef.current.h;
 
     const u = compileDevelopShaderUniforms(curRecipe);
-    const uv = computeObjectFitUvTransform(
+    const uv = computeViewportUvTransform(
       orientedW,
       orientedH,
       cssW,
       cssH,
       fitRef.current,
       applyCropRef.current ? crop.rect : undefined,
+      viewportPadPxRef.current,
+      viewportZoomRef.current,
+      viewportPanRef.current,
     );
 
     const allMasks = curRecipe.masks ?? [];
@@ -1860,12 +1946,15 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
     }
     gl.uniform1i(colorLoc.toneLut, 1);
 
-    gl.uniform3f(
+    const rotRad = Math.abs(crop.rotationDeg) > 1e-3 ? (crop.rotationDeg * Math.PI) / 180 : 0;
+    gl.uniform4f(
       colorLoc.orient,
       crop.flipHorizontal ? 1.0 : 0.0,
       crop.flipVertical ? 1.0 : 0.0,
       qt,
+      rotRad,
     );
+    gl.uniform2f(colorLoc.orientedDims, orientedW, orientedH);
     gl.uniform1f(colorLoc.inputLinear, inputLinearRef.current ? 1.0 : 0.0);
     gl.uniform1f(colorLoc.inputWideGamut, inputWideGamutRef.current ? 1.0 : 0.0);
     gl.uniform1f(colorLoc.linearActive, u.linearStageActive ? 1.0 : 0.0);
@@ -1929,6 +2018,13 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
       gl.clear(gl.COLOR_BUFFER_BIT);
       gl.uniform1f(colorLoc.flipY, 1.0);
       gl.uniform4f(colorLoc.uvTransform, uv.scaleX, uv.scaleY, uv.offsetX, uv.offsetY);
+      gl.uniform4f(
+        colorLoc.cropBounds,
+        uv.cropBounds[0],
+        uv.cropBounds[1],
+        uv.cropBounds[2],
+        uv.cropBounds[3],
+      );
       gl.uniform2f(colorLoc.clipFlags, clipX, clipY);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       return;
@@ -1941,6 +2037,7 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
     gl.viewport(0, 0, fboW, fboH);
     gl.uniform1f(colorLoc.flipY, 0.0);
     gl.uniform4f(colorLoc.uvTransform, 1.0, 1.0, 0.0, 0.0);
+    gl.uniform4f(colorLoc.cropBounds, 0.0, 0.0, 1.0, 1.0);
     gl.uniform2f(colorLoc.clipFlags, 0.0, 0.0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
@@ -1955,6 +2052,7 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
       uvY: number,
       uvOX: number,
       uvOY: number,
+      cropBounds: readonly [number, number, number, number] = [0, 0, 1, 1],
     ) => {
       gl.useProgram(maskProgram);
       gl.enableVertexAttribArray(maskPosLoc);
@@ -1970,6 +2068,13 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
 
       gl.uniform1f(maskLoc.flipY, flipY);
       gl.uniform4f(maskLoc.uvTransform, uvX, uvY, uvOX, uvOY);
+      gl.uniform4f(
+        maskLoc.cropBounds,
+        cropBounds[0],
+        cropBounds[1],
+        cropBounds[2],
+        cropBounds[3],
+      );
       gl.uniform2f(maskLoc.texelSize, 1.0 / fboW, 1.0 / fboH);
       gl.uniform1f(maskLoc.spatialScale, Math.max(0.5, Math.min(4.0, Math.max(fboW, fboH) / 1024.0)));
       gl.uniform1f(maskLoc.hasSpatial, cached.compiled.hasSpatial ? 1.0 : 0.0);
@@ -2060,6 +2165,13 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
     gl.uniform1i(spatialLoc.graded, 0);
     gl.uniform1f(spatialLoc.flipY, 1.0);
     gl.uniform4f(spatialLoc.uvTransform, uv.scaleX, uv.scaleY, uv.offsetX, uv.offsetY);
+    gl.uniform4f(
+      spatialLoc.cropBounds,
+      uv.cropBounds[0],
+      uv.cropBounds[1],
+      uv.cropBounds[2],
+      uv.cropBounds[3],
+    );
     gl.uniform2f(spatialLoc.texelSize, 1.0 / fboW, 1.0 / fboH);
     gl.uniform1f(spatialLoc.spatialScale, Math.max(1.0, Math.max(fboW, fboH) / 1024.0));
     gl.uniform1f(spatialLoc.nr, u.luminanceNoiseReduction);
@@ -2090,12 +2202,14 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
           uv.scaleY,
           uv.offsetX,
           uv.offsetY,
+          uv.cropBounds,
         );
         gl.drawArrays(gl.TRIANGLES, 0, 6);
         gl.disable(gl.BLEND);
       }
     }
   };
+  renderFrameRef.current = renderFrame;
 
   const handleCanvasClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
@@ -2141,17 +2255,21 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
     const swapAxes = qt % 2 === 1;
     const orientedW = swapAxes ? imgSizeRef.current.h : imgSizeRef.current.w;
     const orientedH = swapAxes ? imgSizeRef.current.w : imgSizeRef.current.h;
-    const uv = computeObjectFitUvTransform(
+    const uv = computeViewportUvTransform(
       orientedW,
       orientedH,
       rect.width,
       rect.height,
       fitRef.current,
       applyCropRef.current ? crop.rect : undefined,
+      viewportPadPxRef.current,
+      viewportZoomRef.current,
+      viewportPanRef.current,
     );
     const uOriented = nx * uv.scaleX + uv.offsetX;
     const vOriented = ny * uv.scaleY + uv.offsetY;
-    if (uOriented < 0 || uOriented > 1 || vOriented < 0 || vOriented > 1) return;
+    const [minU, minV, maxU, maxV] = uv.cropBounds;
+    if (uOriented < minU || uOriented > maxU || vOriented < minV || vOriented > maxV) return;
 
     const [srcU, srcV] = orientSourceUvJs(
       uOriented,
@@ -2207,17 +2325,23 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
       return;
     }
 
-    const img = sourceImgRef.current;
-    if (img && img.naturalWidth > 0 && img.naturalHeight > 0) {
+    const cachedSource = sourceBitmapRef.current;
+    if (cachedSource && cachedSource.width > 0 && cachedSource.height > 0) {
       try {
         const sampleCanvas = document.createElement('canvas');
         sampleCanvas.width = 5;
         sampleCanvas.height = 5;
         const ctx2d = sampleCanvas.getContext('2d');
         if (!ctx2d) return;
-        const sx = Math.min(img.naturalWidth - 5, Math.max(0, Math.round(srcU * img.naturalWidth) - 2));
-        const sy = Math.min(img.naturalHeight - 5, Math.max(0, Math.round(srcV * img.naturalHeight) - 2));
-        ctx2d.drawImage(img, sx, sy, 5, 5, 0, 0, 5, 5);
+        const sx = Math.min(
+          cachedSource.width - 5,
+          Math.max(0, Math.round(srcU * cachedSource.width) - 2),
+        );
+        const sy = Math.min(
+          cachedSource.height - 5,
+          Math.max(0, Math.round(srcV * cachedSource.height) - 2),
+        );
+        ctx2d.drawImage(cachedSource.bitmap, sx, sy, 5, 5, 0, 0, 5, 5);
         const data = ctx2d.getImageData(0, 0, 5, 5).data;
         let sr = 0;
         let sg = 0;
@@ -2266,10 +2390,18 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
     };
     canvas.addEventListener('webglcontextlost', handleContextLost);
 
-    const observer = new ResizeObserver(() => renderFrame());
+    const observer = new ResizeObserver(() => scheduleRender());
     observer.observe(canvas);
+    const reportedMaxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+    if (reportedMaxTex > 0) {
+      onMaxTextureDimRef.current?.(reportedMaxTex);
+    }
 
     return () => {
+      if (pendingRafRef.current !== null) {
+        window.cancelAnimationFrame(pendingRafRef.current);
+        pendingRafRef.current = null;
+      }
       canvas.removeEventListener('webglcontextlost', handleContextLost);
       observer.disconnect();
       pipelineRef.current = null;
@@ -2342,15 +2474,17 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
       if (workingBuffer.width > 0 && workingBuffer.height > 0) {
         onNaturalSizeRef.current?.(workingBuffer.width, workingBuffer.height);
       }
-      renderFrame();
+      scheduleRender();
       setTextureVersion((v) => v + 1);
     } catch {
       // Keep the already-displayed 8-bit preview cleanly if driver rejects half-float upload
     }
   }, [workingBuffer, fallbackMode]);
 
-  // Upload 8-bit preview/source photo texture immediately when `src` changes
+  // Upload 8-bit preview/source photo texture immediately when `src` changes using the shared
+  // downscaled ImageBitmap LRU cache (synchronous hit for pre-decoded neighbors, zero flash on 1:1 upgrade).
   const hasActiveHalfFloat = workingBuffer !== null;
+  const clampedPreviewMaxDim = Math.min(8192, Math.max(640, previewMaxDim));
   useEffect(() => {
     if (fallbackMode) return;
     const pipeline = pipelineRef.current;
@@ -2358,59 +2492,74 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
     if (hasActiveHalfFloat && pipeline.isWebGl2) return;
 
     let cancelled = false;
-    textureReadyRef.current = false;
 
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.decoding = 'async';
-    img.onload = () => {
+    const uploadCachedBitmap = (entry: CachedDevelopBitmap) => {
       if (cancelled || !pipelineRef.current) return;
-      sourceImgRef.current = img;
       if (workingBufferRef.current && pipelineRef.current.isWebGl2) return;
       try {
+        sourceBitmapRef.current = entry;
+        loadedSrcRef.current = src;
         const { gl, imageTex } = pipelineRef.current;
         const maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
-        if (img.naturalWidth > maxTexSize || img.naturalHeight > maxTexSize) {
+        if (entry.width > maxTexSize || entry.height > maxTexSize) {
           setFallbackMode(true);
           return;
         }
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, imageTex);
         gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
-        imgSizeRef.current = { w: img.naturalWidth, h: img.naturalHeight };
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, entry.bitmap);
+        imgSizeRef.current = { w: entry.width, h: entry.height };
         inputLinearRef.current = false;
         inputWideGamutRef.current = false;
         textureReadyRef.current = true;
-        if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-          onNaturalSizeRef.current?.(img.naturalWidth, img.naturalHeight);
+        if (entry.naturalWidth > 0 && entry.naturalHeight > 0) {
+          onNaturalSizeRef.current?.(entry.naturalWidth, entry.naturalHeight);
         }
-        renderFrame();
+        scheduleRender();
         setTextureVersion((v) => v + 1);
       } catch {
         setFallbackMode(true);
       }
     };
-    img.onerror = () => {
-      if (!cancelled) {
+
+    const syncHit = peekDevelopBitmap(src, clampedPreviewMaxDim);
+    if (syncHit) {
+      uploadCachedBitmap(syncHit);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (loadedSrcRef.current !== src) {
+      textureReadyRef.current = false;
+    }
+    void loadDevelopBitmap(src, clampedPreviewMaxDim).then((entry) => {
+      if (cancelled) return;
+      if (!entry) {
         setFallbackMode(true);
+        return;
       }
-    };
-    img.src = src;
+      uploadCachedBitmap(entry);
+    });
 
     return () => {
       cancelled = true;
     };
-  }, [src, hasActiveHalfFloat, fallbackMode]);
+  }, [src, hasActiveHalfFloat, fallbackMode, clampedPreviewMaxDim]);
 
-  // Redraw immediately on any slider/recipe/mask/clipping/crop/texture/fit change (< 1ms on GPU)
+  // Coalesce redraws on any slider/recipe/mask/clipping/crop/texture/viewport change to at most one GPU pass per display frame
   useEffect(() => {
     if (!fallbackMode) {
-      renderFrame();
+      scheduleRender();
     }
   }, [
     recipe,
     fit,
+    viewportZoom,
+    viewportPan.x,
+    viewportPan.y,
+    viewportPadPx,
     applyCrop,
     showShadowClip,
     showHighlightClip,
@@ -2490,7 +2639,6 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
       role="img"
       aria-label={alt}
       onClick={handleCanvasClick}
-      style={{ transform: transformStyle }}
       className={`block w-full h-full ${eyedropperActive || colorPickActive ? 'cursor-crosshair' : ''} ${className}`}
     />
   );

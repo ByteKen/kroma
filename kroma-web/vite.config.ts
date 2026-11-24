@@ -16,6 +16,36 @@ export default defineConfig({
       ignored: ['**/internal/**', '**/kroma-tau/**', '**/target/**'],
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined;
+          if (
+            id.includes('/node_modules/react/') ||
+            id.includes('/node_modules/react-dom/') ||
+            id.includes('/node_modules/scheduler/') ||
+            id.includes('\\node_modules\\react\\') ||
+            id.includes('\\node_modules\\react-dom\\') ||
+            id.includes('\\node_modules\\scheduler\\')
+          ) {
+            return 'vendor-react';
+          }
+          if (
+            id.includes('framer-motion') ||
+            id.includes('motion-dom') ||
+            id.includes('motion-utils')
+          ) {
+            return 'vendor-motion';
+          }
+          if (id.includes('@tauri-apps')) {
+            return 'vendor-tauri';
+          }
+          return undefined;
+        },
+      },
+    },
+  },
   test: {
     environment: 'node',
     include: ['../tests/web/**/*.test.ts', 'src/**/*.test.ts'],

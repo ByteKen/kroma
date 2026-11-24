@@ -4,6 +4,26 @@ All notable changes to **Kroma** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-24
+
+### Added
+- **Single Photo Mode & Direct File Opening (`Ctrl+Shift+O`):** Open an individual photo or custom file selection directly from the Start Screen without scanning an entire shoot folder. When editing a single photo, Kroma automatically focuses the workspace on Studio Develop and Export—hiding Face Organizer, Slate OCR, filmstrip, and batch sync controls—with a one-click **Open Parent Folder** shortcut whenever you want to expand into the full shoot.
+- **Full-Stage Darkroom Canvas & Free-Form GPU Zoom/Pan:** Replaced clipped frame-box zoom with an edge-to-edge full-stage GPU viewport across Single, Split Wipe, and Side-by-Side (`Y|Y`) modes. Zoom smoothly toward the cursor with `Ctrl+Scroll` / `Cmd+Scroll`, double-click or press `Z` to toggle `Fit ↔ 100% (1:1)`, pan freely in 2D across the stage, and automatically upgrade zoomed details to crisp 4K+ resolution on demand (`4096px` in Single loupe, `3072px` in dual compare) with bounded memory.
+- **Unified Start Screen Action Card:** Combined **Open Folder** (`Ctrl+O`) and **Open Photo(s)** (`Ctrl+Shift+O`) into a single viewfinder action card on the Welcome screen.
+- **Project Community Templates & Contributing Guide:** Added Kroma-specific GitHub bug report and feature request forms, PR template, and `CONTRIBUTING.md` guidelines.
+
+### Changed
+- **120 Hz Zero-Lag Develop Scrubbing & Fast Present Path:** Decoupled live slider, curve, color-wheel, crop, and brush drags into an external store (`liveDevelopDraftStore`) to eliminate full-shell React re-renders during adjustments, and split WebGPU rendering into a present-only fast path (~0.2 ms/frame) so panning, zooming, and clipping toggles skip heavy compute passes.
+- **Faster JPEG/PNG Browsing & Tab Switching:** Added a bounded LRU `ImageBitmap` cache with neighbor pre-decoding (`developBitmapCache`) for instant JPEG switching, plus cached `1024px` web preview proxies (`>= 300 KB`) and virtualized review queues to eliminate FPS drops when switching workspaces.
+- **Faster Batch Exports & Lower Memory Churn:** Added GPU texture, uniform, staging-buffer, and 3D LUT pooling plus parallel Rayon pack/unpack in the `wgpu` export engine, cached `.cube` LUT parsing, parallel Rayon area-averaging preview downscaling, cached 384 px RAM histogram proxies for JPEG/PNG photos, and release-profile optimizations (`lto = "thin"`, `codegen-units = 1`, symbol stripping).
+- **Leaner Frontend Bundle (-3.9 MB):** Subsetted the bundled offline Material Symbols icon font from `4,026 kB` to `11.19 kB` (-99.7%) with an automated Vitest manifest check, and split React, Framer Motion, and Tauri runtime chunks in Vite.
+- **Clean Sidecar Storage for Downloads & Desktop:** Kept single-photo `.kroma.json` sidecars inside Kroma's managed app-data directory when opening standalone files from shared folders like Downloads or Desktop so personal folders stay uncluttered.
+
+### Fixed
+- **Batch Export CPU & RAM Spikes:** Bounded export worker concurrency and recycled `wgpu` scratch resources to eliminate memory surges during large multi-photo exports.
+- **Deep-Zoom WebGPU Stability:** Added 512-row chunked WebGPU texture uploads (`<= 16 MB` per transfer), automatic `device.lost` recovery, and async OOM/validation error scopes so zooming deeply on high-megapixel RAW files never blanks the viewport.
+- **Virtualized Grid Scroll Jitter:** Quantized virtual grid/strip/list scroll ranges via `requestAnimationFrame` and memoized photo cluster cards for steady scrolling across large shoots.
+
 ## [0.1.2] - 2026-11-23
 
 ### Added
