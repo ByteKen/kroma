@@ -9,6 +9,9 @@ use kroma_domain::masking::{
     AiMaskKind, BackgroundRemoval, BackgroundReplaceMode, BrushStroke, LocalAdjustments,
     MaskCombineOp, MaskComponent, MaskLayer,
 };
+use kroma_domain::retouch::{
+    FaceParseMap, HealSpot, HealSpotMode, InpaintPatch, PortraitRetouch, RetouchSettings,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +76,14 @@ pub struct RuntimeStatusDto {
     pub default_segmenter_model_label: String,
     pub is_custom_segmenter: bool,
     pub segmenter_models_ready: bool,
+    pub face_parser_model_path: Option<String>,
+    pub face_parser_model_label: String,
+    pub is_custom_face_parser: bool,
+    pub face_parser_ready: bool,
+    pub lama_model_path: Option<String>,
+    pub lama_model_label: String,
+    pub is_custom_lama: bool,
+    pub lama_ready: bool,
     pub supported_raw_count: usize,
     pub backend_label: String,
     pub develop_gpu_backend_label: String,
@@ -700,6 +711,277 @@ impl From<BackgroundRemovalDto> for BackgroundRemoval {
     }
 }
 
+fn default_heal_mode() -> String {
+    "heal".to_string()
+}
+
+fn default_heal_radius() -> f32 {
+    0.018
+}
+
+fn default_heal_feather() -> f32 {
+    0.55
+}
+
+fn default_one_f32() -> f32 {
+    1.0
+}
+
+fn default_seventy_u8() -> u8 {
+    70
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealSpotDto {
+    pub id: String,
+    #[serde(default = "default_heal_mode")]
+    pub mode: String,
+    pub target_x: f32,
+    pub target_y: f32,
+    pub source_x: f32,
+    pub source_y: f32,
+    #[serde(default = "default_heal_radius")]
+    pub radius: f32,
+    #[serde(default = "default_heal_feather")]
+    pub feather: f32,
+    #[serde(default = "default_one_f32")]
+    pub opacity: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<[f32; 2]>,
+}
+
+impl From<&HealSpot> for HealSpotDto {
+    fn from(s: &HealSpot) -> Self {
+        Self {
+            id: s.id.clone(),
+            mode: s.mode.as_str().to_string(),
+            target_x: s.target_x,
+            target_y: s.target_y,
+            source_x: s.source_x,
+            source_y: s.source_y,
+            radius: s.radius,
+            feather: s.feather,
+            opacity: s.opacity,
+            points: s.points.clone(),
+        }
+    }
+}
+
+impl From<HealSpotDto> for HealSpot {
+    fn from(d: HealSpotDto) -> Self {
+        Self {
+            id: d.id,
+            mode: HealSpotMode::parse(&d.mode),
+            target_x: d.target_x,
+            target_y: d.target_y,
+            source_x: d.source_x,
+            source_y: d.source_y,
+            radius: d.radius,
+            feather: d.feather,
+            opacity: d.opacity,
+            points: d.points,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortraitRetouchDto {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub skin_smoothing: u8,
+    #[serde(default = "default_seventy_u8")]
+    pub skin_texture_preserve: u8,
+    #[serde(default)]
+    pub skin_tone_evenness: u8,
+    #[serde(default)]
+    pub shine_removal: u8,
+    #[serde(default)]
+    pub under_eye_brighten: u8,
+    #[serde(default)]
+    pub eye_enhance: u8,
+    #[serde(default)]
+    pub teeth_whiten: u8,
+    #[serde(default)]
+    pub lip_enhance: u8,
+}
+
+impl Default for PortraitRetouchDto {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            skin_smoothing: 0,
+            skin_texture_preserve: 70,
+            skin_tone_evenness: 0,
+            shine_removal: 0,
+            under_eye_brighten: 0,
+            eye_enhance: 0,
+            teeth_whiten: 0,
+            lip_enhance: 0,
+        }
+    }
+}
+
+impl From<&PortraitRetouch> for PortraitRetouchDto {
+    fn from(p: &PortraitRetouch) -> Self {
+        Self {
+            enabled: p.enabled,
+            skin_smoothing: p.skin_smoothing,
+            skin_texture_preserve: p.skin_texture_preserve,
+            skin_tone_evenness: p.skin_tone_evenness,
+            shine_removal: p.shine_removal,
+            under_eye_brighten: p.under_eye_brighten,
+            eye_enhance: p.eye_enhance,
+            teeth_whiten: p.teeth_whiten,
+            lip_enhance: p.lip_enhance,
+        }
+    }
+}
+
+impl From<PortraitRetouchDto> for PortraitRetouch {
+    fn from(d: PortraitRetouchDto) -> Self {
+        Self {
+            enabled: d.enabled,
+            skin_smoothing: d.skin_smoothing,
+            skin_texture_preserve: d.skin_texture_preserve,
+            skin_tone_evenness: d.skin_tone_evenness,
+            shine_removal: d.shine_removal,
+            under_eye_brighten: d.under_eye_brighten,
+            eye_enhance: d.eye_enhance,
+            teeth_whiten: d.teeth_whiten,
+            lip_enhance: d.lip_enhance,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InpaintPatchDto {
+    pub id: String,
+    pub bounds: CropRectDto,
+    pub patch_width: u16,
+    pub patch_height: u16,
+    #[serde(default = "default_one_f32")]
+    pub opacity: f32,
+    #[serde(default)]
+    pub mask_rle_b64: String,
+    #[serde(default)]
+    pub patch_image_b64: String,
+    #[serde(default)]
+    pub engine_label: String,
+}
+
+impl From<&InpaintPatch> for InpaintPatchDto {
+    fn from(p: &InpaintPatch) -> Self {
+        Self {
+            id: p.id.clone(),
+            bounds: CropRectDto {
+                left: p.bounds.left,
+                top: p.bounds.top,
+                width: p.bounds.width,
+                height: p.bounds.height,
+            },
+            patch_width: p.patch_width,
+            patch_height: p.patch_height,
+            opacity: p.opacity,
+            mask_rle_b64: p.mask_rle_b64.clone(),
+            patch_image_b64: p.patch_image_b64.clone(),
+            engine_label: p.engine_label.clone(),
+        }
+    }
+}
+
+impl From<InpaintPatchDto> for InpaintPatch {
+    fn from(d: InpaintPatchDto) -> Self {
+        let mut out = Self {
+            id: d.id,
+            bounds: NormalizedRect {
+                left: d.bounds.left,
+                top: d.bounds.top,
+                width: d.bounds.width,
+                height: d.bounds.height,
+            },
+            patch_width: d.patch_width,
+            patch_height: d.patch_height,
+            opacity: d.opacity,
+            mask_rle_b64: d.mask_rle_b64,
+            patch_image_b64: d.patch_image_b64,
+            engine_label: d.engine_label,
+        };
+        out.clamp_invariants();
+        out
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InpaintStrokeDto {
+    pub radius: f32,
+    pub points: Vec<[f32; 2]>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedInpaintPatchDto {
+    pub patch: InpaintPatchDto,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaceParseMapDto {
+    pub width: u16,
+    pub height: u16,
+    pub rgba_b64: String,
+    pub engine_label: String,
+    pub elapsed_ms: u64,
+}
+
+impl FaceParseMapDto {
+    pub fn from_map(map: &FaceParseMap, engine_label: String, elapsed_ms: u64) -> Self {
+        Self {
+            width: map.width,
+            height: map.height,
+            rgba_b64: kroma_domain::masking::base64_encode(&map.rgba),
+            engine_label,
+            elapsed_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RetouchSettingsDto {
+    #[serde(default)]
+    pub heal_spots: Vec<HealSpotDto>,
+    #[serde(default)]
+    pub inpaint_patches: Vec<InpaintPatchDto>,
+    #[serde(default)]
+    pub portrait: PortraitRetouchDto,
+}
+
+impl From<&RetouchSettings> for RetouchSettingsDto {
+    fn from(r: &RetouchSettings) -> Self {
+        Self {
+            heal_spots: r.heal_spots.iter().map(Into::into).collect(),
+            inpaint_patches: r.inpaint_patches.iter().map(Into::into).collect(),
+            portrait: (&r.portrait).into(),
+        }
+    }
+}
+
+impl From<RetouchSettingsDto> for RetouchSettings {
+    fn from(d: RetouchSettingsDto) -> Self {
+        Self {
+            heal_spots: d.heal_spots.into_iter().map(Into::into).collect(),
+            inpaint_patches: d.inpaint_patches.into_iter().map(Into::into).collect(),
+            portrait: d.portrait.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DevelopRecipeDto {
@@ -719,6 +1001,8 @@ pub struct DevelopRecipeDto {
     pub masks: Vec<MaskLayerDto>,
     #[serde(default)]
     pub background_removal: BackgroundRemovalDto,
+    #[serde(default)]
+    pub retouch: RetouchSettingsDto,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -738,6 +1022,10 @@ pub struct DevelopSyncMaskDto {
     pub crop_transform: bool,
     #[serde(default)]
     pub masks: bool,
+    #[serde(default)]
+    pub portrait_retouch: bool,
+    #[serde(default)]
+    pub heal_spots: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1414,6 +1702,7 @@ impl From<&DevelopRecipe> for DevelopRecipeDto {
             },
             masks: r.masks.iter().map(Into::into).collect(),
             background_removal: (&r.background_removal).into(),
+            retouch: (&r.retouch).into(),
         }
     }
 }
@@ -1507,6 +1796,7 @@ impl DevelopRecipeDto {
             },
             masks: self.masks.into_iter().map(Into::into).collect(),
             background_removal: self.background_removal.into(),
+            retouch: self.retouch.into(),
         };
         recipe.clamp_all_invariants();
         recipe
@@ -1526,6 +1816,8 @@ impl From<DevelopSyncMaskDto> for DevelopSyncMask {
             sync_detail_optics: m.detail_optics,
             sync_crop_transform: m.crop_transform,
             sync_masks: m.masks,
+            sync_portrait_retouch: m.portrait_retouch,
+            sync_heal_spots: m.heal_spots,
         }
     }
 }

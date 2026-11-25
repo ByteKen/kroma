@@ -1,5 +1,6 @@
 import { memo, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { recipeToCssFilter, type DevelopRecipe } from '../../domain/develop';
+import type { YuNetFaceOverlay } from '../../domain/photo';
 import {
   buildToneCurveLutRgba,
   compileDevelopShaderUniforms,
@@ -23,6 +24,16 @@ import {
   type CompiledWebGlMaskData,
   type MaskLayer,
 } from '../../domain/masking';
+import {
+  decodeInpaintPatchRgba,
+  faceOverlayToOrientedGuide,
+  hasEffectiveHealSpots,
+  hydrateRetouchSettings,
+  isInpaintPatchEffective,
+  isPortraitRetouchActive,
+  type FaceParseMapData,
+  type InpaintPatch,
+} from '../../domain/retouch';
 import { isToneCurveModified, sampleToneCurveSvgTableValues } from '../../domain/toneCurve';
 import {
   loadDevelopBitmap,
@@ -34,6 +45,8 @@ interface WebGlDevelopCanvasProps {
   readonly src: string;
   readonly alt: string;
   readonly recipe: DevelopRecipe;
+  readonly faceOverlay?: YuNetFaceOverlay | null;
+  readonly faceParseMap?: FaceParseMapData | null;
   /** Optional 16-bit half-float working buffer (`RGBA16F`) decoded directly from Camera RAW / 16-bit TIFF/PNG. */
   readonly workingBuffer?: DevelopWorkingBuffer | null;
   readonly previewMaxDim?: number;
@@ -1184,6 +1197,465 @@ void main() {
 }
 `;
 
+// Pass 1a-0 (WebGL2 Fallback): Generative Inpaint Patch Composite mirroring `shaders/develop/inpaint_pass.wgsl`.
+const INPAINT_FRAGMENT_SHADER_SRC = `
+precision highp float;
+
+uniform sampler2D u_prevImage;
+uniform sampler2D u_patchTex;
+uniform vec4 u_bounds; // (left, top, width, height) in oriented full-frame [0..1]
+uniform float u_opacity;
+
+varying vec2 v_texCoord;
+
+vec3 sampleSrcClamp(vec2 uv) {
+  return texture2D(u_prevImage, clamp(uv, vec2(0.0), vec2(1.0))).rgb;
+}
+
+void main() {
+  vec2 uv = v_texCoord;
+  vec4 centerPx = texture2D(u_prevImage, uv);
+  float lu = (uv.x - u_bounds.x) / max(u_bounds.z, 1e-6);
+  float lv = (uv.y - u_bounds.y) / max(u_bounds.w, 1e-6);
+  if (lu < 0.0 || lu > 1.0 || lv < 0.0 || lv > 1.0) {
+    gl_FragColor = centerPx;
+    return;
+  }
+
+  vec4 patchSample = texture2D(u_patchTex, vec2(lu, lv));
+  float alpha = clamp(patchSample.a * u_opacity, 0.0, 1.0);
+  if (alpha <= 1e-5) {
+    gl_FragColor = centerPx;
+    return;
+  }
+
+  vec3 shiftSum = vec3(0.0);
+  float wSum = 0.0;
+  for (int k = 0; k < 8; k++) {
+    vec2 tap = vec2(0.02, 0.02);
+    if (k == 1) tap = vec2(0.50, 0.02);
+    else if (k == 2) tap = vec2(0.98, 0.02);
+    else if (k == 3) tap = vec2(0.98, 0.50);
+    else if (k == 4) tap = vec2(0.98, 0.98);
+    else if (k == 5) tap = vec2(0.50, 0.98);
+    else if (k == 6) tap = vec2(0.02, 0.98);
+    else if (k == 7) tap = vec2(0.02, 0.50);
+
+    vec4 pTap = texture2D(u_patchTex, tap);
+    float borderW = 1.0 - clamp(pTap.a * 4.0, 0.0, 1.0);
+    if (borderW > 0.05) {
+      vec2 tapUv = vec2(u_bounds.x + tap.x * u_bounds.z, u_bounds.y + tap.y * u_bounds.w);
+      vec3 liveRgb = sampleSrcClamp(tapUv);
+      vec2 d = vec2(lu - tap.x, lv - tap.y);
+      float invW = borderW / (dot(d, d) + 0.12);
+      shiftSum += (liveRgb - pTap.rgb) * invW;
+      wSum += invW;
+    }
+  }
+
+  vec3 adaptedPatch = patchSample.rgb;
+  if (wSum > 1e-5) {
+    vec3 shift = clamp(shiftSum / wSum, vec3(-0.30), vec3(0.30));
+    adaptedPatch = clamp(patchSample.rgb + shift, vec3(0.0), vec3(1.0));
+  }
+
+  vec3 outRgb = mix(centerPx.rgb, adaptedPatch, alpha);
+  gl_FragColor = vec4(clamp(outRgb, vec3(0.0), vec3(1.0)), centerPx.a);
+}
+`;
+
+// Pass 1a-1 (WebGL2 Fallback): Spot Heal & Clone pass mirroring `shaders/develop/heal_pass.wgsl`.
+const MAX_GL_HEAL_SLOTS = 24;
+const HEAL_FRAGMENT_SHADER_SRC = `
+precision highp float;
+
+uniform sampler2D u_prevImage;
+uniform vec2 u_oriDims;
+uniform float u_slotCount;
+uniform vec4 u_spotGeom[${MAX_GL_HEAL_SLOTS}];   // (deltaU, deltaV, radiusNorm, feather)
+uniform vec4 u_spotParams[${MAX_GL_HEAL_SLOTS}]; // (opacity, mode: 0=heal 1=clone, 0, 0)
+uniform vec4 u_spotSeg[${MAX_GL_HEAL_SLOTS}];    // (ax, ay, bx, by)
+
+varying vec2 v_texCoord;
+
+float kSmoothstep(float edge0, float edge1, float x) {
+  float t = clamp((x - edge0) / max(edge1 - edge0, 1e-6), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+vec3 pointToSegmentInfo(vec2 uv, vec2 a, vec2 b, vec2 scaleUv) {
+  vec2 pS = uv * scaleUv;
+  vec2 aS = a * scaleUv;
+  vec2 bS = b * scaleUv;
+  vec2 ab = bS - aS;
+  float lenSq = dot(ab, ab);
+  float t = lenSq > 1e-10 ? clamp(dot(pS - aS, ab) / lenSq, 0.0, 1.0) : 0.0;
+  vec2 qUv = mix(a, b, t);
+  float dist = length((uv - qUv) * scaleUv);
+  return vec3(dist, qUv.x, qUv.y);
+}
+
+vec3 sampleClamp(vec2 uv) {
+  return texture2D(u_prevImage, clamp(uv, vec2(0.0), vec2(1.0))).rgb;
+}
+
+void main() {
+  vec2 uv = v_texCoord;
+  vec4 centerPx = texture2D(u_prevImage, uv);
+  vec3 rgb = centerPx.rgb;
+
+  float oriW = max(u_oriDims.x, 1.0);
+  float oriH = max(u_oriDims.y, 1.0);
+  float minSide = min(oriW, oriH);
+  vec2 scaleUv = vec2(oriW / minSide, oriH / minSide);
+  vec2 invScaleUv = vec2(minSide / oriW, minSide / oriH);
+
+  for (int i = 0; i < ${MAX_GL_HEAL_SLOTS}; i++) {
+    if (float(i) >= u_slotCount) break;
+    vec4 geom = u_spotGeom[i];
+    vec4 params = u_spotParams[i];
+    vec4 seg = u_spotSeg[i];
+
+    float radius = geom.z;
+    float feather = geom.w;
+    vec3 info = pointToSegmentInfo(uv, seg.xy, seg.zw, scaleUv);
+    if (info.x >= radius) continue;
+
+    float mask = 1.0;
+    if (feather > 1e-4) {
+      float innerR = radius * (1.0 - feather * 0.85);
+      mask = 1.0 - kSmoothstep(innerR, radius, info.x);
+    }
+    float alpha = clamp(mask * params.x, 0.0, 1.0);
+    if (alpha <= 1e-5) continue;
+
+    vec2 delta = geom.xy;
+    vec3 donorRgb = sampleClamp(uv + delta);
+    vec3 patchRgb = donorRgb;
+
+    if (params.y <= 0.5) {
+      vec2 closestUv = info.yz;
+      float ringR = radius * 1.28;
+      float regEps = 0.18 * radius * radius;
+      vec3 shiftSum = vec3(0.0);
+      float wSum = 0.0;
+
+      for (int d = 0; d < 8; d++) {
+        float ang = float(d) * 0.78539816;
+        vec2 dir = vec2(cos(ang), sin(ang));
+        vec2 ringDstUv = closestUv + dir * ringR * invScaleUv;
+        vec2 ringSrcUv = ringDstUv + delta;
+        vec3 dstRingCol = sampleClamp(ringDstUv);
+        vec3 srcRingCol = sampleClamp(ringSrcUv);
+        vec2 pToRing = (uv - ringDstUv) * scaleUv;
+        float invDistW = 1.0 / (dot(pToRing, pToRing) + regEps);
+        shiftSum += (dstRingCol - srcRingCol) * invDistW;
+        wSum += invDistW;
+      }
+
+      if (wSum > 1e-6) {
+        vec3 shift = clamp(shiftSum / wSum, vec3(-0.35), vec3(0.35));
+        patchRgb = clamp(donorRgb + shift, vec3(0.0), vec3(1.0));
+      }
+    }
+
+    rgb = mix(rgb, patchRgb, alpha);
+  }
+
+  gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), centerPx.a);
+}
+`;
+
+// Pass 1a-2 (WebGL2 Fallback): 3-Band Frequency-Separation & Landmark-Guided Portrait Retouch
+// mirroring `shaders/develop/portrait_retouch_pass.wgsl`.
+const PORTRAIT_RETOUCH_FRAGMENT_SHADER_SRC = `
+precision highp float;
+
+uniform sampler2D u_prevImage;
+uniform sampler2D u_faceParseTex;
+uniform vec2 u_texelSize;
+uniform vec2 u_oriDims;
+uniform vec4 u_meta;          // (spatialScale, hasFace, hasFaceParse, 0)
+uniform vec4 u_skinParams;    // (skinSmooth, texPreserve, toneEven, shineRemoval)
+uniform vec4 u_featureParams; // (underEye, eyeEnhance, teethWhiten, lipEnhance)
+uniform vec4 u_faceEyes;      // (rightEyeU, rightEyeV, leftEyeU, leftEyeV)
+uniform vec4 u_faceNose;      // (noseU, noseV, 0, 0)
+uniform vec4 u_faceMouth;     // (rightMouthU, rightMouthV, leftMouthU, leftMouthV)
+
+varying vec2 v_texCoord;
+
+float kSmoothstep(float edge0, float edge1, float x) {
+  float t = clamp((x - edge0) / max(edge1 - edge0, 1e-6), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+float luma709(vec3 c) {
+  return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+}
+
+vec3 sampleClamp(vec2 uv) {
+  return texture2D(u_prevImage, clamp(uv, vec2(0.0), vec2(1.0))).rgb;
+}
+
+float ycbcrSkinProbability(vec3 rgb) {
+  float y = 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+  float cb = 0.5 - 0.168736 * rgb.r - 0.331264 * rgb.g + 0.5 * rgb.b;
+  float cr = 0.5 + 0.5 * rgb.r - 0.418688 * rgb.g - 0.081312 * rgb.b;
+  float yGate = kSmoothstep(0.06, 0.16, y) * (1.0 - kSmoothstep(0.95, 0.995, y));
+  float cbGate = kSmoothstep(0.24, 0.32, cb) * (1.0 - kSmoothstep(0.49, 0.55, cb));
+  float crGate = kSmoothstep(0.505, 0.54, cr) * (1.0 - kSmoothstep(0.70, 0.76, cr));
+  float warmthGate = kSmoothstep(-0.015, 0.035, rgb.r - rgb.b);
+  return clamp(yGate * cbGate * crGate * warmthGate, 0.0, 1.0);
+}
+
+float rotatedEllipseMask(vec2 p, vec2 center, vec2 ax, vec2 ay, float rx, float ry, float innerRatio) {
+  vec2 d = p - center;
+  float lx = dot(d, ax) / max(rx, 1e-5);
+  float ly = dot(d, ay) / max(ry, 1e-5);
+  float r = sqrt(lx * lx + ly * ly);
+  return 1.0 - kSmoothstep(innerRatio, 1.0, r);
+}
+
+void main() {
+  vec2 uv = v_texCoord;
+  vec4 center = texture2D(u_prevImage, uv);
+  vec3 rgb = center.rgb;
+
+  float skinSmooth = u_skinParams.x;
+  float skinTexPreserve = u_skinParams.y;
+  float skinEven = u_skinParams.z;
+  float shineAmt = u_skinParams.w;
+
+  float underEyeAmt = u_featureParams.x;
+  float eyeAmt = u_featureParams.y;
+  float teethAmt = u_featureParams.z;
+  float lipAmt = u_featureParams.w;
+
+  bool anySkin = skinSmooth > 1e-4 || skinEven > 1e-4 || shineAmt > 1e-4;
+  bool anyFeature = underEyeAmt > 1e-4 || eyeAmt > 1e-4 || teethAmt > 1e-4 || lipAmt > 1e-4;
+  if (!anySkin && !anyFeature) {
+    gl_FragColor = center;
+    return;
+  }
+
+  float oriW = max(u_oriDims.x, 1.0);
+  float oriH = max(u_oriDims.y, 1.0);
+  float minSide = min(oriW, oriH);
+  vec2 scaleUv = vec2(oriW / minSide, oriH / minSide);
+  vec2 pS = uv * scaleUv;
+
+  float hasFace = u_meta.y;
+  float faceEnv = 0.0;
+  float featureProtect = 0.0;
+  float underEyeMask = 0.0;
+  float eyeMask = 0.0;
+  float mouthMask = 0.0;
+
+  if (hasFace > 0.5) {
+    vec2 rEye = u_faceEyes.xy * scaleUv;
+    vec2 lEye = u_faceEyes.zw * scaleUv;
+    vec2 nose = u_faceNose.xy * scaleUv;
+    vec2 rMouth = u_faceMouth.xy * scaleUv;
+    vec2 lMouth = u_faceMouth.zw * scaleUv;
+
+    vec2 eVec = lEye - rEye;
+    float eyeDist = max(length(eVec), 0.02);
+    vec2 ax = length(eVec) > 1e-4 ? eVec / eyeDist : vec2(1.0, 0.0);
+    vec2 ay = vec2(-ax.y, ax.x);
+    vec2 eyeMid = 0.5 * (rEye + lEye);
+    vec2 mouthMid = 0.5 * (rMouth + lMouth);
+    if (dot(mouthMid - eyeMid, ay) < 0.0) {
+      ay = -ay;
+    }
+
+    vec2 faceCenter = eyeMid + ay * (0.28 * eyeDist);
+    float fHead = rotatedEllipseMask(pS, faceCenter, ax, ay, 1.32 * eyeDist, 1.72 * eyeDist, 0.52);
+    vec2 neckCenter = eyeMid + ay * (1.65 * eyeDist);
+    float fNeck = rotatedEllipseMask(pS, neckCenter, ax, ay, 1.02 * eyeDist, 1.05 * eyeDist, 0.35);
+    faceEnv = max(fHead, fNeck * 0.85);
+
+    float rEyeProt = rotatedEllipseMask(pS, rEye, ax, ay, 0.28 * eyeDist, 0.16 * eyeDist, 0.45);
+    float lEyeProt = rotatedEllipseMask(pS, lEye, ax, ay, 0.28 * eyeDist, 0.16 * eyeDist, 0.45);
+    float rBrowProt = rotatedEllipseMask(pS, rEye - ay * (0.24 * eyeDist), ax, ay, 0.32 * eyeDist, 0.12 * eyeDist, 0.4);
+    float lBrowProt = rotatedEllipseMask(pS, lEye - ay * (0.24 * eyeDist), ax, ay, 0.32 * eyeDist, 0.12 * eyeDist, 0.4);
+    float noseProt = rotatedEllipseMask(pS, nose, ax, ay, 0.15 * eyeDist, 0.11 * eyeDist, 0.4);
+
+    vec2 mVec = lMouth - rMouth;
+    float mouthW = max(length(mVec), eyeDist * 0.55);
+    vec2 mAx = length(mVec) > 1e-4 ? mVec / length(mVec) : ax;
+    vec2 mAy = vec2(-mAx.y, mAx.x);
+    if (dot(mAy, ay) < 0.0) {
+      mAy = -mAy;
+    }
+    float mProt = rotatedEllipseMask(pS, mouthMid, mAx, mAy, 0.58 * mouthW, 0.25 * mouthW, 0.45);
+    featureProtect = max(max(rEyeProt, lEyeProt), max(max(rBrowProt, lBrowProt), max(noseProt, mProt)));
+
+    float rEyeM = rotatedEllipseMask(pS, rEye, ax, ay, 0.24 * eyeDist, 0.12 * eyeDist, 0.35);
+    float lEyeM = rotatedEllipseMask(pS, lEye, ax, ay, 0.24 * eyeDist, 0.12 * eyeDist, 0.35);
+    eyeMask = max(rEyeM, lEyeM);
+
+    float rUe = rotatedEllipseMask(pS, rEye + ay * (0.22 * eyeDist), ax, ay, 0.36 * eyeDist, 0.14 * eyeDist, 0.25) * (1.0 - rEyeProt);
+    float lUe = rotatedEllipseMask(pS, lEye + ay * (0.22 * eyeDist), ax, ay, 0.36 * eyeDist, 0.14 * eyeDist, 0.25) * (1.0 - lEyeProt);
+    underEyeMask = max(rUe, lUe);
+
+    mouthMask = rotatedEllipseMask(pS, mouthMid, mAx, mAy, 0.50 * mouthW, 0.22 * mouthW, 0.35);
+  }
+
+  float skinProb = ycbcrSkinProbability(rgb);
+  float hasFaceParse = u_meta.z;
+  float skinMask = hasFace > 0.5 ? skinProb * faceEnv * (1.0 - featureProtect * 0.92) : skinProb * 0.85;
+  float teethMask = mouthMask;
+  float lipMask = mouthMask;
+
+  if (hasFaceParse > 0.5) {
+    vec4 fp = texture2D(u_faceParseTex, uv);
+    skinMask = clamp(fp.r, 0.0, 1.0);
+    eyeMask = clamp(fp.g, 0.0, 1.0);
+    teethMask = clamp(fp.b, 0.0, 1.0);
+    lipMask = clamp(fp.a, 0.0, 1.0);
+    underEyeMask = underEyeMask * clamp(fp.r * 1.15, 0.0, 1.0) * (1.0 - eyeMask);
+  }
+
+  bool needSpatialSkin = (anySkin && skinMask > 0.005) || (underEyeAmt > 1e-4 && underEyeMask > 0.005);
+  bool needFineDetail = needSpatialSkin || (eyeAmt > 1e-4 && eyeMask > 0.005) || (lipAmt > 1e-4 && lipMask > 0.005);
+  if (!needFineDetail && !(teethAmt > 1e-4 && teethMask > 0.005)) {
+    gl_FragColor = center;
+    return;
+  }
+
+  float scale = u_meta.x;
+  vec3 fineLow = rgb;
+  if (needFineDetail) {
+    vec2 rFine = u_texelSize * (1.15 * scale);
+    fineLow = (
+      rgb * 2.0
+      + sampleClamp(uv + vec2(-rFine.x, 0.0))
+      + sampleClamp(uv + vec2( rFine.x, 0.0))
+      + sampleClamp(uv + vec2(0.0, -rFine.y))
+      + sampleClamp(uv + vec2(0.0,  rFine.y))
+    ) / 6.0;
+  }
+  vec3 highFreqPores = rgb - fineLow;
+
+  vec3 lowFreq = rgb;
+  if (needSpatialSkin) {
+    vec2 r1 = u_texelSize * (2.6 * scale);
+    vec2 r2 = u_texelSize * (5.6 * scale);
+    float sigmaColor = 0.095 + 0.085 * max(skinSmooth, max(skinEven, underEyeAmt));
+    float inv2Sig2 = -0.5 / (sigmaColor * sigmaColor);
+    vec3 acc = rgb * 1.4;
+    float wSum = 1.4;
+    for (int k = 0; k < 8; k++) {
+      float ang = float(k) * 0.78539816;
+      vec2 dir = vec2(cos(ang), sin(ang));
+      vec3 s1 = sampleClamp(uv + dir * r1);
+      vec3 d1 = s1 - rgb;
+      float w1 = 0.85 * exp(dot(d1, d1) * inv2Sig2);
+      acc += s1 * w1;
+      wSum += w1;
+
+      vec3 s2 = sampleClamp(uv + dir * r2);
+      vec3 d2 = s2 - rgb;
+      float w2 = 0.55 * exp(dot(d2, d2) * inv2Sig2);
+      acc += s2 * w2;
+      wSum += w2;
+    }
+    lowFreq = acc / max(wSum, 1e-5);
+  }
+
+  vec3 midFreqBlotch = fineLow - lowFreq;
+
+  if (skinSmooth > 1e-4 && skinMask > 0.005) {
+    float poreKeep = mix(1.0 - skinSmooth * 0.55, 1.0, skinTexPreserve);
+    vec3 fsRgb = lowFreq + midFreqBlotch * (1.0 - skinSmooth * 0.88) + highFreqPores * poreKeep;
+    float blendW = clamp(skinMask * skinSmooth * 1.05, 0.0, 1.0);
+    rgb = mix(rgb, clamp(fsRgb, 0.0, 1.0), blendW);
+  }
+
+  if (skinEven > 1e-4 && skinMask > 0.005) {
+    float curL = luma709(rgb);
+    float lowL = luma709(lowFreq);
+    vec3 curChroma = rgb - vec3(curL);
+    vec3 lowChroma = lowFreq - vec3(lowL);
+    vec3 evenedChroma = mix(curChroma, lowChroma, skinMask * skinEven * 0.65);
+    float redSpike = max(0.0, (rgb.r - rgb.g) - (lowFreq.r - lowFreq.g) - 0.015);
+    vec3 evenRgb = vec3(curL) + evenedChroma;
+    evenRgb.r -= redSpike * skinMask * skinEven * 0.45;
+    evenRgb.g += redSpike * skinMask * skinEven * 0.14;
+    rgb = clamp(evenRgb, 0.0, 1.0);
+  }
+
+  if (shineAmt > 1e-4 && skinMask > 0.005) {
+    float curL = luma709(rgb);
+    float maxC = max(rgb.r, max(rgb.g, rgb.b));
+    float minC = min(rgb.r, min(rgb.g, rgb.b));
+    float sat = (maxC - minC) / max(maxC, 1e-4);
+    float specWeight = kSmoothstep(0.60, 0.86, curL) * (1.0 - kSmoothstep(0.14, 0.38, sat));
+    float lowL = luma709(lowFreq);
+    vec3 matteTarget = clamp(
+      vec3(lowL * 0.92) + (lowFreq - vec3(lowL)) * 1.18 + highFreqPores * 0.5,
+      0.0,
+      1.0
+    );
+    rgb = mix(rgb, matteTarget, clamp(skinMask * specWeight * shineAmt * 0.78, 0.0, 0.85));
+  }
+
+  if (underEyeAmt > 1e-4 && underEyeMask > 0.005) {
+    float ueW = underEyeMask * clamp(skinProb * 1.15, 0.0, 1.0) * underEyeAmt;
+    if (ueW > 1e-4) {
+      float curL = luma709(rgb);
+      float shadowLift = 0.115 * ueW * (1.0 - kSmoothstep(0.45, 0.88, curL));
+      vec3 softened = mix(rgb, lowFreq + highFreqPores * 0.75, clamp(ueW * 0.45, 0.0, 0.6));
+      rgb = clamp(softened + vec3(shadowLift * 1.06, shadowLift, shadowLift * 0.86), 0.0, 1.0);
+    }
+  }
+
+  if (eyeAmt > 1e-4 && eyeMask > 0.005) {
+    float eW = eyeMask * eyeAmt;
+    float curL = luma709(rgb);
+    float maxC = max(rgb.r, max(rgb.g, rgb.b));
+    float minC = min(rgb.r, min(rgb.g, rgb.b));
+    float sat = (maxC - minC) / max(maxC, 1e-4);
+    float scleraW = kSmoothstep(0.42, 0.72, curL) * (1.0 - kSmoothstep(0.10, 0.28, sat));
+    vec3 neutralWhite = mix(rgb, vec3(curL), scleraW * eW * 0.48) + vec3(0.065 * scleraW * eW * (1.0 - curL * 0.45));
+    float irisW = 1.0 - scleraW;
+    vec3 irisPop = highFreqPores * (eW * 1.15) + vec3(0.042 * irisW * eW * kSmoothstep(0.08, 0.45, curL));
+    rgb = clamp(neutralWhite + irisPop, 0.0, 1.0);
+  }
+
+  if (teethAmt > 1e-4 && teethMask > 0.005) {
+    float curL = luma709(rgb);
+    float maxC = max(rgb.r, max(rgb.g, rgb.b));
+    float minC = min(rgb.r, min(rgb.g, rgb.b));
+    float sat = (maxC - minC) / max(maxC, 1e-4);
+    float nonLipGate = 1.0 - kSmoothstep(0.06, 0.15, rgb.r - rgb.g);
+    float brightGate = kSmoothstep(0.32, 0.58, curL);
+    float satGate = 1.0 - kSmoothstep(0.24, 0.46, sat);
+    float teethW = teethMask * nonLipGate * brightGate * satGate * teethAmt;
+    if (teethW > 1e-4) {
+      vec3 desat = mix(rgb, vec3(curL), clamp(teethW * 0.72, 0.0, 0.85));
+      rgb = clamp(desat + vec3(0.085 * teethW * (1.0 - curL * 0.55)), 0.0, 1.0);
+    }
+  }
+
+  if (lipAmt > 1e-4 && lipMask > 0.005) {
+    float curL = luma709(rgb);
+    float maxC = max(rgb.r, max(rgb.g, rgb.b));
+    float minC = min(rgb.r, min(rgb.g, rgb.b));
+    float sat = (maxC - minC) / max(maxC, 1e-4);
+    float lipHueGate = kSmoothstep(0.055, 0.17, rgb.r - rgb.g);
+    float lipSatGate = kSmoothstep(0.10, 0.28, sat);
+    float lipW = lipMask * lipHueGate * lipSatGate * lipAmt;
+    if (lipW > 1e-4) {
+      vec3 boostedChroma = (rgb - vec3(curL)) * (1.0 + 0.30 * lipW);
+      rgb = clamp(vec3(curL * (1.0 - 0.04 * lipW)) + boostedChroma + highFreqPores * (0.28 * lipW), 0.0, 1.0);
+    }
+  }
+
+  gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), center.a);
+}
+`;
+
 type GlContext = WebGLRenderingContext | WebGL2RenderingContext;
 
 function isWebGl2Context(gl: GlContext): gl is WebGL2RenderingContext {
@@ -1196,11 +1668,20 @@ interface CachedSpatialMaskEntry {
   readonly compiled: CompiledWebGlMaskData;
 }
 
+interface CachedGlInpaintPatch {
+  readonly sig: string;
+  status: 'loading' | 'ready' | 'error';
+  tex?: WebGLTexture;
+}
+
 interface GlPipeline {
   readonly gl: GlContext;
   readonly isWebGl2: boolean;
   readonly hasHalfFloatFbo: boolean;
   readonly colorProgram: WebGLProgram;
+  readonly inpaintProgram: WebGLProgram;
+  readonly healProgram: WebGLProgram;
+  readonly portraitProgram: WebGLProgram;
   readonly maskProgram: WebGLProgram;
   readonly spatialProgram: WebGLProgram;
   readonly buffer: WebGLBuffer;
@@ -1211,13 +1692,48 @@ interface GlPipeline {
   readonly fboB: WebGLFramebuffer;
   readonly fboTexB: WebGLTexture;
   readonly spatialMaskCache: Map<string, CachedSpatialMaskEntry>;
+  readonly inpaintPatchCache: Map<string, CachedGlInpaintPatch>;
   readonly bgMatteTex: WebGLTexture;
   bgMatteSig: string;
+  readonly faceParseTex: WebGLTexture;
+  faceParseRef: FaceParseMapData | null;
   fboWidth: number;
   fboHeight: number;
   readonly colorPosLoc: number;
+  readonly inpaintPosLoc: number;
+  readonly healPosLoc: number;
+  readonly portraitPosLoc: number;
   readonly maskPosLoc: number;
   readonly spatialPosLoc: number;
+  readonly inpaintLoc: {
+    readonly flipY: WebGLUniformLocation | null;
+    readonly prevImage: WebGLUniformLocation | null;
+    readonly patchTex: WebGLUniformLocation | null;
+    readonly bounds: WebGLUniformLocation | null;
+    readonly opacity: WebGLUniformLocation | null;
+  };
+  readonly healLoc: {
+    readonly flipY: WebGLUniformLocation | null;
+    readonly prevImage: WebGLUniformLocation | null;
+    readonly oriDims: WebGLUniformLocation | null;
+    readonly slotCount: WebGLUniformLocation | null;
+    readonly spotGeom: WebGLUniformLocation | null;
+    readonly spotParams: WebGLUniformLocation | null;
+    readonly spotSeg: WebGLUniformLocation | null;
+  };
+  readonly portraitLoc: {
+    readonly flipY: WebGLUniformLocation | null;
+    readonly prevImage: WebGLUniformLocation | null;
+    readonly faceParseTex: WebGLUniformLocation | null;
+    readonly texelSize: WebGLUniformLocation | null;
+    readonly oriDims: WebGLUniformLocation | null;
+    readonly meta: WebGLUniformLocation | null;
+    readonly skinParams: WebGLUniformLocation | null;
+    readonly featureParams: WebGLUniformLocation | null;
+    readonly faceEyes: WebGLUniformLocation | null;
+    readonly faceNose: WebGLUniformLocation | null;
+    readonly faceMouth: WebGLUniformLocation | null;
+  };
   readonly colorLoc: {
     readonly flipY: WebGLUniformLocation | null;
     readonly image: WebGLUniformLocation | null;
@@ -1381,10 +1897,23 @@ function initGlPipeline(canvas: HTMLCanvasElement): GlPipeline | null {
     : false;
 
   const colorProgram = linkProgram(gl, VERTEX_SHADER_SRC, COLOR_FRAGMENT_SHADER_SRC);
+  const inpaintProgram = linkProgram(gl, VERTEX_SHADER_SRC, INPAINT_FRAGMENT_SHADER_SRC);
+  const healProgram = linkProgram(gl, VERTEX_SHADER_SRC, HEAL_FRAGMENT_SHADER_SRC);
+  const portraitProgram = linkProgram(gl, VERTEX_SHADER_SRC, PORTRAIT_RETOUCH_FRAGMENT_SHADER_SRC);
   const maskProgram = linkProgram(gl, VERTEX_SHADER_SRC, MASK_FRAGMENT_SHADER_SRC);
   const spatialProgram = linkProgram(gl, VERTEX_SHADER_SRC, SPATIAL_FRAGMENT_SHADER_SRC);
-  if (!colorProgram || !maskProgram || !spatialProgram) {
+  if (
+    !colorProgram ||
+    !inpaintProgram ||
+    !healProgram ||
+    !portraitProgram ||
+    !maskProgram ||
+    !spatialProgram
+  ) {
     if (colorProgram) gl.deleteProgram(colorProgram);
+    if (inpaintProgram) gl.deleteProgram(inpaintProgram);
+    if (healProgram) gl.deleteProgram(healProgram);
+    if (portraitProgram) gl.deleteProgram(portraitProgram);
     if (maskProgram) gl.deleteProgram(maskProgram);
     if (spatialProgram) gl.deleteProgram(spatialProgram);
     return null;
@@ -1398,7 +1927,18 @@ function initGlPipeline(canvas: HTMLCanvasElement): GlPipeline | null {
   const fboB = gl.createFramebuffer();
   const fboTexB = gl.createTexture();
   const bgMatteTex = gl.createTexture();
-  if (!buffer || !imageTex || !toneLutTex || !fbo || !fboTex || !fboB || !fboTexB || !bgMatteTex) {
+  const faceParseTex = gl.createTexture();
+  if (
+    !buffer ||
+    !imageTex ||
+    !toneLutTex ||
+    !fbo ||
+    !fboTex ||
+    !fboB ||
+    !fboTexB ||
+    !bgMatteTex ||
+    !faceParseTex
+  ) {
     if (buffer) gl.deleteBuffer(buffer);
     if (imageTex) gl.deleteTexture(imageTex);
     if (toneLutTex) gl.deleteTexture(toneLutTex);
@@ -1407,7 +1947,11 @@ function initGlPipeline(canvas: HTMLCanvasElement): GlPipeline | null {
     if (fboB) gl.deleteFramebuffer(fboB);
     if (fboTexB) gl.deleteTexture(fboTexB);
     if (bgMatteTex) gl.deleteTexture(bgMatteTex);
+    if (faceParseTex) gl.deleteTexture(faceParseTex);
     gl.deleteProgram(colorProgram);
+    gl.deleteProgram(inpaintProgram);
+    gl.deleteProgram(healProgram);
+    gl.deleteProgram(portraitProgram);
     gl.deleteProgram(maskProgram);
     gl.deleteProgram(spatialProgram);
     return null;
@@ -1420,7 +1964,7 @@ function initGlPipeline(canvas: HTMLCanvasElement): GlPipeline | null {
     gl.STATIC_DRAW,
   );
 
-  for (const tex of [imageTex, toneLutTex, fboTex, fboTexB, bgMatteTex]) {
+  for (const tex of [imageTex, toneLutTex, fboTex, fboTexB, bgMatteTex, faceParseTex]) {
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -1429,12 +1973,17 @@ function initGlPipeline(canvas: HTMLCanvasElement): GlPipeline | null {
   }
   gl.bindTexture(gl.TEXTURE_2D, bgMatteTex);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
+  gl.bindTexture(gl.TEXTURE_2D, faceParseTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]));
 
   return {
     gl,
     isWebGl2,
     hasHalfFloatFbo,
     colorProgram,
+    inpaintProgram,
+    healProgram,
+    portraitProgram,
     maskProgram,
     spatialProgram,
     buffer,
@@ -1445,13 +1994,54 @@ function initGlPipeline(canvas: HTMLCanvasElement): GlPipeline | null {
     fboB,
     fboTexB,
     spatialMaskCache: new Map(),
+    inpaintPatchCache: new Map(),
     bgMatteTex,
     bgMatteSig: '',
+    faceParseTex,
+    faceParseRef: null,
     fboWidth: 0,
     fboHeight: 0,
     colorPosLoc: gl.getAttribLocation(colorProgram, 'a_position'),
+    inpaintPosLoc: gl.getAttribLocation(inpaintProgram, 'a_position'),
+    healPosLoc: gl.getAttribLocation(healProgram, 'a_position'),
+    portraitPosLoc: gl.getAttribLocation(portraitProgram, 'a_position'),
     maskPosLoc: gl.getAttribLocation(maskProgram, 'a_position'),
     spatialPosLoc: gl.getAttribLocation(spatialProgram, 'a_position'),
+    inpaintLoc: {
+      flipY: gl.getUniformLocation(inpaintProgram, 'u_flipY'),
+      prevImage: gl.getUniformLocation(inpaintProgram, 'u_prevImage'),
+      patchTex: gl.getUniformLocation(inpaintProgram, 'u_patchTex'),
+      bounds: gl.getUniformLocation(inpaintProgram, 'u_bounds'),
+      opacity: gl.getUniformLocation(inpaintProgram, 'u_opacity'),
+    },
+    healLoc: {
+      flipY: gl.getUniformLocation(healProgram, 'u_flipY'),
+      prevImage: gl.getUniformLocation(healProgram, 'u_prevImage'),
+      oriDims: gl.getUniformLocation(healProgram, 'u_oriDims'),
+      slotCount: gl.getUniformLocation(healProgram, 'u_slotCount'),
+      spotGeom:
+        gl.getUniformLocation(healProgram, 'u_spotGeom[0]') ??
+        gl.getUniformLocation(healProgram, 'u_spotGeom'),
+      spotParams:
+        gl.getUniformLocation(healProgram, 'u_spotParams[0]') ??
+        gl.getUniformLocation(healProgram, 'u_spotParams'),
+      spotSeg:
+        gl.getUniformLocation(healProgram, 'u_spotSeg[0]') ??
+        gl.getUniformLocation(healProgram, 'u_spotSeg'),
+    },
+    portraitLoc: {
+      flipY: gl.getUniformLocation(portraitProgram, 'u_flipY'),
+      prevImage: gl.getUniformLocation(portraitProgram, 'u_prevImage'),
+      faceParseTex: gl.getUniformLocation(portraitProgram, 'u_faceParseTex'),
+      texelSize: gl.getUniformLocation(portraitProgram, 'u_texelSize'),
+      oriDims: gl.getUniformLocation(portraitProgram, 'u_oriDims'),
+      meta: gl.getUniformLocation(portraitProgram, 'u_meta'),
+      skinParams: gl.getUniformLocation(portraitProgram, 'u_skinParams'),
+      featureParams: gl.getUniformLocation(portraitProgram, 'u_featureParams'),
+      faceEyes: gl.getUniformLocation(portraitProgram, 'u_faceEyes'),
+      faceNose: gl.getUniformLocation(portraitProgram, 'u_faceNose'),
+      faceMouth: gl.getUniformLocation(portraitProgram, 'u_faceMouth'),
+    },
     colorLoc: {
       flipY: gl.getUniformLocation(colorProgram, 'u_flipY'),
       image: gl.getUniformLocation(colorProgram, 'u_image'),
@@ -1735,6 +2325,91 @@ function getOrUploadSpatialMask(
   return entry;
 }
 
+function ensureFaceParseTextureGl(
+  pipeline: GlPipeline,
+  faceParseMap: FaceParseMapData | null | undefined,
+): boolean {
+  if (!faceParseMap || faceParseMap.width <= 0 || faceParseMap.height <= 0) return false;
+  if (pipeline.faceParseRef === faceParseMap) return true;
+  if (faceParseMap.rgba.length !== faceParseMap.width * faceParseMap.height * 4) return false;
+  const { gl, faceParseTex } = pipeline;
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, faceParseTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.RGBA,
+    faceParseMap.width,
+    faceParseMap.height,
+    0,
+    gl.RGBA,
+    gl.UNSIGNED_BYTE,
+    faceParseMap.rgba,
+  );
+  gl.bindTexture(gl.TEXTURE_2D, null);
+  pipeline.faceParseRef = faceParseMap;
+  return true;
+}
+
+function getOrLoadInpaintPatchGl(
+  pipeline: GlPipeline,
+  patch: InpaintPatch,
+  isCurrentPipeline: () => boolean,
+  onDecoded: () => void,
+): WebGLTexture | null {
+  const sig = `${patch.id}:${patch.patchWidth}x${patch.patchHeight}:${patch.patchImageB64.length}:${patch.maskRleB64.length}`;
+  const existing = pipeline.inpaintPatchCache.get(patch.id);
+  if (existing && existing.sig === sig) {
+    return existing.status === 'ready' ? (existing.tex ?? null) : null;
+  }
+  if (existing?.tex) {
+    pipeline.gl.deleteTexture(existing.tex);
+  }
+  const pending: CachedGlInpaintPatch = { sig, status: 'loading' };
+  pipeline.inpaintPatchCache.set(patch.id, pending);
+
+  void decodeInpaintPatchRgba(patch).then((decoded) => {
+    if (!isCurrentPipeline()) return;
+    const latest = pipeline.inpaintPatchCache.get(patch.id);
+    if (!latest || latest.sig !== sig) return;
+    if (!decoded) {
+      latest.status = 'error';
+      return;
+    }
+    const { gl } = pipeline;
+    const tex = gl.createTexture();
+    if (!tex) {
+      latest.status = 'error';
+      return;
+    }
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      decoded.width,
+      decoded.height,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      decoded.rgba,
+    );
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    latest.tex = tex;
+    latest.status = 'ready';
+    onDecoded();
+  });
+
+  return null;
+}
+
 function orientSourceUvJs(
   u: number,
   v: number,
@@ -1762,6 +2437,8 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
   src,
   alt,
   recipe,
+  faceOverlay = null,
+  faceParseMap = null,
   workingBuffer = null,
   previewMaxDim = 2560,
   fit = 'cover',
@@ -1793,6 +2470,8 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
   const textureReadyRef = useRef(false);
   const workingBufferRef = useRef<DevelopWorkingBuffer | null>(workingBuffer);
   const recipeRef = useRef(recipe);
+  const faceOverlayRef = useRef(faceOverlay);
+  const faceParseMapRef = useRef(faceParseMap);
   const fitRef = useRef(fit);
   const viewportZoomRef = useRef(viewportZoom);
   const viewportPanRef = useRef(viewportPan);
@@ -1804,6 +2483,8 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
   const onMaxTextureDimRef = useRef(onMaxTextureDim);
   workingBufferRef.current = workingBuffer;
   recipeRef.current = recipe;
+  faceOverlayRef.current = faceOverlay;
+  faceParseMapRef.current = faceParseMap;
   fitRef.current = fit;
   viewportZoomRef.current = viewportZoom;
   viewportPanRef.current = viewportPan;
@@ -1839,6 +2520,9 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
     const {
       gl,
       colorProgram,
+      inpaintProgram,
+      healProgram,
+      portraitProgram,
       maskProgram,
       spatialProgram,
       buffer,
@@ -1849,10 +2533,17 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
       fboB,
       fboTexB,
       spatialMaskCache,
+      inpaintPatchCache,
       colorPosLoc,
+      inpaintPosLoc,
+      healPosLoc,
+      portraitPosLoc,
       maskPosLoc,
       spatialPosLoc,
       colorLoc,
+      inpaintLoc,
+      healLoc,
+      portraitLoc,
       maskLoc,
       spatialLoc,
     } = pipeline;
@@ -1922,10 +2613,36 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
             : 0.0
         : 0.0;
 
+    const retouch = hydrateRetouchSettings(curRecipe.retouch);
+    const effectiveInpaint = (retouch.inpaintPatches ?? []).filter(isInpaintPatchEffective);
+    if (inpaintPatchCache.size > 0) {
+      const liveIds = new Set(effectiveInpaint.map((p) => p.id));
+      for (const [id, entry] of inpaintPatchCache.entries()) {
+        if (!liveIds.has(id)) {
+          if (entry.tex) gl.deleteTexture(entry.tex);
+          inpaintPatchCache.delete(id);
+        }
+      }
+    }
+    const needInpaint = effectiveInpaint.length > 0;
+    const needHeal = hasEffectiveHealSpots(retouch);
+    const needPortrait = isPortraitRetouchActive(retouch.portrait);
+
     const needMultiPass =
-      u.spatialStageActive || effectiveMasks.length > 0 || overlayMask !== null || bgTransparent;
+      u.spatialStageActive ||
+      effectiveMasks.length > 0 ||
+      overlayMask !== null ||
+      bgTransparent ||
+      needInpaint ||
+      needHeal ||
+      needPortrait;
     const fboState = needMultiPass
-      ? ensureFboSize(pipeline, orientedW, orientedH, effectiveMasks.length > 0)
+      ? ensureFboSize(
+          pipeline,
+          orientedW,
+          orientedH,
+          effectiveMasks.length > 0 || needInpaint || needHeal || needPortrait,
+        )
       : { w: 0, h: 0, complete: false };
     const runMultiPass = needMultiPass && fboState.complete;
 
@@ -2124,12 +2841,225 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
       gl.uniform1f(maskLoc.sharpness, adj.sharpness);
     };
 
-    // Pass 1b: Ping-pong Local & AI Mask passes (0 overhead when masks array is empty)
+    // Pass 1a-1 & 1a-2: Non-Destructive Spot Heal / Clone + Frequency-Separation Portrait Retouch
     let curSrcTex = fboTex;
     let curDstFbo = fboB;
     let curDstTex = fboTexB;
     let altFbo = fbo;
 
+    const swapPingPong = () => {
+      const prevSrcTex = curSrcTex;
+      const prevDstFbo = curDstFbo;
+      curSrcTex = curDstTex;
+      curDstTex = prevSrcTex;
+      curDstFbo = altFbo;
+      altFbo = prevDstFbo;
+    };
+
+    if (needInpaint) {
+      for (const patch of effectiveInpaint) {
+        const patchTex = getOrLoadInpaintPatchGl(
+          pipeline,
+          patch,
+          () => pipelineRef.current === pipeline,
+          () => scheduleRender(),
+        );
+        if (!patchTex) continue;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, curDstFbo);
+        gl.viewport(0, 0, fboW, fboH);
+        gl.useProgram(inpaintProgram);
+        gl.enableVertexAttribArray(inpaintPosLoc);
+        gl.vertexAttribPointer(inpaintPosLoc, 2, gl.FLOAT, false, 0, 0);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, curSrcTex);
+        gl.uniform1i(inpaintLoc.prevImage, 0);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, patchTex);
+        gl.uniform1i(inpaintLoc.patchTex, 1);
+        gl.uniform1f(inpaintLoc.flipY, 0.0);
+        gl.uniform4f(
+          inpaintLoc.bounds,
+          patch.bounds.left,
+          patch.bounds.top,
+          patch.bounds.width,
+          patch.bounds.height,
+        );
+        gl.uniform1f(inpaintLoc.opacity, patch.opacity);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+        swapPingPong();
+      }
+    }
+
+    if (needHeal) {
+      const slots: {
+        deltaU: number;
+        deltaV: number;
+        radius: number;
+        feather: number;
+        opacity: number;
+        mode: number;
+        ax: number;
+        ay: number;
+        bx: number;
+        by: number;
+      }[] = [];
+      for (const spot of retouch.healSpots) {
+        if (spot.radius < 0.002 || spot.opacity < 0.05) continue;
+        const deltaU = spot.sourceX - spot.targetX;
+        const deltaV = spot.sourceY - spot.targetY;
+        const mode = spot.mode === 'clone' ? 1.0 : 0.0;
+        const pts =
+          spot.points && spot.points.length > 0
+            ? spot.points
+            : ([[spot.targetX, spot.targetY]] as const);
+        if (pts.length === 1) {
+          const p = pts[0]!;
+          slots.push({
+            deltaU,
+            deltaV,
+            radius: spot.radius,
+            feather: spot.feather,
+            opacity: spot.opacity,
+            mode,
+            ax: p[0],
+            ay: p[1],
+            bx: p[0],
+            by: p[1],
+          });
+        } else {
+          for (let k = 0; k < pts.length - 1; k++) {
+            const a = pts[k]!;
+            const b = pts[k + 1]!;
+            slots.push({
+              deltaU,
+              deltaV,
+              radius: spot.radius,
+              feather: spot.feather,
+              opacity: spot.opacity,
+              mode,
+              ax: a[0],
+              ay: a[1],
+              bx: b[0],
+              by: b[1],
+            });
+          }
+        }
+      }
+
+      const geomArr = new Float32Array(MAX_GL_HEAL_SLOTS * 4);
+      const paramArr = new Float32Array(MAX_GL_HEAL_SLOTS * 4);
+      const segArr = new Float32Array(MAX_GL_HEAL_SLOTS * 4);
+
+      for (let offset = 0; offset < slots.length; offset += MAX_GL_HEAL_SLOTS) {
+        const count = Math.min(MAX_GL_HEAL_SLOTS, slots.length - offset);
+        geomArr.fill(0);
+        paramArr.fill(0);
+        segArr.fill(0);
+        for (let k = 0; k < count; k++) {
+          const s = slots[offset + k]!;
+          const o = k * 4;
+          geomArr[o] = s.deltaU;
+          geomArr[o + 1] = s.deltaV;
+          geomArr[o + 2] = s.radius;
+          geomArr[o + 3] = s.feather;
+          paramArr[o] = s.opacity;
+          paramArr[o + 1] = s.mode;
+          segArr[o] = s.ax;
+          segArr[o + 1] = s.ay;
+          segArr[o + 2] = s.bx;
+          segArr[o + 3] = s.by;
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, curDstFbo);
+        gl.viewport(0, 0, fboW, fboH);
+        gl.useProgram(healProgram);
+        gl.enableVertexAttribArray(healPosLoc);
+        gl.vertexAttribPointer(healPosLoc, 2, gl.FLOAT, false, 0, 0);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, curSrcTex);
+        gl.uniform1i(healLoc.prevImage, 0);
+        gl.uniform1f(healLoc.flipY, 0.0);
+        gl.uniform2f(healLoc.oriDims, orientedW, orientedH);
+        gl.uniform1f(healLoc.slotCount, count);
+        gl.uniform4fv(healLoc.spotGeom, geomArr);
+        gl.uniform4fv(healLoc.spotParams, paramArr);
+        gl.uniform4fv(healLoc.spotSeg, segArr);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+        swapPingPong();
+      }
+    }
+
+    if (needPortrait) {
+      const guide = faceOverlayToOrientedGuide(
+        faceOverlayRef.current,
+        crop,
+        orientedW,
+        orientedH,
+        true,
+      );
+      const p = retouch.portrait;
+      const faceParseReady = ensureFaceParseTextureGl(pipeline, faceParseMapRef.current);
+      const spatialScale = Math.max(0.75, Math.min(4.0, Math.max(fboW, fboH) / 1024.0));
+      gl.bindFramebuffer(gl.FRAMEBUFFER, curDstFbo);
+      gl.viewport(0, 0, fboW, fboH);
+      gl.useProgram(portraitProgram);
+      gl.enableVertexAttribArray(portraitPosLoc);
+      gl.vertexAttribPointer(portraitPosLoc, 2, gl.FLOAT, false, 0, 0);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, curSrcTex);
+      gl.uniform1i(portraitLoc.prevImage, 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, pipeline.faceParseTex);
+      gl.uniform1i(portraitLoc.faceParseTex, 1);
+      gl.uniform1f(portraitLoc.flipY, 0.0);
+      gl.uniform2f(portraitLoc.texelSize, 1.0 / fboW, 1.0 / fboH);
+      gl.uniform2f(portraitLoc.oriDims, orientedW, orientedH);
+      gl.uniform4f(
+        portraitLoc.meta,
+        spatialScale,
+        guide ? 1.0 : 0.0,
+        faceParseReady ? 1.0 : 0.0,
+        0.0,
+      );
+      gl.uniform4f(
+        portraitLoc.skinParams,
+        p.skinSmoothing / 100,
+        p.skinTexturePreserve / 100,
+        p.skinToneEvenness / 100,
+        p.shineRemoval / 100,
+      );
+      gl.uniform4f(
+        portraitLoc.featureParams,
+        p.underEyeBrighten / 100,
+        p.eyeEnhance / 100,
+        p.teethWhiten / 100,
+        p.lipEnhance / 100,
+      );
+      if (guide) {
+        gl.uniform4f(
+          portraitLoc.faceEyes,
+          guide.rightEye[0],
+          guide.rightEye[1],
+          guide.leftEye[0],
+          guide.leftEye[1],
+        );
+        gl.uniform4f(portraitLoc.faceNose, guide.noseTip[0], guide.noseTip[1], 0.0, 0.0);
+        gl.uniform4f(
+          portraitLoc.faceMouth,
+          guide.rightMouth[0],
+          guide.rightMouth[1],
+          guide.leftMouth[0],
+          guide.leftMouth[1],
+        );
+      } else {
+        gl.uniform4f(portraitLoc.faceEyes, 0, 0, 0, 0);
+        gl.uniform4f(portraitLoc.faceNose, 0, 0, 0, 0);
+        gl.uniform4f(portraitLoc.faceMouth, 0, 0, 0, 0);
+      }
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      swapPingPong();
+    }
+
+    // Pass 1b: Ping-pong Local & AI Mask passes (0 overhead when masks array is empty)
     for (const layer of effectiveMasks) {
       const cached = getOrUploadSpatialMask(pipeline, layer, orientedW, orientedH);
       if (!cached) continue;
@@ -2137,14 +3067,7 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
       gl.viewport(0, 0, fboW, fboH);
       bindMaskUniforms(layer, curSrcTex, cached, false, 0.0, 1.0, 1.0, 0.0, 0.0);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
-
-      // Swap ping-pong buffers
-      const prevSrcTex = curSrcTex;
-      const prevDstFbo = curDstFbo;
-      curSrcTex = curDstTex;
-      curDstTex = prevSrcTex;
-      curDstFbo = altFbo;
-      altFbo = prevDstFbo;
+      swapPingPong();
     }
 
     // Pass 2: Global spatial detail (Color NR, Luma NR, Texture, Clarity, Sharpening, Grain) + clip overlay
@@ -2411,14 +3334,22 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
       gl.deleteFramebuffer(pipeline.fboB);
       gl.deleteTexture(pipeline.fboTexB);
       gl.deleteTexture(pipeline.bgMatteTex);
+      gl.deleteTexture(pipeline.faceParseTex);
       for (const entry of pipeline.spatialMaskCache.values()) {
         gl.deleteTexture(entry.tex);
       }
       pipeline.spatialMaskCache.clear();
+      for (const entry of pipeline.inpaintPatchCache.values()) {
+        if (entry.tex) gl.deleteTexture(entry.tex);
+      }
+      pipeline.inpaintPatchCache.clear();
       gl.deleteTexture(pipeline.imageTex);
       gl.deleteTexture(pipeline.toneLutTex);
       gl.deleteBuffer(pipeline.buffer);
       gl.deleteProgram(pipeline.colorProgram);
+      gl.deleteProgram(pipeline.inpaintProgram);
+      gl.deleteProgram(pipeline.healProgram);
+      gl.deleteProgram(pipeline.portraitProgram);
       gl.deleteProgram(pipeline.maskProgram);
       gl.deleteProgram(pipeline.spatialProgram);
     };
@@ -2555,6 +3486,8 @@ export const WebGlDevelopCanvas = memo(function WebGlDevelopCanvas({
     }
   }, [
     recipe,
+    faceOverlay,
+    faceParseMap,
     fit,
     viewportZoom,
     viewportPan.x,

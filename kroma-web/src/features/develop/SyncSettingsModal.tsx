@@ -60,6 +60,16 @@ const MASK_ITEMS: readonly {
     label: 'Masks & Background Cutout',
     hint: 'Copy local masks, AI mattes & background removal (off by default)',
   },
+  {
+    key: 'portraitRetouch',
+    label: 'Portrait Retouching',
+    hint: 'Frequency-separation skin, shine, eyes, teeth & lips (auto-adapts to each face)',
+  },
+  {
+    key: 'healSpots',
+    label: 'Spot Heal & Clone',
+    hint: 'Per-photo blemish & stray-hair patches (off by default)',
+  },
 ];
 
 const MAX_PREVIEW_TARGETS = 5;
@@ -145,6 +155,8 @@ export function SyncSettingsModal({
       detailOptics: checked,
       cropTransform: checked,
       masks: checked,
+      portraitRetouch: checked,
+      healSpots: checked,
     });
   };
 
@@ -169,7 +181,9 @@ export function SyncSettingsModal({
               <DarkroomButton
                 variant="subtle"
                 size="xs"
-                onClick={() => setMask({ ...modifiedModules, cropTransform: false })}
+                onClick={() =>
+                  setMask({ ...modifiedModules, cropTransform: false, healSpots: false })
+                }
                 title="Select only adjustments edited on this photo"
               >
                 Modified Only

@@ -12,9 +12,17 @@ import {
   type CompiledWebGlMaskData,
   type MaskLayer,
 } from './masking';
+import {
+  MAX_PORTRAIT_FACE_GUIDES,
+  type PortraitFaceGuide,
+  type PortraitRetouchSettings,
+} from './retouch';
 
 /** Strict 16-byte aligned uniform sizes matching `shaders/develop/*.wgsl` and `wgpu_engine.rs`. */
 export const GRADE_UNIFORM_FLOATS = 29 * 4; // 464 bytes
+export const INPAINT_UNIFORM_FLOATS = 4 * 4; // 64 bytes
+export const HEAL_UNIFORM_FLOATS = 3 * 4; // 48 bytes
+export const PORTRAIT_RETOUCH_UNIFORM_FLOATS = 21 * 4; // 336 bytes
 export const MASK_UNIFORM_FLOATS = 17 * 4; // 272 bytes
 export const SPATIAL_UNIFORM_FLOATS = 5 * 4; // 80 bytes
 export const PRESENT_UNIFORM_FLOATS = 3 * 4; // 48 bytes
@@ -386,5 +394,170 @@ export function packPresentUniforms(
   out[9] = cropBounds[1];
   out[10] = cropBounds[2];
   out[11] = cropBounds[3];
+  return out;
+}
+
+export interface PackInpaintUniformsInput {
+  readonly outWidth: number;
+  readonly outHeight: number;
+  readonly patchWidth: number;
+  readonly patchHeight: number;
+  readonly cropRect?: CropRect;
+  readonly bounds: CropRect;
+  readonly opacity: number;
+}
+
+/**
+ * Packs `InpaintUniforms` (4 × `vec4<f32>` = 64 bytes) matching `shaders/develop/inpaint_pass.wgsl`
+ * and `internal/infrastructure/src/develop/retouch_engine.rs::InpaintUniforms` byte-for-byte.
+ */
+export function packInpaintUniforms(input: PackInpaintUniformsInput): Float32Array {
+  const out = new Float32Array(INPAINT_UNIFORM_FLOATS);
+  const cr = input.cropRect ?? { left: 0, top: 0, width: 1, height: 1 };
+  // [0] dims: (outW, outH, patchW, patchH)
+  out[0] = input.outWidth;
+  out[1] = input.outHeight;
+  out[2] = Math.max(1, input.patchWidth);
+  out[3] = Math.max(1, input.patchHeight);
+  // [1] cropRect: (left, top, width, height)
+  out[4] = cr.left;
+  out[5] = cr.top;
+  out[6] = cr.width;
+  out[7] = cr.height;
+  // [2] bounds: (left, top, width, height)
+  out[8] = input.bounds.left;
+  out[9] = input.bounds.top;
+  out[10] = input.bounds.width;
+  out[11] = input.bounds.height;
+  // [3] params: (opacity, 0, 0, 0)
+  out[12] = Math.min(1.0, Math.max(0.0, input.opacity));
+  out[13] = 0.0;
+  out[14] = 0.0;
+  out[15] = 0.0;
+  return out;
+}
+
+export interface PackHealUniformsInput {
+  readonly outWidth: number;
+  readonly outHeight: number;
+  readonly oriWidth: number;
+  readonly oriHeight: number;
+  readonly cropRect?: CropRect;
+  readonly spotCount: number;
+}
+
+/**
+ * Packs `HealUniforms` (3 × `vec4<f32>` = 48 bytes) matching `shaders/develop/heal_pass.wgsl`
+ * and `internal/infrastructure/src/develop/retouch_engine.rs::HealUniforms` byte-for-byte.
+ */
+export function packHealUniforms(input: PackHealUniformsInput): Float32Array {
+  const out = new Float32Array(HEAL_UNIFORM_FLOATS);
+  const cr = input.cropRect ?? { left: 0, top: 0, width: 1, height: 1 };
+  const spatialScale = Math.max(
+    1.0,
+    Math.max(input.oriWidth, input.oriHeight) / 1024.0,
+  );
+  // [0] dims: (outW, outH, oriW, oriH)
+  out[0] = input.outWidth;
+  out[1] = input.outHeight;
+  out[2] = input.oriWidth;
+  out[3] = input.oriHeight;
+  // [1] cropRect: (left, top, width, height)
+  out[4] = cr.left;
+  out[5] = cr.top;
+  out[6] = cr.width;
+  out[7] = cr.height;
+  // [2] meta: (spotCount, spatialScale, 0, 0)
+  out[8] = input.spotCount;
+  out[9] = spatialScale;
+  out[10] = 0.0;
+  out[11] = 0.0;
+  return out;
+}
+
+export interface PackPortraitRetouchUniformsInput {
+  readonly outWidth: number;
+  readonly outHeight: number;
+  readonly oriWidth: number;
+  readonly oriHeight: number;
+  readonly cropRect?: CropRect;
+  readonly portrait: PortraitRetouchSettings;
+  readonly faceGuides: readonly PortraitFaceGuide[];
+  readonly hasFaceParseMap?: boolean;
+}
+
+/**
+ * Packs `PortraitRetouchUniforms` (21 × `vec4<f32>` = 336 bytes) matching
+ * `shaders/develop/portrait_retouch_pass.wgsl` and
+ * `internal/infrastructure/src/develop/retouch_engine.rs::PortraitRetouchUniforms` byte-for-byte.
+ */
+export function packPortraitRetouchUniforms(
+  input: PackPortraitRetouchUniformsInput,
+): Float32Array {
+  const out = new Float32Array(PORTRAIT_RETOUCH_UNIFORM_FLOATS);
+  const cr = input.cropRect ?? { left: 0, top: 0, width: 1, height: 1 };
+  const oriW = Math.max(1, input.oriWidth);
+  const oriH = Math.max(1, input.oriHeight);
+  const spatialScale = Math.max(0.75, Math.min(4.0, Math.max(oriW, oriH) / 1024.0));
+  const faceCount = Math.min(MAX_PORTRAIT_FACE_GUIDES, input.faceGuides.length);
+  const p = input.portrait;
+
+  let i = 0;
+  // [0] dims: (outW, outH, oriW, oriH)
+  out[i++] = input.outWidth;
+  out[i++] = input.outHeight;
+  out[i++] = oriW;
+  out[i++] = oriH;
+  // [1] cropRect: (left, top, width, height)
+  out[i++] = cr.left;
+  out[i++] = cr.top;
+  out[i++] = cr.width;
+  out[i++] = cr.height;
+  // [2] meta: (spatialScale, faceCount, oriW/oriH, hasFaceParseMap)
+  out[i++] = spatialScale;
+  out[i++] = faceCount;
+  out[i++] = oriW / oriH;
+  out[i++] = input.hasFaceParseMap ? 1.0 : 0.0;
+  // [3] skinParams: (skinSmoothing, skinTexturePreserve, skinToneEvenness, shineRemoval)
+  out[i++] = p.skinSmoothing / 100;
+  out[i++] = p.skinTexturePreserve / 100;
+  out[i++] = p.skinToneEvenness / 100;
+  out[i++] = p.shineRemoval / 100;
+  // [4] featureParams: (underEyeBrighten, eyeEnhance, teethWhiten, lipEnhance)
+  out[i++] = p.underEyeBrighten / 100;
+  out[i++] = p.eyeEnhance / 100;
+  out[i++] = p.teethWhiten / 100;
+  out[i++] = p.lipEnhance / 100;
+
+  // [5..20] faces[4] (4 x vec4<f32> each)
+  for (let f = 0; f < MAX_PORTRAIT_FACE_GUIDES; f++) {
+    const face = input.faceGuides[f];
+    if (face) {
+      out[i++] = face.boxLeft;
+      out[i++] = face.boxTop;
+      out[i++] = face.boxWidth;
+      out[i++] = face.boxHeight;
+
+      out[i++] = face.rightEye[0];
+      out[i++] = face.rightEye[1];
+      out[i++] = face.leftEye[0];
+      out[i++] = face.leftEye[1];
+
+      out[i++] = face.noseTip[0];
+      out[i++] = face.noseTip[1];
+      out[i++] = 0.0;
+      out[i++] = 0.0;
+
+      out[i++] = face.rightMouth[0];
+      out[i++] = face.rightMouth[1];
+      out[i++] = face.leftMouth[0];
+      out[i++] = face.leftMouth[1];
+    } else {
+      for (let z = 0; z < 16; z++) {
+        out[i++] = 0.0;
+      }
+    }
+  }
+
   return out;
 }

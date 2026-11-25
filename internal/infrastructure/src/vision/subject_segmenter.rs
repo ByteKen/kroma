@@ -8,6 +8,7 @@
 //!    face detector + border-seeded Dijkstra geodesic edge-cost propagation + fast `O(N)` RGB Guided
 //!    Filter so silhouettes hug hair, sleeves, and waist cleanly even without an optional ONNX matte.
 
+use crate::vision::face_parser::OnnxBiSeNetFaceParser;
 use crate::vision::onnx_runtime::shared_ort_environment;
 use crate::vision::yunet_detector::YuNetOnnxDetector;
 use image::imageops::{self, FilterType};
@@ -15,6 +16,7 @@ use image::RgbImage;
 use kroma_app::error::AppError;
 use kroma_app::ports::vision::RawFaceDetection;
 use kroma_domain::masking::{encode_matte_rle_b64, AiMaskKind};
+use kroma_domain::retouch::PortraitFaceGuide;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
@@ -227,6 +229,18 @@ pub fn generate_ai_mask_for_rgb(
     segmenter: Option<&OnnxSubjectSegmenter>,
     yunet: Option<&YuNetOnnxDetector>,
 ) -> Result<GeneratedAiMask, AppError> {
+    generate_ai_mask_for_rgb_with_face_parser(rgb, kind, segmenter, yunet, None)
+}
+
+/// Generates a high-precision, edge-refined soft AI mask for `rgb`, additionally upgrading
+/// `AiMaskKind::FaceSkin` with opt-in BiSeNet 19-class neural face parsing when installed.
+pub fn generate_ai_mask_for_rgb_with_face_parser(
+    rgb: &RgbImage,
+    kind: AiMaskKind,
+    segmenter: Option<&OnnxSubjectSegmenter>,
+    yunet: Option<&YuNetOnnxDetector>,
+    face_parser: Option<&OnnxBiSeNetFaceParser>,
+) -> Result<GeneratedAiMask, AppError> {
     let started = Instant::now();
     let (orig_w, orig_h) = rgb.dimensions();
     if orig_w == 0 || orig_h == 0 {
@@ -235,7 +249,7 @@ pub fn generate_ai_mask_for_rgb(
         ));
     }
 
-    let target_max_dim = if segmenter.is_some() {
+    let target_max_dim = if segmenter.is_some() || (kind == AiMaskKind::FaceSkin && face_parser.is_some()) {
         ONNX_MATTE_MAX_DIM
     } else {
         FALLBACK_MATTE_MAX_DIM
@@ -305,18 +319,60 @@ pub fn generate_ai_mask_for_rgb(
             (m, label)
         }
         AiMaskKind::FaceSkin => {
-            let label = match (&onnx_subject_gate, faces.is_empty()) {
-                (Some(_), false) => "YuNet 5-Point + ONNX Subject Skin AI".to_string(),
-                (None, false) => "Built-in Face & Skin AI (YuNet 5-Point)".to_string(),
-                _ => "Built-in Skin Tone AI".to_string(),
-            };
-            let mut m = compute_face_skin_matte(&guide_rgb, &faces);
-            if let Some(ref subj) = onnx_subject_gate {
-                for (dst, &s) in m.iter_mut().zip(subj.iter()) {
-                    *dst *= s;
+            if let Some(parser) = face_parser {
+                let guides: Vec<PortraitFaceGuide> = faces
+                    .iter()
+                    .take(4)
+                    .map(|det| {
+                        PortraitFaceGuide::from_normalized(
+                            det.bounding_box.x,
+                            det.bounding_box.y,
+                            det.bounding_box.width,
+                            det.bounding_box.height,
+                            [det.landmarks.right_eye.x, det.landmarks.right_eye.y],
+                            [det.landmarks.left_eye.x, det.landmarks.left_eye.y],
+                            [det.landmarks.nose_tip.x, det.landmarks.nose_tip.y],
+                            [
+                                det.landmarks.right_mouth_corner.x,
+                                det.landmarks.right_mouth_corner.y,
+                            ],
+                            [
+                                det.landmarks.left_mouth_corner.x,
+                                det.landmarks.left_mouth_corner.y,
+                            ],
+                        )
+                    })
+                    .collect();
+                if let Ok(mut parsed) = parser.predict_face_skin_matte_f32(rgb, &guides, out_w, out_h) {
+                    if let Some(ref subj) = onnx_subject_gate {
+                        for (dst, &s) in parsed.iter_mut().zip(subj.iter()) {
+                            *dst *= s;
+                        }
+                    }
+                    (parsed, parser.engine_label())
+                } else {
+                    let mut m = compute_face_skin_matte(&guide_rgb, &faces);
+                    if let Some(ref subj) = onnx_subject_gate {
+                        for (dst, &s) in m.iter_mut().zip(subj.iter()) {
+                            *dst *= s;
+                        }
+                    }
+                    (m, "Built-in Face & Skin AI (YuNet 5-Point)".to_string())
                 }
+            } else {
+                let label = match (&onnx_subject_gate, faces.is_empty()) {
+                    (Some(_), false) => "YuNet 5-Point + ONNX Subject Skin AI".to_string(),
+                    (None, false) => "Built-in Face & Skin AI (YuNet 5-Point)".to_string(),
+                    _ => "Built-in Skin Tone AI".to_string(),
+                };
+                let mut m = compute_face_skin_matte(&guide_rgb, &faces);
+                if let Some(ref subj) = onnx_subject_gate {
+                    for (dst, &s) in m.iter_mut().zip(subj.iter()) {
+                        *dst *= s;
+                    }
+                }
+                (m, label)
             }
-            (m, label)
         }
         AiMaskKind::Sky => {
             let label = if onnx_subject_gate.is_some() {

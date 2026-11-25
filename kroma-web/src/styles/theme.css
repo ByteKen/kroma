@@ -76,6 +76,26 @@
     background: var(--color-hairline-strong);
   }
 
+  /* Slightly larger, easier-to-grab horizontal scrollbar for the Studio filmstrip */
+  .kroma-filmstrip-scroll::-webkit-scrollbar {
+    height: 8px;
+  }
+
+  .kroma-filmstrip-scroll::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.02);
+    border-radius: 9999px;
+  }
+
+  .kroma-filmstrip-scroll::-webkit-scrollbar-thumb {
+    background: var(--color-hairline-strong);
+    border-radius: 9999px;
+    border: 1px solid transparent;
+  }
+
+  .kroma-filmstrip-scroll::-webkit-scrollbar-thumb:hover {
+    background: var(--color-ink-telemetry);
+  }
+
   /* Layered in @layer base so Tailwind utilities like text-[15px] cleanly override default size */
   .material-symbols-outlined {
     font-family: "Material Symbols Outlined";
@@ -115,23 +135,47 @@ input[type="range"].kroma-slider {
   border-radius: 9999px;
   background: var(--color-hairline);
   outline: none;
+  cursor: pointer;
+}
+
+input[type="range"].kroma-slider:focus-visible {
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.45);
 }
 
 input[type="range"].kroma-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
   border-radius: 9999px;
   background: var(--color-ink-primary);
   border: 2px solid var(--color-canvas);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);
   cursor: pointer;
-  transition: transform 120ms ease, border-color 120ms ease;
+  transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
 }
 
 input[type="range"].kroma-slider::-webkit-slider-thumb:hover {
   border-color: var(--color-amber-core);
-  transform: scale(1.15);
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.22), 0 1px 4px rgba(0, 0, 0, 0.65);
+  transform: scale(1.12);
+}
+
+input[type="range"].kroma-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: var(--color-ink-primary);
+  border: 2px solid var(--color-canvas);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);
+  cursor: pointer;
+  transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+}
+
+input[type="range"].kroma-slider::-moz-range-thumb:hover {
+  border-color: var(--color-amber-core);
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.22), 0 1px 4px rgba(0, 0, 0, 0.65);
+  transform: scale(1.12);
 }
 
 /* Smooth GPU-composited darkroom skeleton shimmer for workspace transitions */

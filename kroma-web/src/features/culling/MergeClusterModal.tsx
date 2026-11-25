@@ -1,5 +1,8 @@
-import { useState } from 'react';
-import type { SubjectCluster } from '../../domain/identity';
+import { useMemo, useState } from 'react';
+import {
+  compareSubjectClustersAlphabetically,
+  type SubjectCluster,
+} from '../../domain/identity';
 import { DarkroomButton, DarkroomModal, TelemetryPill } from '../darkroom-kit';
 
 interface MergeClusterModalProps {
@@ -17,14 +20,18 @@ export function MergeClusterModal({
   candidates,
   onConfirmMerge,
 }: MergeClusterModalProps) {
+  const sortedCandidates = useMemo(
+    () => [...candidates].sort(compareSubjectClustersAlphabetically),
+    [candidates],
+  );
   const [selectedTargetId, setSelectedTargetId] = useState<string>(
-    candidates[0]?.anchor.id ?? '',
+    sortedCandidates[0]?.anchor.id ?? '',
   );
 
   const effectiveTargetId =
-    candidates.some((c) => c.anchor.id === selectedTargetId)
+    sortedCandidates.some((c) => c.anchor.id === selectedTargetId)
       ? selectedTargetId
-      : (candidates[0]?.anchor.id ?? '');
+      : (sortedCandidates[0]?.anchor.id ?? '');
 
   return (
     <DarkroomModal
@@ -55,13 +62,13 @@ export function MergeClusterModal({
         </>
       }
     >
-      {candidates.length === 0 ? (
+      {sortedCandidates.length === 0 ? (
         <p className="text-[12px] text-ink-secondary">
           No other subject clusters are available to merge into.
         </p>
       ) : (
         <div className="flex flex-col gap-1.5 max-h-[300px] overflow-y-auto">
-          {candidates.map((cluster) => {
+          {sortedCandidates.map((cluster) => {
             const isPicked = cluster.anchor.id === effectiveTargetId;
             return (
               <button

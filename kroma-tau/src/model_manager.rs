@@ -207,12 +207,14 @@ pub fn inspect_manifest_status(
             }
         };
 
-        if status == "missing" {
-            missing_count += 1;
-            pending_download_bytes = pending_download_bytes.saturating_add(entry.size_bytes);
-        } else if status == "outdated" {
-            outdated_count += 1;
-            pending_download_bytes = pending_download_bytes.saturating_add(entry.size_bytes);
+        if entry.required {
+            if status == "missing" {
+                missing_count += 1;
+                pending_download_bytes = pending_download_bytes.saturating_add(entry.size_bytes);
+            } else if status == "outdated" {
+                outdated_count += 1;
+                pending_download_bytes = pending_download_bytes.saturating_add(entry.size_bytes);
+            }
         }
 
         entries.push(ModelManifestEntryStatusDto {
@@ -346,10 +348,58 @@ fn build_download_agent() -> ureq::Agent {
     config.into()
 }
 
-/// Downloads all missing or outdated models defined by `manifest` into `managed_models_dir`,
-/// streaming progress updates via `on_progress` and verifying SHA-256 before finalizing.
+/// Downloads all missing or outdated **required** models defined by `manifest` into
+/// `managed_models_dir`, streaming progress updates via `on_progress` and verifying SHA-256.
 pub fn download_pending_models<F>(
     manifest: &ModelManifest,
+    managed_models_dir: &Path,
+    fallback_search_dirs: &[PathBuf],
+    cancel_flag: &AtomicBool,
+    on_progress: F,
+) -> Result<ModelManifestStatusDto, String>
+where
+    F: FnMut(ModelDownloadProgressDto),
+{
+    download_selected_models(
+        manifest,
+        None,
+        managed_models_dir,
+        fallback_search_dirs,
+        cancel_flag,
+        on_progress,
+    )
+}
+
+/// Downloads a specific opt-in model pack (e.g. `bisenet-face-parsing` or `lama-inpainting`)
+/// on demand into `managed_models_dir` with live progress events and SHA-256 verification.
+pub fn download_optional_model_by_id<F>(
+    manifest: &ModelManifest,
+    model_id: &str,
+    managed_models_dir: &Path,
+    fallback_search_dirs: &[PathBuf],
+    cancel_flag: &AtomicBool,
+    on_progress: F,
+) -> Result<ModelManifestStatusDto, String>
+where
+    F: FnMut(ModelDownloadProgressDto),
+{
+    let trimmed = model_id.trim();
+    if !manifest.models.iter().any(|m| m.id == trimmed) {
+        return Err(format!("Unknown model pack '{trimmed}'."));
+    }
+    download_selected_models(
+        manifest,
+        Some(trimmed),
+        managed_models_dir,
+        fallback_search_dirs,
+        cancel_flag,
+        on_progress,
+    )
+}
+
+fn download_selected_models<F>(
+    manifest: &ModelManifest,
+    only_model_id: Option<&str>,
     managed_models_dir: &Path,
     fallback_search_dirs: &[PathBuf],
     cancel_flag: &AtomicBool,
@@ -364,6 +414,10 @@ where
     let pending: Vec<&ModelManifestEntry> = manifest
         .models
         .iter()
+        .filter(|entry| match only_model_id {
+            Some(target_id) => entry.id == target_id,
+            None => entry.required,
+        })
         .filter(|entry| {
             initial
                 .entries
@@ -661,7 +715,13 @@ mod tests {
         let manifest = load_models_manifest(&[]).expect("embedded manifest should parse");
         assert_eq!(manifest.schema_version, 1);
         assert_eq!(manifest.release_tag, "models-v1");
-        assert_eq!(manifest.models.len(), 6);
+        assert_eq!(manifest.models.len(), 8);
+        let required_count = manifest.models.iter().filter(|m| m.required).count();
+        let optional_count = manifest.models.iter().filter(|m| !m.required).count();
+        assert_eq!(required_count, 6);
+        assert_eq!(optional_count, 2);
+        assert!(manifest.models.iter().any(|m| m.id == "bisenet-face-parsing" && !m.required));
+        assert!(manifest.models.iter().any(|m| m.id == "lama-inpainting" && !m.required));
         assert!(manifest.models.iter().all(|m| !m.sha256.is_empty() && m.size_bytes > 0));
     }
 

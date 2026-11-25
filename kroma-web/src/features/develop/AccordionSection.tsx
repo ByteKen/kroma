@@ -27,17 +27,17 @@ export function AccordionSection({
   children,
 }: AccordionSectionProps) {
   return (
-    <section className="border-b border-hairline/80 last:border-b-0">
-      <div className="flex items-center justify-between gap-2 px-3 py-2.5 hover:bg-surface/60 transition-colors select-none">
+    <section className="border-b border-hairline/55 last:border-b-0">
+      <div className="flex items-center justify-between gap-2 px-4 py-3 hover:bg-surface/45 transition-colors duration-150 select-none">
         <button
           type="button"
           onClick={onToggle}
           aria-expanded={open}
-          className="flex-1 flex items-center gap-2 text-left min-w-0 cursor-pointer"
+          className="flex-1 flex items-center gap-2 text-left min-w-0 cursor-pointer focus-visible:outline-none focus-visible:text-amber-soft"
         >
           <span
-            className={`material-symbols-outlined text-[16px] text-ink-telemetry transition-transform duration-150 ${
-              open ? 'rotate-90 text-ink-primary' : ''
+            className={`material-symbols-outlined text-[15px] text-ink-telemetry/80 transition-transform duration-150 ${
+              open ? 'rotate-90 text-ink-secondary' : ''
             }`}
           >
             chevron_right
@@ -60,7 +60,7 @@ export function AccordionSection({
               type="button"
               onClick={onReset}
               title={`Reset ${title}`}
-              className="tabular-nums-mono text-[9.5px] text-ink-telemetry hover:text-amber-soft px-1 py-0.5 rounded transition-colors cursor-pointer"
+              className="tabular-nums-mono text-[10px] text-ink-telemetry hover:text-amber-soft px-1.5 py-0.5 rounded transition-colors cursor-pointer"
             >
               Reset
             </button>
@@ -77,7 +77,7 @@ export function AccordionSection({
             transition={FAST_FADE}
             className="overflow-hidden"
           >
-            <div className="px-3 pb-3.5 pt-1 flex flex-col gap-2.5">{children}</div>
+            <div className="px-4 pb-4 pt-0.5 flex flex-col gap-2.5">{children}</div>
           </motion.div>
         )}
       </AnimatePresence>

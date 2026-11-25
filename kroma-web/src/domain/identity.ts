@@ -202,8 +202,43 @@ export interface ShootTimelinePhoto {
   readonly proximityRank: number;
 }
 
-const naturalFileCompare = (a: string, b: string) =>
-  a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+/**
+ * Natural, case-insensitive A–Z comparator (`"Folder 2"` before `"Folder 10"`, `"a"` == `"A"`).
+ */
+export function compareNaturalAlphabetical(a: string, b: string): number {
+  return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+/**
+ * Sorts subject clusters alphabetically A–Z by display name (case-insensitive, natural numeric),
+ * keeping special system buckets (`_group_photos`, `_no_face_photos`) pinned at the end.
+ */
+export function compareSubjectClustersAlphabetically(
+  a: SubjectCluster,
+  b: SubjectCluster,
+): number {
+  const aSpecial = a.anchor.id.startsWith('_');
+  const bSpecial = b.anchor.id.startsWith('_');
+  if (aSpecial !== bSpecial) {
+    return aSpecial ? 1 : -1;
+  }
+  return (
+    compareNaturalAlphabetical(a.anchor.subjectName, b.anchor.subjectName) ||
+    compareNaturalAlphabetical(a.anchor.id, b.anchor.id)
+  );
+}
+
+/**
+ * Sorts photos naturally A–Z by filename (with deterministic ID tie-breaker).
+ */
+export function comparePhotosAlphabetically(a: PhotoAsset, b: PhotoAsset): number {
+  return (
+    compareNaturalAlphabetical(a.fileName, b.fileName) ||
+    compareNaturalAlphabetical(a.id, b.id)
+  );
+}
+
+const naturalFileCompare = compareNaturalAlphabetical;
 
 /**
  * Flattens all photos across the shoot (clusters + review queue) into a single unorganized

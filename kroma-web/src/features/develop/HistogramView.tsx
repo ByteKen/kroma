@@ -48,25 +48,14 @@ export function HistogramView({
   }, [recipe, liveHistogram]);
 
   return (
-    <div className="p-2.5 rounded-lg bg-surface-elevated border border-hairline flex flex-col gap-2">
-      <div className="flex items-center justify-between tabular-nums-mono text-[10px]">
-        <span className="uppercase tracking-wider text-ink-telemetry font-semibold">
-          {liveHistogram ? 'RGB Histogram (Live)' : 'RGB Histogram'}
-        </span>
-        <span className="text-ink-secondary">
-          {recipe.whiteBalance.temperatureKelvin}K •{' '}
-          {recipe.basicTone.exposureEv >= 0 ? '+' : ''}
-          {recipe.basicTone.exposureEv.toFixed(2)} EV
-        </span>
-      </div>
-
-      {/* Crisp Darkroom RGB Waveform Canvas + Lightroom Clipping Triangles (J) */}
-      <div className="h-[78px] w-full rounded bg-canvas border border-hairline relative overflow-hidden">
-        <div className="absolute inset-0 grid grid-cols-5 pointer-events-none">
-          {[0, 1, 2, 3, 4].map((idx) => (
+    <div className="flex flex-col gap-2">
+      {/* Frameless Darkroom RGB Waveform Canvas + Quiet Clipping Triangles (J) */}
+      <div className="h-[74px] w-full rounded-xl bg-surface-lowest/95 border border-hairline/60 relative overflow-hidden">
+        <div className="absolute inset-0 grid grid-cols-4 pointer-events-none">
+          {[0, 1, 2, 3].map((idx) => (
             <div
               key={idx}
-              className={idx < 4 ? 'border-r border-hairline/40 h-full' : 'h-full'}
+              className={idx < 3 ? 'border-r border-white/[0.04] h-full' : 'h-full'}
             />
           ))}
         </div>
@@ -79,12 +68,12 @@ export function HistogramView({
             title="Show Shadow Clipping (J) — blue overlay on crushed blacks"
             aria-label="Toggle shadow clipping warning"
             aria-pressed={showShadowClip}
-            className={`absolute top-1 left-1 z-10 w-4 h-4 rounded flex items-center justify-center transition-colors cursor-pointer ${
+            className={`absolute top-1.5 left-1.5 z-10 w-4 h-4 rounded flex items-center justify-center transition-all duration-150 cursor-pointer ${
               showShadowClip
-                ? 'bg-blue-500/30 border border-blue-400 text-blue-300'
+                ? 'bg-blue-500/30 border border-blue-400/80 text-blue-300 opacity-100'
                 : shadowsClipped
-                  ? 'bg-surface-lowest/75 border border-blue-500/50 text-blue-400 hover:bg-blue-500/20'
-                  : 'bg-surface-lowest/60 border border-hairline text-ink-telemetry/60 hover:text-ink-primary'
+                  ? 'bg-black/50 text-blue-400 opacity-85 hover:opacity-100'
+                  : 'text-ink-telemetry/50 opacity-45 hover:opacity-100 hover:text-ink-primary'
             }`}
           >
             <span className="text-[8px] leading-none">▲</span>
@@ -99,12 +88,12 @@ export function HistogramView({
             title="Show Highlight Clipping (J) — red overlay on blown whites"
             aria-label="Toggle highlight clipping warning"
             aria-pressed={showHighlightClip}
-            className={`absolute top-1 right-1 z-10 w-4 h-4 rounded flex items-center justify-center transition-colors cursor-pointer ${
+            className={`absolute top-1.5 right-1.5 z-10 w-4 h-4 rounded flex items-center justify-center transition-all duration-150 cursor-pointer ${
               showHighlightClip
-                ? 'bg-red-500/30 border border-red-400 text-red-300'
+                ? 'bg-red-500/30 border border-red-400/80 text-red-300 opacity-100'
                 : highlightsClipped
-                  ? 'bg-surface-lowest/75 border border-red-500/50 text-red-400 hover:bg-red-500/20'
-                  : 'bg-surface-lowest/60 border border-hairline text-ink-telemetry/60 hover:text-ink-primary'
+                  ? 'bg-black/50 text-red-400 opacity-85 hover:opacity-100'
+                  : 'text-ink-telemetry/50 opacity-45 hover:opacity-100 hover:text-ink-primary'
             }`}
           >
             <span className="text-[8px] leading-none">▲</span>
@@ -119,31 +108,39 @@ export function HistogramView({
         >
           <path
             d={redPath}
-            fill="rgba(239, 68, 68, 0.34)"
-            stroke="rgba(239, 68, 68, 0.85)"
+            fill="rgba(239, 68, 68, 0.28)"
+            stroke="rgba(239, 68, 68, 0.78)"
             strokeWidth="1"
           />
           <path
             d={greenPath}
-            fill="rgba(16, 185, 129, 0.30)"
-            stroke="rgba(78, 222, 163, 0.85)"
+            fill="rgba(16, 185, 129, 0.25)"
+            stroke="rgba(78, 222, 163, 0.78)"
             strokeWidth="1"
           />
           <path
             d={bluePath}
-            fill="rgba(59, 130, 246, 0.32)"
-            stroke="rgba(96, 165, 250, 0.85)"
+            fill="rgba(59, 130, 246, 0.28)"
+            stroke="rgba(96, 165, 250, 0.78)"
             strokeWidth="1"
           />
         </svg>
       </div>
 
-      {/* Compact EXIF Strip */}
-      <div className="flex items-center justify-between tabular-nums-mono text-[10px] text-ink-telemetry">
-        <span>ISO {exif.iso}</span>
-        <span>{exif.focalLengthMm}</span>
-        <span>{exif.aperture}</span>
-        <span>{exif.shutterSpeed}</span>
+      {/* Quiet Telemetry & EXIF Readout */}
+      <div className="flex items-center justify-between gap-2 px-0.5 tabular-nums-mono text-[10px] text-ink-telemetry">
+        <div className="flex items-center gap-1.5 truncate">
+          <span>ISO {exif.iso}</span>
+          <span className="opacity-40">·</span>
+          <span>{exif.focalLengthMm}</span>
+          <span className="opacity-40">·</span>
+          <span>{exif.aperture}</span>
+        </div>
+        <span className="text-ink-secondary shrink-0">
+          {recipe.whiteBalance.temperatureKelvin}K ·{' '}
+          {recipe.basicTone.exposureEv >= 0 ? '+' : ''}
+          {recipe.basicTone.exposureEv.toFixed(2)} EV
+        </span>
       </div>
     </div>
   );

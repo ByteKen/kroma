@@ -31,12 +31,18 @@ import {
 } from './SubjectHoverPreviewCard';
 
 const SORT_LABELS: Record<AnchorSortMode, string> = {
+  alphabetical: 'A–Z',
   capture_time: 'Order',
   confidence: 'Confidence',
   exposures: 'Count',
 };
 
-const SORT_ORDER: readonly AnchorSortMode[] = ['capture_time', 'exposures', 'confidence'];
+const SORT_ORDER: readonly AnchorSortMode[] = [
+  'alphabetical',
+  'capture_time',
+  'exposures',
+  'confidence',
+];
 
 export const SlateAnchorColumn = memo(function SlateAnchorColumn() {
   const {

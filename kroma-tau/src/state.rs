@@ -1,15 +1,19 @@
+use crate::dto::FaceOverlayDto;
 use kroma_app::use_cases::cluster_shoot::{PhotoScanTarget, PreExtractedPhotoScan};
 use kroma_domain::develop::DevelopRecipe;
 use kroma_domain::identity::ShootOrganizationPlan;
+use kroma_domain::retouch::{FaceParseMap, PortraitFaceGuide};
 use kroma_infra::develop::image_decoder::DecodedDevelopBuffer;
+use kroma_infra::vision::face_parser::OnnxBiSeNetFaceParser;
+use kroma_infra::vision::lama_inpainter::OnnxLamaInpainter;
 use kroma_infra::vision::ppocr_v5::PpOcrV5Engine;
 use kroma_infra::vision::subject_segmenter::OnnxSubjectSegmenter;
 use kroma_infra::vision::yunet_detector::YuNetOnnxDetector;
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 const MAX_ORGANIZATION_HISTORY: usize = 50;
 const MAX_DEVELOP_BUFFER_CACHE: usize = 12;
@@ -153,16 +157,301 @@ pub struct ActiveShootContext {
     /// In-memory cached face detections & embeddings keyed by recognition model path
     /// so adjusting Match strictness or Time Assist re-clusters in <0.1s!
     pub cached_face_scans: Option<(String, Vec<PreExtractedPhotoScan>)>,
+    /// Per-photo YuNet face guides detected on-demand for Portrait Retouching (Single-Photo or un-clustered shoots)
+    pub detected_face_guides: HashMap<String, Vec<PortraitFaceGuide>>,
+    /// Per-photo UI face overlay DTOs detected on-demand for live Portrait Retouching
+    pub detected_face_overlays: HashMap<String, FaceOverlayDto>,
+    /// Per-photo BiSeNet 19-class semantic FaceParseMap cached keyed by `(photo_id, orientation_key)`
+    pub detected_face_parse_maps: HashMap<String, (String, FaceParseMap)>,
     /// Maps directory bucket id -> (display name, photo count)
     pub directory_summaries: Vec<(String, String, usize)>,
 }
 
 pub type CachedOcrEngine = Arc<Mutex<Option<(String, Arc<PpOcrV5Engine>)>>>;
 pub type CachedSegmenterEngine = Arc<Mutex<Option<(String, Arc<OnnxSubjectSegmenter>)>>>;
+pub type CachedFaceParserEngine = Arc<Mutex<Option<(String, Arc<OnnxBiSeNetFaceParser>)>>>;
+pub type CachedLamaEngine = Arc<Mutex<Option<(String, Arc<OnnxLamaInpainter>)>>>;
 pub type CachedYuNetEngine = Arc<Mutex<Option<(String, Arc<YuNetOnnxDetector>)>>>;
 pub type CachedStdHistBuffers = Arc<Mutex<Vec<(String, Arc<DecodedDevelopBuffer>)>>>;
 pub type CachedHiResBuffers = Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>;
 pub type CachedNativeDims = Arc<Mutex<HashMap<String, (u32, u32)>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThumbnailProgressSnapshot {
+    pub active: bool,
+    pub completed: usize,
+    pub total: usize,
+    pub mode: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveThumbnailWorker {
+    completed: usize,
+    total: usize,
+    mode: String,
+}
+
+/// Coordinates concurrent full-shoot and targeted single-photo 32-bit thumbnail workers so the
+/// bottom status pill can never remain stuck on `0/1` due to generation-invalidation races,
+/// overlapping edits, or background worker panics.
+#[derive(Debug, Default)]
+pub struct ThumbnailProgressTracker {
+    active_workers: HashMap<u64, ActiveThumbnailWorker>,
+    next_worker_id: u64,
+}
+
+impl ThumbnailProgressTracker {
+    pub fn try_register_worker(
+        &mut self,
+        thumb_gen: &AtomicU64,
+        load_gen: &AtomicU64,
+        expected_thumb_gen: u64,
+        expected_load_gen: u64,
+        total: usize,
+        mode: String,
+    ) -> Option<(u64, ThumbnailProgressSnapshot)> {
+        if total == 0
+            || thumb_gen.load(Ordering::SeqCst) != expected_thumb_gen
+            || load_gen.load(Ordering::SeqCst) != expected_load_gen
+        {
+            return None;
+        }
+        self.next_worker_id = self.next_worker_id.wrapping_add(1).max(1);
+        let worker_id = self.next_worker_id;
+        self.active_workers.insert(
+            worker_id,
+            ActiveThumbnailWorker {
+                completed: 0,
+                total,
+                mode: mode.clone(),
+            },
+        );
+        let snapshot = self.aggregated_snapshot(&mode);
+        Some((worker_id, snapshot))
+    }
+
+    pub fn update_worker(
+        &mut self,
+        worker_id: u64,
+        completed: usize,
+    ) -> Option<ThumbnailProgressSnapshot> {
+        let mode = {
+            let worker = self.active_workers.get_mut(&worker_id)?;
+            worker.completed = completed.min(worker.total);
+            worker.mode.clone()
+        };
+        Some(self.aggregated_snapshot(&mode))
+    }
+
+    pub fn finish_worker(
+        &mut self,
+        worker_id: u64,
+        fallback_mode: &str,
+    ) -> Option<ThumbnailProgressSnapshot> {
+        let removed = self.active_workers.remove(&worker_id)?;
+        if self.active_workers.is_empty() {
+            Some(ThumbnailProgressSnapshot {
+                active: false,
+                completed: removed.total,
+                total: removed.total,
+                mode: if removed.mode.is_empty() {
+                    fallback_mode.to_string()
+                } else {
+                    removed.mode
+                },
+            })
+        } else {
+            Some(self.aggregated_snapshot(fallback_mode))
+        }
+    }
+
+    pub fn invalidate_and_bump(
+        &mut self,
+        thumb_gen: &AtomicU64,
+        mode: &str,
+    ) -> (u64, bool, ThumbnailProgressSnapshot) {
+        let next_gen = thumb_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let had_active = !self.active_workers.is_empty();
+        self.active_workers.clear();
+        (
+            next_gen,
+            had_active,
+            ThumbnailProgressSnapshot {
+                active: false,
+                completed: 0,
+                total: 0,
+                mode: mode.to_string(),
+            },
+        )
+    }
+
+    pub fn has_active_workers(&self) -> bool {
+        !self.active_workers.is_empty()
+    }
+
+    fn aggregated_snapshot(&self, fallback_mode: &str) -> ThumbnailProgressSnapshot {
+        let mut completed = 0usize;
+        let mut total = 0usize;
+        let mut mode: Option<&str> = None;
+        for worker in self.active_workers.values() {
+            completed = completed.saturating_add(worker.completed);
+            total = total.saturating_add(worker.total);
+            if mode.is_none() && !worker.mode.is_empty() {
+                mode = Some(worker.mode.as_str());
+            }
+        }
+        ThumbnailProgressSnapshot {
+            active: total > 0 && completed < total,
+            completed,
+            total,
+            mode: mode.unwrap_or(fallback_mode).to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevelopDecodePriority {
+    Active,
+    Prefetch,
+}
+
+impl DevelopDecodePriority {
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some("prefetch") => Self::Prefetch,
+            _ => Self::Active,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DevelopDecodeTicket {
+    pub priority: DevelopDecodePriority,
+    pub generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct DevelopDecodeQueueState {
+    active_gen: u64,
+    running: bool,
+    waiting_active: usize,
+}
+
+/// Latest-wins priority scheduler for heavy Camera RAW working-buffer decodes.
+///
+/// Guarantees at most one heavy multi-threaded Bayer demosaic runs at a time so rapid subject or
+/// photo switching never stacks competing Rayon decodes that starve the selected frame or drop
+/// UI FPS. RAM LRU hits and SSD `.kr16` cache hits bypass `acquire_demosaic_slot` completely.
+#[derive(Debug, Default)]
+pub struct DevelopDecodeScheduler {
+    queue: Mutex<DevelopDecodeQueueState>,
+    cv: Condvar,
+    active_gen_fast: AtomicU64,
+}
+
+pub struct DevelopDecodePermit {
+    scheduler: Arc<DevelopDecodeScheduler>,
+}
+
+impl Drop for DevelopDecodePermit {
+    fn drop(&mut self) {
+        let mut guard = self
+            .scheduler
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.running = false;
+        drop(guard);
+        self.scheduler.cv.notify_all();
+    }
+}
+
+impl DevelopDecodeScheduler {
+    pub fn begin_request(&self, priority: DevelopDecodePriority) -> DevelopDecodeTicket {
+        match priority {
+            DevelopDecodePriority::Active => {
+                let mut guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                guard.active_gen = guard.active_gen.wrapping_add(1);
+                let generation = guard.active_gen;
+                self.active_gen_fast.store(generation, Ordering::Release);
+                drop(guard);
+                self.cv.notify_all();
+                DevelopDecodeTicket {
+                    priority,
+                    generation,
+                }
+            }
+            DevelopDecodePriority::Prefetch => {
+                let generation = self.active_gen_fast.load(Ordering::Acquire);
+                DevelopDecodeTicket {
+                    priority,
+                    generation,
+                }
+            }
+        }
+    }
+
+    /// Invalidates all in-flight or queued decode tickets (e.g., on folder switch or cache clear)
+    /// and wakes waiting workers immediately.
+    pub fn invalidate(&self) {
+        let _ = self.begin_request(DevelopDecodePriority::Active);
+    }
+
+    pub fn is_superseded(&self, ticket: &DevelopDecodeTicket) -> bool {
+        self.active_gen_fast.load(Ordering::Acquire) != ticket.generation
+    }
+
+    /// Acquires the single heavy RAW demosaic slot if `ticket` is still the latest winner.
+    /// Returns `None` immediately when superseded by a newer `Active` selection.
+    pub fn acquire_demosaic_slot(
+        self: &Arc<Self>,
+        ticket: DevelopDecodeTicket,
+    ) -> Option<DevelopDecodePermit> {
+        let mut guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        match ticket.priority {
+            DevelopDecodePriority::Active => {
+                if guard.active_gen != ticket.generation {
+                    return None;
+                }
+                guard.waiting_active += 1;
+                while guard.running && guard.active_gen == ticket.generation {
+                    guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                }
+                guard.waiting_active = guard.waiting_active.saturating_sub(1);
+                if guard.active_gen != ticket.generation {
+                    return None;
+                }
+                guard.running = true;
+                Some(DevelopDecodePermit {
+                    scheduler: Arc::clone(self),
+                })
+            }
+            DevelopDecodePriority::Prefetch => {
+                while guard.running || guard.waiting_active > 0 {
+                    if guard.active_gen != ticket.generation {
+                        return None;
+                    }
+                    guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                }
+                if guard.active_gen != ticket.generation {
+                    return None;
+                }
+                guard.running = true;
+                Some(DevelopDecodePermit {
+                    scheduler: Arc::clone(self),
+                })
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn waiting_active_count(&self) -> usize {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiting_active
+    }
+}
 
 pub struct AppState {
     pub default_preview_cache_dir: PathBuf,
@@ -173,14 +462,21 @@ pub struct AppState {
     pub active_shoot: Arc<Mutex<Option<ActiveShootContext>>>,
     pub load_generation: Arc<AtomicU64>,
     pub thumbnail_render_generation: Arc<AtomicU64>,
+    pub thumbnail_progress_tracker: Arc<Mutex<ThumbnailProgressTracker>>,
     pub export_estimate_generation: Arc<AtomicU64>,
     pub custom_yunet_path: Arc<Mutex<Option<PathBuf>>>,
     pub custom_recognizer_path: Arc<Mutex<Option<PathBuf>>>,
     pub custom_segmenter_path: Arc<Mutex<Option<PathBuf>>>,
+    pub custom_face_parser_path: Arc<Mutex<Option<PathBuf>>>,
+    pub custom_lama_path: Arc<Mutex<Option<PathBuf>>>,
     /// Cached warmed-up PP-OCRv5 engine keyed by model paths so single-photo re-scans run in <100ms
     pub cached_ocr_engine: CachedOcrEngine,
     /// Cached warmed-up ONNX subject segmenter & YuNet detector for instant AI Masking (<200ms)
     pub cached_segmenter_engine: CachedSegmenterEngine,
+    /// Cached warmed-up opt-in BiSeNet Face Parsing ONNX engine (Phase 3)
+    pub cached_face_parser_engine: CachedFaceParserEngine,
+    /// Cached warmed-up opt-in LaMa Generative Inpainting ONNX engine (Phase 3)
+    pub cached_lama_engine: CachedLamaEngine,
     pub cached_yunet_engine: CachedYuNetEngine,
     /// Bounded LRU cache (max 12 entries) of decoded 16-bit half-float `KR16` Develop
     /// buffers + compact 384px linear histogram proxies for instant RAW switching & live histograms.
@@ -195,6 +491,8 @@ pub struct AppState {
     pub hi_res_develop_buffer_cache: CachedHiResBuffers,
     /// Lightweight header-only `(width, height)` cache for true `1:1` zoom calculations.
     pub photo_native_dims_cache: CachedNativeDims,
+    /// Latest-wins priority scheduler preventing competing concurrent RAW Bayer demosaics.
+    pub develop_decode_scheduler: Arc<DevelopDecodeScheduler>,
 }
 
 impl AppState {
@@ -211,12 +509,17 @@ impl AppState {
             active_shoot: Arc::new(Mutex::new(None)),
             load_generation: Arc::new(AtomicU64::new(0)),
             thumbnail_render_generation: Arc::new(AtomicU64::new(0)),
+            thumbnail_progress_tracker: Arc::new(Mutex::new(ThumbnailProgressTracker::default())),
             export_estimate_generation: Arc::new(AtomicU64::new(0)),
             custom_yunet_path: Arc::new(Mutex::new(None)),
             custom_recognizer_path: Arc::new(Mutex::new(None)),
             custom_segmenter_path: Arc::new(Mutex::new(None)),
+            custom_face_parser_path: Arc::new(Mutex::new(None)),
+            custom_lama_path: Arc::new(Mutex::new(None)),
             cached_ocr_engine: Arc::new(Mutex::new(None)),
             cached_segmenter_engine: Arc::new(Mutex::new(None)),
+            cached_face_parser_engine: Arc::new(Mutex::new(None)),
+            cached_lama_engine: Arc::new(Mutex::new(None)),
             cached_yunet_engine: Arc::new(Mutex::new(None)),
             develop_buffer_cache: Arc::new(Mutex::new(Vec::with_capacity(
                 MAX_DEVELOP_BUFFER_CACHE,
@@ -228,6 +531,7 @@ impl AppState {
                 MAX_HI_RES_DEVELOP_BUFFER_CACHE,
             ))),
             photo_native_dims_cache: Arc::new(Mutex::new(HashMap::new())),
+            develop_decode_scheduler: Arc::new(DevelopDecodeScheduler::default()),
         }
     }
 
@@ -333,6 +637,17 @@ impl AppState {
         Some(bytes)
     }
 
+    /// Returns the most recently cached `KR32`/`KR16` high-bit-depth working wire buffer for
+    /// `source_path` (if Studio already decoded this RAW/TIFF/16-bit photo into RAM).
+    pub fn get_cached_develop_wire_for_source(&self, source_path: &str) -> Option<Arc<Vec<u8>>> {
+        let guard = self.develop_buffer_cache.lock().ok()?;
+        guard
+            .iter()
+            .rev()
+            .find(|entry| entry.source_path == source_path)
+            .map(|entry| Arc::clone(&entry.kr16_bytes))
+    }
+
     pub fn get_cached_hist_buffer(&self, source_path: &str) -> Option<Arc<DecodedDevelopBuffer>> {
         if let Ok(guard) = self.develop_buffer_cache.lock()
             && let Some(entry) = guard
@@ -408,6 +723,7 @@ impl AppState {
     }
 
     pub fn clear_develop_buffer_cache(&self) {
+        self.develop_decode_scheduler.invalidate();
         if let Ok(mut guard) = self.develop_buffer_cache.lock() {
             guard.clear();
         }
@@ -463,6 +779,106 @@ impl AppState {
             .ok()
             .and_then(|g| g.clone())
             .is_some_and(|p| p.is_file())
+    }
+
+    pub fn has_custom_face_parser(&self) -> bool {
+        self.custom_face_parser_path
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_some_and(|p| p.is_file())
+    }
+
+    pub fn has_custom_lama(&self) -> bool {
+        self.custom_lama_path
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_some_and(|p| p.is_file())
+    }
+
+    /// Resolves active BiSeNet Face Parsing ONNX model (custom override -> `models/retouch/`).
+    pub fn resolve_face_parser_model_path(&self) -> Option<PathBuf> {
+        let custom = self
+            .custom_face_parser_path
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .filter(|p| p.is_file());
+        custom.or_else(|| self.resolve_default_face_parser_model_path())
+    }
+
+    pub fn resolve_default_face_parser_model_path(&self) -> Option<PathBuf> {
+        let mut search_dirs = Vec::new();
+        for base in self.model_search_dirs() {
+            search_dirs.push(base.join("retouch"));
+            search_dirs.push(base);
+        }
+        for dir in search_dirs {
+            if !dir.is_dir() {
+                continue;
+            }
+            if let Some(found) = find_matching_onnx(&dir, "parsing")
+                .or_else(|| find_matching_onnx(&dir, "bisenet"))
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    pub fn face_parser_model_label(model_path: Option<&Path>) -> String {
+        let Some(raw_name) = model_path.and_then(|p| p.file_name()).and_then(|n| n.to_str()) else {
+            return "YuNet 5-Point (Built-in)".to_string();
+        };
+        let lower = raw_name.to_ascii_lowercase();
+        if lower.contains("resnet34") {
+            "BiSeNet ResNet-34 Face Parsing".to_string()
+        } else if lower.contains("resnet18") || lower.contains("parsing") || lower.contains("bisenet") {
+            "BiSeNet Face Parsing".to_string()
+        } else {
+            raw_name.to_string()
+        }
+    }
+
+    /// Resolves active LaMa Generative Inpainting ONNX model (custom override -> `models/retouch/`).
+    pub fn resolve_lama_model_path(&self) -> Option<PathBuf> {
+        let custom = self
+            .custom_lama_path
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .filter(|p| p.is_file());
+        custom.or_else(|| self.resolve_default_lama_model_path())
+    }
+
+    pub fn resolve_default_lama_model_path(&self) -> Option<PathBuf> {
+        let mut search_dirs = Vec::new();
+        for base in self.model_search_dirs() {
+            search_dirs.push(base.join("retouch"));
+            search_dirs.push(base);
+        }
+        for dir in search_dirs {
+            if !dir.is_dir() {
+                continue;
+            }
+            if let Some(found) = find_matching_onnx(&dir, "lama") {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    pub fn lama_model_label(model_path: Option<&Path>) -> String {
+        let Some(raw_name) = model_path.and_then(|p| p.file_name()).and_then(|n| n.to_str()) else {
+            return "Harmonic Fill (Built-in)".to_string();
+        };
+        let lower = raw_name.to_ascii_lowercase();
+        if lower.contains("lama") {
+            "LaMa Neural Inpainter".to_string()
+        } else {
+            raw_name.to_string()
+        }
     }
 
     /// Resolves active subject segmentation ONNX model (custom override -> bundled `./models/`).
@@ -852,5 +1268,194 @@ mod tests {
         state.clear_develop_buffer_cache();
         assert!(state.get_cached_hi_res_develop_buffer("a@6144").is_none());
         assert!(state.get_cached_native_dims("raw.arw").is_none());
+    }
+
+    #[test]
+    fn thumbnail_progress_tracker_prevents_stale_0_of_1_sticking_across_cancels_overlaps_and_panics() {
+        let thumb_gen = AtomicU64::new(1);
+        let load_gen = AtomicU64::new(1);
+        let mut tracker = ThumbnailProgressTracker::default();
+
+        // 1. Overlapping single-photo edits aggregate smoothly (0/1 -> 0/2 -> 1/2 -> inactive)
+        let (w1, s1) = tracker
+            .try_register_worker(&thumb_gen, &load_gen, 1, 1, 1, "edited_32bit".to_string())
+            .expect("worker 1 registers");
+        assert_eq!((s1.active, s1.completed, s1.total), (true, 0, 1));
+
+        let (w2, s2) = tracker
+            .try_register_worker(&thumb_gen, &load_gen, 1, 1, 1, "edited_32bit".to_string())
+            .expect("worker 2 registers");
+        assert_eq!((s2.active, s2.completed, s2.total), (true, 0, 2));
+
+        // Finishing worker 1 keeps progress active for remaining worker 2
+        let after_w1 = tracker
+            .finish_worker(w1, "edited_32bit")
+            .expect("worker 1 finish emits remaining progress");
+        assert_eq!((after_w1.active, after_w1.completed, after_w1.total), (true, 0, 1));
+
+        // Finishing worker 2 clears pill cleanly
+        let after_w2 = tracker
+            .finish_worker(w2, "edited_32bit")
+            .expect("worker 2 finish clears pill");
+        assert!(!after_w2.active);
+        assert!(!tracker.has_active_workers());
+
+        // 2. Generation invalidation (e.g. open folder / clear cache / full pass) rejects stale
+        //    registration (eliminating TOCTOU 0/1 leak) and ignores stale worker finish events
+        let (w3, s3) = tracker
+            .try_register_worker(&thumb_gen, &load_gen, 1, 1, 1, "edited_32bit".to_string())
+            .expect("worker 3 registers");
+        assert!(s3.active);
+
+        let (next_gen, had_active, cleared) =
+            tracker.invalidate_and_bump(&thumb_gen, "edited_32bit");
+        assert_eq!(next_gen, 2);
+        assert!(had_active);
+        assert!(!cleared.active);
+
+        // Stale gen-1 worker that wakes up late cannot register `0/1`
+        assert!(tracker
+            .try_register_worker(&thumb_gen, &load_gen, 1, 1, 1, "edited_32bit".to_string())
+            .is_none());
+
+        // Start a fresh gen-2 worker, then let cancelled gen-1 worker w3 unwind/finish:
+        // w3 must be a strict no-op and NEVER clobber gen-2 progress!
+        let (w4, s4) = tracker
+            .try_register_worker(&thumb_gen, &load_gen, 2, 1, 4, "all_32bit".to_string())
+            .expect("gen-2 worker registers");
+        assert_eq!((s4.active, s4.completed, s4.total), (true, 0, 4));
+        assert!(tracker.update_worker(w3, 1).is_none());
+        assert!(tracker.finish_worker(w3, "edited_32bit").is_none());
+        assert!(tracker.has_active_workers());
+
+        // Advance and finish gen-2 worker cleanly
+        let mid = tracker.update_worker(w4, 2).expect("gen-2 update");
+        assert_eq!((mid.active, mid.completed, mid.total), (true, 2, 4));
+        let done = tracker.finish_worker(w4, "all_32bit").expect("gen-2 done");
+        assert!(!done.active);
+
+        // 3. Load generation mismatch also rejects stale worker registration
+        load_gen.fetch_add(1, Ordering::SeqCst);
+        assert!(tracker
+            .try_register_worker(&thumb_gen, &load_gen, 2, 1, 1, "edited_32bit".to_string())
+            .is_none());
+    }
+
+    #[test]
+    fn develop_decode_scheduler_latest_active_wins_and_preempts_stale_waiters() {
+        let scheduler = Arc::new(DevelopDecodeScheduler::default());
+        assert_eq!(
+            DevelopDecodePriority::parse(Some("prefetch")),
+            DevelopDecodePriority::Prefetch
+        );
+        assert_eq!(
+            DevelopDecodePriority::parse(Some("active")),
+            DevelopDecodePriority::Active
+        );
+        assert_eq!(
+            DevelopDecodePriority::parse(None),
+            DevelopDecodePriority::Active
+        );
+
+        // Worker 1 holds the single heavy Bayer demosaic slot.
+        let t1 = scheduler.begin_request(DevelopDecodePriority::Active);
+        let permit1 = scheduler
+            .acquire_demosaic_slot(t1)
+            .expect("initial active request acquires demosaic slot immediately");
+
+        // User rapidly clicks photo 2 (`t2`) while a background prefetch (`p2`) also queues.
+        let t2 = scheduler.begin_request(DevelopDecodePriority::Active);
+        let p2 = scheduler.begin_request(DevelopDecodePriority::Prefetch);
+        assert!(scheduler.is_superseded(&t1));
+        assert!(!scheduler.is_superseded(&t2));
+        assert!(!scheduler.is_superseded(&p2));
+
+        let s_t2 = Arc::clone(&scheduler);
+        let h_t2 = std::thread::spawn(move || s_t2.acquire_demosaic_slot(t2).is_some());
+        let s_p2 = Arc::clone(&scheduler);
+        let h_p2 = std::thread::spawn(move || s_p2.acquire_demosaic_slot(p2).is_some());
+
+        while scheduler.waiting_active_count() < 1 {
+            std::thread::yield_now();
+        }
+
+        // User clicks photo 3 (`t3`) before worker 1 finishes: both `t2` and `p2` must wake up
+        // and abort immediately without waiting for worker 1 to finish.
+        let t3 = scheduler.begin_request(DevelopDecodePriority::Active);
+        assert!(!h_t2.join().expect("t2 thread joined"));
+        assert!(!h_p2.join().expect("p2 thread joined"));
+        assert!(scheduler.is_superseded(&t2));
+        assert!(scheduler.is_superseded(&p2));
+        assert!(!scheduler.is_superseded(&t3));
+
+        // Queue `t3`, then release `permit1`: `t3` must immediately acquire the demosaic slot.
+        let s_t3 = Arc::clone(&scheduler);
+        let h_t3 = std::thread::spawn(move || {
+            let permit3 = s_t3.acquire_demosaic_slot(t3);
+            permit3.is_some()
+        });
+        while scheduler.waiting_active_count() < 1 {
+            std::thread::yield_now();
+        }
+        drop(permit1);
+        assert!(h_t3.join().expect("t3 thread joined"));
+    }
+
+    #[test]
+    fn develop_decode_scheduler_active_outranks_same_gen_prefetch_and_recovers_after_panic() {
+        let scheduler = Arc::new(DevelopDecodeScheduler::default());
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+        let t1 = scheduler.begin_request(DevelopDecodePriority::Active);
+        let permit1 = scheduler.acquire_demosaic_slot(t1).expect("t1 permit");
+
+        // Same generation `t2` (Active) and `p2` (Prefetch) both wait behind `permit1`.
+        let t2 = scheduler.begin_request(DevelopDecodePriority::Active);
+        let p2 = scheduler.begin_request(DevelopDecodePriority::Prefetch);
+
+        let s_t2 = Arc::clone(&scheduler);
+        let o_t2 = Arc::clone(&order);
+        let h_t2 = std::thread::spawn(move || {
+            let permit2 = s_t2
+                .acquire_demosaic_slot(t2)
+                .expect("active t2 must acquire slot ahead of same-gen prefetch");
+            o_t2.lock().unwrap().push("active");
+            drop(permit2);
+        });
+        while scheduler.waiting_active_count() < 1 {
+            std::thread::yield_now();
+        }
+
+        let s_p2 = Arc::clone(&scheduler);
+        let o_p2 = Arc::clone(&order);
+        let h_p2 = std::thread::spawn(move || {
+            let permit_p2 = s_p2
+                .acquire_demosaic_slot(p2)
+                .expect("prefetch runs cleanly once active finishes");
+            o_p2.lock().unwrap().push("prefetch");
+            drop(permit_p2);
+        });
+
+        // Give prefetch a brief moment to enter the wait queue behind active t2, then release t1.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(permit1);
+
+        h_t2.join().expect("t2 finished");
+        h_p2.join().expect("p2 finished");
+        assert_eq!(*order.lock().unwrap(), vec!["active", "prefetch"]);
+
+        // Panic while holding a permit must still release the slot cleanly via Drop.
+        let s_panic = Arc::clone(&scheduler);
+        let panicked = std::thread::spawn(move || {
+            let t_bad = s_panic.begin_request(DevelopDecodePriority::Active);
+            let _permit = s_panic.acquire_demosaic_slot(t_bad).expect("t_bad permit");
+            panic!("simulated demosaic panic");
+        })
+        .join();
+        assert!(panicked.is_err());
+
+        let t_next = scheduler.begin_request(DevelopDecodePriority::Active);
+        let permit_next = scheduler.acquire_demosaic_slot(t_next);
+        assert!(permit_next.is_some());
     }
 }

@@ -2,21 +2,23 @@ use crate::dto::{
     build_face_overlay, confidence_label, AmbiguousCandidateDto, BatchSyncResultDto,
     ClearCacheResultDto, ClusterDto, ClusterSlateOcrResultDto, DevelopRecipeDto,
     DevelopSyncMaskDto, DirectorySummaryDto, EstimateExportSizeRequestDto,
-    EstimateExportSizeResponseDto, ExportShootRequestDto, ExportShootResultDto, GeneratedAiMaskDto,
-    HistogramDto, ImportedCubeLutDto, ModelDownloadOutcomeDto, ModelInspectionDto,
-    ModelManifestStatusDto, OcrTextLineDto, PhotoDto, PhotoOcrResultDto,
-    PhotoRecipeSaveItemDto, PreviewPatchDto, PreviewsReadyBatchDto, RelativeDevelopDeltaDto,
-    RuntimeStatusDto, ScanProgressDto, ShootSessionDto, SlateRenameApplyItemDto,
-    StorageCacheSummaryDto, ThumbnailRenderProgressDto, VirtualFolderDto, WhiteBalanceDto,
+    EstimateExportSizeResponseDto, ExportShootRequestDto, ExportShootResultDto, FaceOverlayDto,
+    FaceParseMapDto, GeneratedAiMaskDto, GeneratedInpaintPatchDto, HistogramDto,
+    ImportedCubeLutDto, InpaintStrokeDto, ModelDownloadOutcomeDto, ModelInspectionDto,
+    ModelManifestStatusDto, OcrTextLineDto, PhotoDto, PhotoOcrResultDto, PhotoRecipeSaveItemDto,
+    PreviewPatchDto, PreviewsReadyBatchDto, RelativeDevelopDeltaDto, RuntimeStatusDto,
+    ScanProgressDto, ShootSessionDto, SlateRenameApplyItemDto, StorageCacheSummaryDto,
+    ThumbnailRenderProgressDto, VirtualFolderDto, WhiteBalanceDto,
 };
 use crate::face_cache;
 use crate::model_manager::{
-    download_app_update_installer, download_pending_models, inspect_manifest_status,
-    load_models_manifest, APP_UPDATE_PROGRESS_EVENT, MODEL_DOWNLOAD_PROGRESS_EVENT,
+    download_app_update_installer, download_optional_model_by_id, download_pending_models,
+    inspect_manifest_status, load_models_manifest, APP_UPDATE_PROGRESS_EVENT,
+    MODEL_DOWNLOAD_PROGRESS_EVENT,
 };
 use crate::state::{
-    ActiveShootContext, AppState, CachedDevelopBuffer, CachedOcrEngine, OrganizationHistory,
-    ShootSessionMode,
+    ActiveShootContext, AppState, CachedDevelopBuffer, CachedOcrEngine, DevelopDecodePriority,
+    OrganizationHistory, ShootSessionMode, ThumbnailProgressSnapshot, ThumbnailProgressTracker,
 };
 use image::codecs::jpeg::JpegEncoder;
 use kroma_app::ports::develop_engine::{ImageDevelopPort, OutputImageFormat};
@@ -37,7 +39,7 @@ use kroma_app::use_cases::edit_photo::{
 use kroma_app::use_cases::organize_shoot::{
     OrganizeExecutionMode, OrganizeShootFoldersUseCase, OrganizeShootInput,
 };
-use kroma_domain::develop::{DevelopRecipe, NormalizedRect};
+use kroma_domain::develop::{CropTransform, DevelopRecipe, NormalizedRect};
 use kroma_domain::masking::AiMaskKind;
 use kroma_domain::identity::{
     parse_filename_capture_hints, BoundingBox, ClusterId, ClusterPhotoEntry, DetectedFace,
@@ -46,12 +48,14 @@ use kroma_domain::identity::{
 };
 use kroma_domain::organization::OutputNamingTemplate;
 use kroma_domain::photo::PhotoId;
+use kroma_domain::retouch::{FaceParseMap, PortraitFaceGuide};
 use kroma_infra::develop::cube_lut::CubeLut3D;
 use kroma_infra::develop::image_decoder::{
     decode_develop_buffer, decode_fast_preview_max_dim, decode_high_bit_depth_working_buffer,
-    decode_kr16_downscaled_rgb32f, downscale_rgb32f_unclamped, encode_kr16_rgba16f,
-    encode_kr32_rgba32f, extract_exif_capture_timestamp_epoch_sec, is_16bit_png_path,
-    is_raw_photo_path, is_supported_photo_path, is_tiff_photo_path, is_web_native_image_path,
+    decode_kr16_downscaled_rgb32f, decode_working_wire_downscaled_rgb32f,
+    downscale_rgb32f_unclamped, encode_kr16_rgba16f, encode_kr32_rgba32f,
+    extract_exif_capture_timestamp_epoch_sec, is_16bit_png_path, is_raw_photo_path,
+    is_supported_photo_path, is_tiff_photo_path, is_web_native_image_path,
     read_native_photo_dimensions, supported_raw_extensions, DecodedDevelopBuffer,
 };
 use kroma_infra::develop::pixel_engine::RayonImageDevelopEngine;
@@ -61,6 +65,10 @@ use kroma_infra::develop::wgpu_engine::{
 use kroma_infra::organizer::local_file_organizer::LocalFileOrganizer;
 use kroma_infra::storage::json_organization_plan_store::JsonOrganizationPlanStore;
 use kroma_infra::storage::json_sidecar_store::JsonSidecarRecipeStore;
+use kroma_infra::vision::face_parser::OnnxBiSeNetFaceParser;
+use kroma_infra::vision::lama_inpainter::{
+    generate_inpaint_patch, InpaintStrokeInput, OnnxLamaInpainter,
+};
 use kroma_infra::vision::model_inspector::{
     inspect_onnx_model as inspect_onnx_model_file, ModelCompatibility, ModelRole,
 };
@@ -69,7 +77,9 @@ use kroma_infra::vision::onnx_runtime::{
     is_gpu_execution_provider_available, set_gpu_acceleration_enabled,
 };
 use kroma_infra::vision::ppocr_v5::{PpOcrV5Config, PpOcrV5Engine};
-use kroma_infra::vision::subject_segmenter::{generate_ai_mask_for_rgb, OnnxSubjectSegmenter};
+use kroma_infra::vision::subject_segmenter::{
+    generate_ai_mask_for_rgb_with_face_parser, OnnxSubjectSegmenter,
+};
 use kroma_infra::vision::yunet_detector::{YuNetConfig, YuNetOnnxDetector};
 use rayon::prelude::*;
 use std::collections::hash_map::DefaultHasher;
@@ -317,6 +327,8 @@ fn build_runtime_status_dto(state: &AppState) -> RuntimeStatusDto {
     let (ocr_det, ocr_rec, ocr_dict) = state.resolve_ocr_model_paths();
     let segmenter = state.resolve_segmenter_model_path();
     let default_segmenter = state.resolve_default_segmenter_model_path();
+    let face_parser = state.resolve_face_parser_model_path();
+    let lama = state.resolve_lama_model_path();
     let detector_model_label = AppState::detector_model_label(yunet.as_deref());
     let recognition_model_label = AppState::recognition_model_label(recognizer.as_deref());
     let default_detector_model_label = AppState::detector_model_label(default_yunet.as_deref());
@@ -327,9 +339,13 @@ fn build_runtime_status_dto(state: &AppState) -> RuntimeStatusDto {
     let segmenter_model_label = AppState::segmenter_model_label(segmenter.as_deref());
     let default_segmenter_model_label =
         AppState::segmenter_model_label(default_segmenter.as_deref());
+    let face_parser_model_label = AppState::face_parser_model_label(face_parser.as_deref());
+    let lama_model_label = AppState::lama_model_label(lama.as_deref());
     let models_ready = yunet.is_some() && recognizer.is_some();
     let ocr_models_ready = ocr_det.is_some() && ocr_rec.is_some() && ocr_dict.is_some();
     let segmenter_models_ready = segmenter.is_some();
+    let face_parser_ready = face_parser.is_some();
+    let lama_ready = lama.is_some();
     let gpu_available = is_gpu_execution_provider_available() || is_wgpu_develop_available();
     let gpu_acceleration_enabled = is_gpu_acceleration_enabled();
     let backend_label = if is_gpu_execution_provider_available() && gpu_acceleration_enabled {
@@ -367,6 +383,14 @@ fn build_runtime_status_dto(state: &AppState) -> RuntimeStatusDto {
         default_segmenter_model_label,
         is_custom_segmenter: state.has_custom_segmenter(),
         segmenter_models_ready,
+        face_parser_model_path: face_parser.map(|p| p.to_string_lossy().to_string()),
+        face_parser_model_label,
+        is_custom_face_parser: state.has_custom_face_parser(),
+        face_parser_ready,
+        lama_model_path: lama.map(|p| p.to_string_lossy().to_string()),
+        lama_model_label,
+        is_custom_lama: state.has_custom_lama(),
+        lama_ready,
         supported_raw_count: supported_raw_extensions().len(),
         backend_label,
         develop_gpu_backend_label,
@@ -428,7 +452,54 @@ pub async fn download_missing_models(
     if let Ok(mut guard) = state.cached_segmenter_engine.lock() {
         *guard = None;
     }
+    if let Ok(mut guard) = state.cached_face_parser_engine.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = state.cached_lama_engine.lock() {
+        *guard = None;
+    }
     if let Ok(mut guard) = state.cached_yunet_engine.lock() {
+        *guard = None;
+    }
+
+    let runtime = build_runtime_status_dto(&state);
+    Ok(ModelDownloadOutcomeDto {
+        manifest: manifest_status,
+        runtime,
+    })
+}
+
+#[tauri::command]
+pub async fn download_optional_model(
+    model_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ModelDownloadOutcomeDto, String> {
+    let managed_dir = state.resolve_managed_models_dir();
+    let search_dirs = state.model_search_dirs();
+    let cancel_flag = Arc::clone(&state.model_download_cancel);
+    let app_handle = app.clone();
+
+    let manifest_status = tauri::async_runtime::spawn_blocking(move || {
+        let manifest = load_models_manifest(&search_dirs)?;
+        download_optional_model_by_id(
+            &manifest,
+            &model_id,
+            &managed_dir,
+            &search_dirs,
+            &cancel_flag,
+            |progress| {
+                let _ = app_handle.emit(MODEL_DOWNLOAD_PROGRESS_EVENT, progress);
+            },
+        )
+    })
+    .await
+    .map_err(|err| format!("optional model download worker failed: {err}"))??;
+
+    if let Ok(mut guard) = state.cached_face_parser_engine.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = state.cached_lama_engine.lock() {
         *guard = None;
     }
 
@@ -451,6 +522,12 @@ pub fn set_gpu_acceleration(enabled: bool, state: State<'_, AppState>) -> Runtim
         *guard = None;
     }
     if let Ok(mut guard) = state.cached_segmenter_engine.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = state.cached_face_parser_engine.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = state.cached_lama_engine.lock() {
         *guard = None;
     }
     build_runtime_status_dto(&state)
@@ -545,6 +622,7 @@ pub async fn get_storage_cache_summary(
 #[tauri::command]
 pub async fn set_storage_cache_dir(
     cache_dir: Option<String>,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<StorageCacheSummaryDto, String> {
     let next_path = cache_dir
@@ -553,7 +631,7 @@ pub async fn set_storage_cache_dir(
         .map(PathBuf::from);
     let resolved = state.set_custom_cache_dir(next_path)?;
     let is_custom = state.is_custom_cache_dir();
-    state.thumbnail_render_generation.fetch_add(1, Ordering::SeqCst);
+    invalidate_thumbnail_renders(&state, Some(&app), "edited_32bit", false);
     state.clear_develop_buffer_cache();
     if let Ok(mut guard) = state.active_shoot.lock()
         && let Some(ctx) = guard.as_mut()
@@ -568,6 +646,7 @@ pub async fn set_storage_cache_dir(
 #[tauri::command]
 pub async fn clear_storage_cache(
     target: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ClearCacheResultDto, String> {
     let normalized = target.trim().to_ascii_lowercase();
@@ -576,7 +655,7 @@ pub async fn clear_storage_cache(
     }
 
     if normalized == "previews" || normalized == "all" {
-        state.thumbnail_render_generation.fetch_add(1, Ordering::SeqCst);
+        invalidate_thumbnail_renders(&state, Some(&app), "edited_32bit", false);
         state.clear_develop_buffer_cache();
         if let Ok(mut guard) = state.active_shoot.lock()
             && let Some(ctx) = guard.as_mut()
@@ -606,6 +685,8 @@ pub async fn inspect_onnx_model(
         "detector" => ModelRole::Detector,
         "recognizer" => ModelRole::Recognizer,
         "segmenter" => ModelRole::Segmenter,
+        "face_parser" | "faceparser" => ModelRole::FaceParser,
+        "inpainter" | "lama" => ModelRole::Inpainter,
         other => return Err(format!("unknown model role '{other}'")),
     };
 
@@ -631,6 +712,8 @@ pub async fn set_custom_ai_models(
     yunet_path: Option<String>,
     recognizer_path: Option<String>,
     segmenter_path: Option<String>,
+    face_parser_path: Option<String>,
+    lama_path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<RuntimeStatusDto, String> {
     let next_yunet = yunet_path
@@ -645,11 +728,21 @@ pub async fn set_custom_ai_models(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
+    let next_face_parser = face_parser_path
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let next_lama = lama_path
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
 
     // Backend defense-in-depth: block structurally incompatible ONNX files from activating
     let yunet_check = next_yunet.clone();
     let rec_check = next_recognizer.clone();
     let seg_check = next_segmenter.clone();
+    let fp_check = next_face_parser.clone();
+    let lama_check = next_lama.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         if let Some(ref p) = yunet_check {
             let report = inspect_onnx_model_file(p, ModelRole::Detector);
@@ -674,6 +767,24 @@ pub async fn set_custom_ai_models(
             if report.compatibility == ModelCompatibility::Incompatible {
                 return Err(format!(
                     "Incompatible subject segmenter: {}",
+                    report.warnings.first().cloned().unwrap_or(report.summary)
+                ));
+            }
+        }
+        if let Some(ref p) = fp_check {
+            let report = inspect_onnx_model_file(p, ModelRole::FaceParser);
+            if report.compatibility == ModelCompatibility::Incompatible {
+                return Err(format!(
+                    "Incompatible face parser: {}",
+                    report.warnings.first().cloned().unwrap_or(report.summary)
+                ));
+            }
+        }
+        if let Some(ref p) = lama_check {
+            let report = inspect_onnx_model_file(p, ModelRole::Inpainter);
+            if report.compatibility == ModelCompatibility::Incompatible {
+                return Err(format!(
+                    "Incompatible inpainting model: {}",
                     report.warnings.first().cloned().unwrap_or(report.summary)
                 ));
             }
@@ -704,8 +815,28 @@ pub async fn set_custom_ai_models(
             .map_err(|_| "custom_segmenter_path mutex poisoned".to_string())?;
         *guard = next_segmenter;
     }
+    {
+        let mut guard = state
+            .custom_face_parser_path
+            .lock()
+            .map_err(|_| "custom_face_parser_path mutex poisoned".to_string())?;
+        *guard = next_face_parser;
+    }
+    {
+        let mut guard = state
+            .custom_lama_path
+            .lock()
+            .map_err(|_| "custom_lama_path mutex poisoned".to_string())?;
+        *guard = next_lama;
+    }
     if let Ok(mut seg_cache) = state.cached_segmenter_engine.lock() {
         *seg_cache = None;
+    }
+    if let Ok(mut fp_cache) = state.cached_face_parser_engine.lock() {
+        *fp_cache = None;
+    }
+    if let Ok(mut lama_cache) = state.cached_lama_engine.lock() {
+        *lama_cache = None;
     }
     if let Ok(mut yunet_cache) = state.cached_yunet_engine.lock() {
         *yunet_cache = None;
@@ -714,6 +845,7 @@ pub async fn set_custom_ai_models(
         && let Some(ctx) = shoot_guard.as_mut()
     {
         ctx.cached_face_scans = None;
+        ctx.detected_face_parse_maps.clear();
     }
 
     Ok(build_runtime_status_dto(&state))
@@ -730,7 +862,7 @@ pub async fn load_shoot_folder(
     state: State<'_, AppState>,
 ) -> Result<ShootSessionDto, String> {
     state.clear_develop_buffer_cache();
-    state.thumbnail_render_generation.fetch_add(1, Ordering::SeqCst);
+    invalidate_thumbnail_renders(&state, Some(&app), "edited_32bit", false);
     state.export_estimate_generation.fetch_add(1, Ordering::SeqCst);
     let preview_cache_dir = state.resolve_cache_dir();
     let single_sidecars_dir = state.resolve_managed_single_sidecars_dir();
@@ -779,7 +911,7 @@ pub async fn load_photo_files(
     state: State<'_, AppState>,
 ) -> Result<ShootSessionDto, String> {
     state.clear_develop_buffer_cache();
-    state.thumbnail_render_generation.fetch_add(1, Ordering::SeqCst);
+    invalidate_thumbnail_renders(&state, Some(&app), "edited_32bit", false);
     state.export_estimate_generation.fetch_add(1, Ordering::SeqCst);
     let preview_cache_dir = state.resolve_cache_dir();
     let single_sidecars_dir = state.resolve_managed_single_sidecars_dir();
@@ -2078,18 +2210,35 @@ fn persist_working_kr16_cache_bounded(cache_dir: &Path, dest: &Path, bytes: &[u8
     }
 }
 
+/// 4-byte sentinel payload (`"KRSK"`) returned when a RAW working-buffer decode is preempted by a
+/// newer active photo selection. Kept distinct from empty `Vec::new()` (8-bit fallback) so the
+/// frontend never poisons its LRU cache with `null` for skipped photos.
+const SUPERSEDED_WORKING_BUFFER_MAGIC: &[u8; 4] = b"KRSK";
+
+enum DevelopDecodeOutcome {
+    Superseded,
+    NotHighBitDepth,
+    Ready {
+        wire_bytes: Vec<u8>,
+        proxies: Option<(DecodedDevelopBuffer, DecodedDevelopBuffer)>,
+    },
+}
+
 /// Decodes the active Camera RAW / 16-bit TIFF / 16-bit PNG directly into a screen-sized
 /// 16-bit half-float `KR16` (`RGBA16F` Linear Rec.2020 — lossless for 12/14-bit camera sensors,
 /// 2× faster IPC & GPU upload, fed straight into 32-bit `rgba32float` WGSL compute shaders)
 /// or 32-bit float `KR32` binary buffer for Studio Develop editing.
-/// Checks in-memory LRU first, then bounded SSD cache (~10ms), falling back to full parallel RAW demosaic.
+/// Checks in-memory LRU first, then bounded SSD cache (~10ms), falling back to latest-wins
+/// scheduled parallel RAW demosaic so rapid subject switching never starves the selected photo.
 #[tauri::command]
 pub async fn load_develop_working_buffer(
     photo_id: String,
     max_dim: Option<u32>,
     precision: Option<String>,
+    priority: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
+    let decode_priority = DevelopDecodePriority::parse(priority.as_deref());
     let (source_path, file_size_bytes) = {
         let guard = state
             .active_shoot
@@ -2107,6 +2256,8 @@ pub async fn load_develop_working_buffer(
         (src, size)
     };
 
+    let ticket = state.develop_decode_scheduler.begin_request(decode_priority);
+
     let use_f32 = matches!(precision.as_deref(), Some("f32"));
     // `max_dim == Some(0)` requests full native sensor resolution (capped to 8192 for GPU safety).
     // Standard Fit/scrub buffers (`<= 2560`) use the 12-entry LRU + bounded SSD cache;
@@ -2122,12 +2273,20 @@ pub async fn load_develop_working_buffer(
         "{source_path}@{clamped_max_dim}@{}",
         if use_f32 { "f32" } else { "f16" }
     );
+    // RAM LRU hit bypasses demosaic scheduling completely (~0.1ms instant) while still having
+    // bumped `active_gen` above so superseded background decodes yield immediately.
     if is_hi_res {
         if let Some(cached_bytes) = state.get_cached_hi_res_develop_buffer(&cache_key) {
             return Ok(tauri::ipc::Response::new((*cached_bytes).clone()));
         }
     } else if let Some(cached_bytes) = state.get_cached_develop_buffer(&cache_key) {
         return Ok(tauri::ipc::Response::new((*cached_bytes).clone()));
+    }
+
+    if state.develop_decode_scheduler.is_superseded(&ticket) {
+        return Ok(tauri::ipc::Response::new(
+            SUPERSEDED_WORKING_BUFFER_MAGIC.to_vec(),
+        ));
     }
 
     let cache_dir = state.resolve_cache_dir();
@@ -2142,35 +2301,62 @@ pub async fn load_develop_working_buffer(
         None
     };
 
+    let scheduler = Arc::clone(&state.develop_decode_scheduler);
     let source_for_worker = source_path.clone();
     let decoded_result = tauri::async_runtime::spawn_blocking(move || {
-        // Fast SSD cache hit for compact KR16 working buffers (~10ms instead of 250-600ms RAW demosaic)
+        if scheduler.is_superseded(&ticket) {
+            return Ok::<DevelopDecodeOutcome, String>(DevelopDecodeOutcome::Superseded);
+        }
+
+        // Fast SSD cache hit for compact KR16 working buffers (~8-10ms instead of 250-600ms RAW
+        // demosaic). Intentionally bypasses the heavy demosaic permit so previously viewed photos
+        // load immediately even while an older uncached RAW demosaic is unwinding.
         if let Some(ref disk_path) = disk_cache_path
             && disk_path.is_file()
             && let Ok(cached_kr16) = fs::read(disk_path)
-            && let Some(thumb_buffer) =
-                decode_kr16_downscaled_rgb32f(&cached_kr16, THUMBNAIL_32BIT_MAX_DIM)
         {
-            let hist_image = downscale_rgb32f_unclamped(&thumb_buffer.image, 384);
-            let hist_buffer = DecodedDevelopBuffer {
-                image: hist_image,
-                is_linear: thumb_buffer.is_linear,
-                is_wide_gamut: thumb_buffer.is_wide_gamut,
-                bit_depth: thumb_buffer.bit_depth,
-                is_raw_demosaic: thumb_buffer.is_raw_demosaic,
-            };
-            return Ok::<
-                Option<(Vec<u8>, Option<(DecodedDevelopBuffer, DecodedDevelopBuffer)>)>,
-                String,
-            >(Some((cached_kr16, Some((hist_buffer, thumb_buffer)))));
+            if scheduler.is_superseded(&ticket) {
+                return Ok(DevelopDecodeOutcome::Superseded);
+            }
+            if let Some(thumb_buffer) =
+                decode_kr16_downscaled_rgb32f(&cached_kr16, THUMBNAIL_32BIT_MAX_DIM)
+            {
+                if scheduler.is_superseded(&ticket) {
+                    return Ok(DevelopDecodeOutcome::Superseded);
+                }
+                let hist_image = downscale_rgb32f_unclamped(&thumb_buffer.image, 384);
+                let hist_buffer = DecodedDevelopBuffer {
+                    image: hist_image,
+                    is_linear: thumb_buffer.is_linear,
+                    is_wide_gamut: thumb_buffer.is_wide_gamut,
+                    bit_depth: thumb_buffer.bit_depth,
+                    is_raw_demosaic: thumb_buffer.is_raw_demosaic,
+                };
+                return Ok(DevelopDecodeOutcome::Ready {
+                    wire_bytes: cached_kr16,
+                    proxies: Some((hist_buffer, thumb_buffer)),
+                });
+            }
         }
 
-        let Some(decoded) =
-            decode_high_bit_depth_working_buffer(&source_for_worker, clamped_max_dim)
-                .map_err(|e| e.to_string())?
-        else {
-            return Ok(None);
+        // Uncached heavy RAW Bayer demosaic: acquire the single latest-wins slot so rapid subject
+        // switching never launches competing Rayon decodes that starve the selected photo or FPS.
+        let Some(demosaic_permit) = scheduler.acquire_demosaic_slot(ticket) else {
+            return Ok(DevelopDecodeOutcome::Superseded);
         };
+
+        let decoded_opt =
+            decode_high_bit_depth_working_buffer(&source_for_worker, clamped_max_dim)
+                .map_err(|e| e.to_string())?;
+        drop(demosaic_permit);
+
+        let Some(decoded) = decoded_opt else {
+            return Ok(DevelopDecodeOutcome::NotHighBitDepth);
+        };
+
+        if scheduler.is_superseded(&ticket) {
+            return Ok(DevelopDecodeOutcome::Superseded);
+        }
 
         let wire_bytes = if use_f32 {
             encode_kr32_rgba32f(&decoded)
@@ -2182,7 +2368,10 @@ pub async fn load_develop_working_buffer(
         }
 
         if is_hi_res {
-            return Ok(Some((wire_bytes, None)));
+            return Ok(DevelopDecodeOutcome::Ready {
+                wire_bytes,
+                proxies: None,
+            });
         }
 
         let thumb_image = downscale_rgb32f_unclamped(&decoded.image, THUMBNAIL_32BIT_MAX_DIM);
@@ -2201,30 +2390,51 @@ pub async fn load_develop_working_buffer(
             bit_depth: decoded.bit_depth,
             is_raw_demosaic: decoded.is_raw_demosaic,
         };
-        Ok(Some((wire_bytes, Some((hist_buffer, thumb_buffer)))))
+        Ok(DevelopDecodeOutcome::Ready {
+            wire_bytes,
+            proxies: Some((hist_buffer, thumb_buffer)),
+        })
     })
     .await
     .map_err(|err| format!("high-bit-depth develop decode worker failed: {err}"))??;
 
-    let Some((wire_bytes, proxies)) = decoded_result else {
-        return Ok(tauri::ipc::Response::new(Vec::new()));
+    let (wire_bytes, proxies) = match decoded_result {
+        DevelopDecodeOutcome::Superseded => {
+            return Ok(tauri::ipc::Response::new(
+                SUPERSEDED_WORKING_BUFFER_MAGIC.to_vec(),
+            ));
+        }
+        DevelopDecodeOutcome::NotHighBitDepth => {
+            return Ok(tauri::ipc::Response::new(Vec::new()));
+        }
+        DevelopDecodeOutcome::Ready {
+            wire_bytes,
+            proxies,
+        } => (wire_bytes, proxies),
     };
 
     let shared_bytes = Arc::new(wire_bytes);
-    let response_bytes = (*shared_bytes).clone();
     if is_hi_res {
-        state.insert_hi_res_develop_buffer(cache_key, shared_bytes);
+        state.insert_hi_res_develop_buffer(cache_key, Arc::clone(&shared_bytes));
     } else if let Some((hist_buffer, thumb_buffer)) = proxies {
         state.insert_develop_buffer(CachedDevelopBuffer {
             cache_key,
             source_path,
-            kr16_bytes: shared_bytes,
+            kr16_bytes: Arc::clone(&shared_bytes),
             hist_buffer: Arc::new(hist_buffer),
             thumb_buffer: Arc::new(thumb_buffer),
         });
     }
 
-    Ok(tauri::ipc::Response::new(response_bytes))
+    // If superseded during the final ~8ms encode/proxy window, keep the completed buffer warm in
+    // Rust's RAM LRU while skipping the 15 MB IPC transfer back to WebView2.
+    if state.develop_decode_scheduler.is_superseded(&ticket) {
+        return Ok(tauri::ipc::Response::new(
+            SUPERSEDED_WORKING_BUFFER_MAGIC.to_vec(),
+        ));
+    }
+
+    Ok(tauri::ipc::Response::new((*shared_bytes).clone()))
 }
 
 /// Returns the EXIF-oriented native pixel dimensions `(width, height)` of a photo using fast
@@ -2291,24 +2501,184 @@ impl ThumbnailPreviewRenderMode {
     }
 }
 
+fn emit_thumbnail_progress(app: &AppHandle, snapshot: ThumbnailProgressSnapshot) {
+    let _ = app.emit(
+        THUMBNAIL_RENDER_PROGRESS_EVENT,
+        ThumbnailRenderProgressDto {
+            active: snapshot.active,
+            completed: snapshot.completed,
+            total: snapshot.total,
+            mode: snapshot.mode,
+        },
+    );
+}
+
+fn invalidate_thumbnail_renders(
+    state: &AppState,
+    app: Option<&AppHandle>,
+    mode: &str,
+    force_emit_inactive: bool,
+) -> u64 {
+    let mut tracker = state
+        .thumbnail_progress_tracker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (next_gen, had_active, inactive) =
+        tracker.invalidate_and_bump(&state.thumbnail_render_generation, mode);
+    if let Some(app_handle) = app
+        && (force_emit_inactive || had_active)
+    {
+        emit_thumbnail_progress(app_handle, inactive);
+    }
+    next_gen
+}
+
+fn emit_inactive_if_thumbnail_idle(state: &AppState, app: &AppHandle, mode: &str) {
+    let tracker = state
+        .thumbnail_progress_tracker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !tracker.has_active_workers() {
+        emit_thumbnail_progress(
+            app,
+            ThumbnailProgressSnapshot {
+                active: false,
+                completed: 0,
+                total: 0,
+                mode: mode.to_string(),
+            },
+        );
+    }
+}
+
+/// RAII progress guard for each spawned 32-bit thumbnail worker thread.
+/// Guarantees linearizable event ordering under `thumbnail_progress_tracker` and ensures
+/// `active: false` (or remaining concurrent workers' progress) is always emitted on normal
+/// completion, generation cancellation, early return, or panic unwind.
+struct ThumbnailWorkerProgressGuard {
+    worker_id: u64,
+    mode: String,
+    tracker: Arc<Mutex<ThumbnailProgressTracker>>,
+    app: AppHandle,
+}
+
+impl ThumbnailWorkerProgressGuard {
+    #[allow(clippy::too_many_arguments)]
+    fn try_start(
+        tracker: Arc<Mutex<ThumbnailProgressTracker>>,
+        thumb_gen: &AtomicU64,
+        load_gen: &AtomicU64,
+        expected_thumb_gen: u64,
+        expected_load_gen: u64,
+        total: usize,
+        mode: String,
+        app: AppHandle,
+    ) -> Option<Self> {
+        let mut guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let (worker_id, snapshot) = guard.try_register_worker(
+            thumb_gen,
+            load_gen,
+            expected_thumb_gen,
+            expected_load_gen,
+            total,
+            mode.clone(),
+        )?;
+        emit_thumbnail_progress(&app, snapshot);
+        drop(guard);
+        Some(Self {
+            worker_id,
+            mode,
+            tracker,
+            app,
+        })
+    }
+
+    fn advance(&self, completed: usize) {
+        let mut guard = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(snapshot) = guard.update_worker(self.worker_id, completed) {
+            emit_thumbnail_progress(&self.app, snapshot);
+        }
+    }
+}
+
+impl Drop for ThumbnailWorkerProgressGuard {
+    fn drop(&mut self) {
+        let mut guard = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(snapshot) = guard.finish_worker(self.worker_id, &self.mode) {
+            emit_thumbnail_progress(&self.app, snapshot);
+        }
+    }
+}
+
+fn hash_portrait_retouch_context<H: Hasher>(
+    state: &mut H,
+    face_guides: &[PortraitFaceGuide],
+    face_parse_map: Option<&FaceParseMap>,
+) {
+    face_guides.len().min(4).hash(state);
+    for g in face_guides.iter().take(4) {
+        for v in [
+            g.box_left,
+            g.box_top,
+            g.box_width,
+            g.box_height,
+            g.right_eye[0],
+            g.right_eye[1],
+            g.left_eye[0],
+            g.left_eye[1],
+        ] {
+            (v * 1000.0).round().to_bits().hash(state);
+        }
+    }
+    if let Some(fp) = face_parse_map.filter(|m| m.is_valid()) {
+        true.hash(state);
+        fp.width.hash(state);
+        fp.height.hash(state);
+        let step = (fp.rgba.len() / 64).max(1);
+        for &b in fp.rgba.iter().step_by(step) {
+            b.hash(state);
+        }
+    } else {
+        false.hash(state);
+    }
+}
+
+#[cfg(test)]
 fn compute_32bit_thumbnail_hash(
     source_path: &str,
     file_size_bytes: u64,
     recipe: &DevelopRecipe,
 ) -> (u64, u64) {
+    compute_32bit_thumbnail_hash_with_retouch(source_path, file_size_bytes, recipe, &[], None)
+}
+
+fn compute_32bit_thumbnail_hash_with_retouch(
+    source_path: &str,
+    file_size_bytes: u64,
+    recipe: &DevelopRecipe,
+    face_guides: &[PortraitFaceGuide],
+    face_parse_map: Option<&FaceParseMap>,
+) -> (u64, u64) {
     let recipe_json = serde_json::to_string(&DevelopRecipeDto::from(recipe)).unwrap_or_default();
+    let portrait_active = recipe.retouch.is_portrait_active();
     let mut h1 = DefaultHasher::new();
     "kroma-32bit-thumb-v1-a".hash(&mut h1);
     THUMBNAIL_32BIT_MAX_DIM.hash(&mut h1);
     source_path.hash(&mut h1);
     file_size_bytes.hash(&mut h1);
     recipe_json.hash(&mut h1);
+    if portrait_active {
+        hash_portrait_retouch_context(&mut h1, face_guides, face_parse_map);
+    }
 
     let mut h2 = DefaultHasher::new();
     "kroma-32bit-thumb-v1-b".hash(&mut h2);
     recipe_json.hash(&mut h2);
     file_size_bytes.hash(&mut h2);
     source_path.hash(&mut h2);
+    if portrait_active {
+        hash_portrait_retouch_context(&mut h2, face_guides, face_parse_map);
+    }
 
     (h1.finish(), h2.finish())
 }
@@ -2353,9 +2723,7 @@ pub fn render_32bit_thumbnails(
     let mode_str = parsed_mode.as_str().to_string();
 
     if parsed_mode == ThumbnailPreviewRenderMode::Fast {
-        state
-            .thumbnail_render_generation
-            .fetch_add(1, Ordering::SeqCst);
+        invalidate_thumbnail_renders(&state, Some(&app), &mode_str, true);
         let cleared_ids: Vec<String> = {
             let mut guard = state
                 .active_shoot
@@ -2392,24 +2760,12 @@ pub fn render_32bit_thumbnails(
                 },
             );
         }
-        let _ = app.emit(
-            THUMBNAIL_RENDER_PROGRESS_EVENT,
-            ThumbnailRenderProgressDto {
-                active: false,
-                completed: 0,
-                total: 0,
-                mode: mode_str,
-            },
-        );
         return Ok(());
     }
 
     let is_full_pass = photo_ids.as_ref().is_none_or(|ids| ids.is_empty());
     let expected_thumb_gen = if is_full_pass {
-        state
-            .thumbnail_render_generation
-            .fetch_add(1, Ordering::SeqCst)
-            + 1
+        invalidate_thumbnail_renders(&state, None, &mode_str, false)
     } else {
         state.thumbnail_render_generation.load(Ordering::SeqCst)
     };
@@ -2420,6 +2776,8 @@ pub fn render_32bit_thumbnails(
         photo_id: String,
         source_path: String,
         recipe: DevelopRecipe,
+        face_guides: Vec<PortraitFaceGuide>,
+        face_parse_map: Option<FaceParseMap>,
         hash: (u64, u64),
         dest_path: PathBuf,
     }
@@ -2430,6 +2788,9 @@ pub fn render_32bit_thumbnails(
             .lock()
             .map_err(|_| "active_shoot state mutex poisoned".to_string())?;
         let Some(ctx) = guard.as_mut() else {
+            if is_full_pass {
+                emit_inactive_if_thumbnail_idle(&state, &app, &mode_str);
+            }
             return Ok(());
         };
         let default_recipe = DevelopRecipe::default();
@@ -2461,8 +2822,25 @@ pub fn render_32bit_thumbnails(
                 }
                 continue;
             }
+            let portrait_active = recipe.retouch.is_portrait_active();
+            let face_guides = if portrait_active {
+                get_photo_face_guides(ctx, &pid)
+            } else {
+                Vec::new()
+            };
+            let face_parse_map = if portrait_active {
+                get_photo_face_parse_map(ctx, &pid, recipe.crop_transform)
+            } else {
+                None
+            };
             let file_size_bytes = ctx.photo_file_sizes.get(&pid).copied().unwrap_or(0);
-            let hash = compute_32bit_thumbnail_hash(&source_path, file_size_bytes, &recipe);
+            let hash = compute_32bit_thumbnail_hash_with_retouch(
+                &source_path,
+                file_size_bytes,
+                &recipe,
+                &face_guides,
+                face_parse_map.as_ref(),
+            );
             let dest_path = preview_cache_dir
                 .join(format!("v1_32bit_{:016x}{:016x}_preview.jpg", hash.0, hash.1));
             let dest_str = dest_path.to_string_lossy().to_string();
@@ -2478,6 +2856,8 @@ pub fn render_32bit_thumbnails(
                     photo_id: pid,
                     source_path,
                     recipe,
+                    face_guides,
+                    face_parse_map,
                     hash,
                     dest_path,
                 });
@@ -2522,15 +2902,7 @@ pub fn render_32bit_thumbnails(
 
     if needs_render.is_empty() {
         if is_full_pass {
-            let _ = app.emit(
-                THUMBNAIL_RENDER_PROGRESS_EVENT,
-                ThumbnailRenderProgressDto {
-                    active: false,
-                    completed: 0,
-                    total: 0,
-                    mode: mode_str,
-                },
-            );
+            emit_inactive_if_thumbnail_idle(&state, &app, &mode_str);
         }
         return Ok(());
     }
@@ -2538,6 +2910,7 @@ pub fn render_32bit_thumbnails(
     let active_shoot = state.active_shoot.clone();
     let load_generation = state.load_generation.clone();
     let thumb_generation = state.thumbnail_render_generation.clone();
+    let progress_tracker = state.thumbnail_progress_tracker.clone();
     let develop_buffer_cache = state.develop_buffer_cache.clone();
 
     std::thread::spawn(move || {
@@ -2551,19 +2924,18 @@ pub fn render_32bit_thumbnails(
                 && thumb_generation.load(Ordering::SeqCst) == expected_thumb_gen
         };
 
-        if !is_still_valid() {
+        let Some(progress_guard) = ThumbnailWorkerProgressGuard::try_start(
+            progress_tracker,
+            &thumb_generation,
+            &load_generation,
+            expected_thumb_gen,
+            expected_load_gen,
+            total,
+            mode_str,
+            app.clone(),
+        ) else {
             return;
-        }
-
-        let _ = app.emit(
-            THUMBNAIL_RENDER_PROGRESS_EVENT,
-            ThumbnailRenderProgressDto {
-                active: true,
-                completed: 0,
-                total,
-                mode: mode_str.clone(),
-            },
-        );
+        };
 
         for chunk in needs_render.chunks(THUMBNAIL_32BIT_BATCH_SIZE) {
             if !is_still_valid() {
@@ -2588,18 +2960,22 @@ pub fn render_32bit_thumbnails(
                                     .map(|entry| Arc::clone(&entry.thumb_buffer))
                             });
                         let render_result = if let Some(hot_buf) = cached_buf {
-                            engine.render_buffer_to_jpeg(
+                            engine.render_buffer_to_jpeg_with_retouch(
                                 &hot_buf,
                                 &job.recipe,
+                                &job.face_guides,
+                                job.face_parse_map.as_ref(),
                                 &job.dest_path,
                                 THUMBNAIL_32BIT_JPEG_QUALITY,
                             )
                         } else {
                             decode_develop_buffer(&job.source_path, THUMBNAIL_32BIT_MAX_DIM)
                                 .and_then(|decoded| {
-                                    engine.render_buffer_to_jpeg(
+                                    engine.render_buffer_to_jpeg_with_retouch(
                                         &decoded,
                                         &job.recipe,
+                                        &job.face_guides,
+                                        job.face_parse_map.as_ref(),
                                         &job.dest_path,
                                         THUMBNAIL_32BIT_JPEG_QUALITY,
                                     )
@@ -2634,8 +3010,24 @@ pub fn render_32bit_thumbnails(
                     };
                     let current_size = ctx.photo_file_sizes.get(&pid).copied().unwrap_or(0);
                     let current_recipe = ctx.recipes.get(&pid).unwrap_or(&default_recipe);
-                    let current_hash =
-                        compute_32bit_thumbnail_hash(source_path, current_size, current_recipe);
+                    let portrait_active = current_recipe.retouch.is_portrait_active();
+                    let current_guides = if portrait_active {
+                        get_photo_face_guides(ctx, &pid)
+                    } else {
+                        Vec::new()
+                    };
+                    let current_parse = if portrait_active {
+                        get_photo_face_parse_map(ctx, &pid, current_recipe.crop_transform)
+                    } else {
+                        None
+                    };
+                    let current_hash = compute_32bit_thumbnail_hash_with_retouch(
+                        source_path,
+                        current_size,
+                        current_recipe,
+                        &current_guides,
+                        current_parse.as_ref(),
+                    );
                     if current_hash != expected_hash {
                         continue;
                     }
@@ -2663,28 +3055,12 @@ pub fn render_32bit_thumbnails(
                 );
             }
 
-            let _ = app.emit(
-                THUMBNAIL_RENDER_PROGRESS_EVENT,
-                ThumbnailRenderProgressDto {
-                    active: completed < total,
-                    completed,
-                    total,
-                    mode: mode_str.clone(),
-                },
-            );
+            progress_guard.advance(completed);
         }
 
-        if is_still_valid() {
-            let _ = app.emit(
-                THUMBNAIL_RENDER_PROGRESS_EVENT,
-                ThumbnailRenderProgressDto {
-                    active: false,
-                    completed: total,
-                    total,
-                    mode: mode_str,
-                },
-            );
-        }
+        // `progress_guard` drops here (or on any early return / panic unwind), removing this
+        // worker from `thumbnail_progress_tracker` and emitting `active: false` when idle.
+        drop(progress_guard);
     });
 
     Ok(())
@@ -2694,6 +3070,522 @@ pub fn render_32bit_thumbnails(
 /// aligned to the photo's current orientation (quarter-turns + flips).
 /// Uses an installed ONNX segmentation model (`RMBG`, `MODNet`, `BiRefNet`, `IS-Net`, `U2-Net`)
 /// on DirectML GPU / CPU when configured, and falls back to Kroma's built-in YuNet + edge-matte AI.
+fn entry_to_face_guide(bbox: BoundingBox, lm: YuNetLandmarks) -> PortraitFaceGuide {
+    PortraitFaceGuide::from_normalized(
+        bbox.x,
+        bbox.y,
+        bbox.width,
+        bbox.height,
+        [lm.right_eye.x, lm.right_eye.y],
+        [lm.left_eye.x, lm.left_eye.y],
+        [lm.nose_tip.x, lm.nose_tip.y],
+        [lm.right_mouth_corner.x, lm.right_mouth_corner.y],
+        [lm.left_mouth_corner.x, lm.left_mouth_corner.y],
+    )
+}
+
+fn get_photo_face_guides(ctx: &ActiveShootContext, photo_id: &str) -> Vec<PortraitFaceGuide> {
+    if let Some(guides) = ctx.detected_face_guides.get(photo_id)
+        && !guides.is_empty()
+    {
+        return guides.clone();
+    }
+    if ctx.is_clustered {
+        for cluster in &ctx.plan.clusters {
+            if let Some(entry) = cluster.entries.iter().find(|e| e.photo_id.as_str() == photo_id)
+                && entry.face_bounding_box.area() > 0.0
+            {
+                return vec![entry_to_face_guide(entry.face_bounding_box, entry.landmarks)];
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn get_photo_face_parse_map(
+    ctx: &ActiveShootContext,
+    photo_id: &str,
+    crop: CropTransform,
+) -> Option<FaceParseMap> {
+    let current_ori = format!(
+        "{}:{}:{}",
+        crop.quarter_turns % 4,
+        crop.flip_horizontal as u8,
+        crop.flip_vertical as u8
+    );
+    ctx.detected_face_parse_maps
+        .get(photo_id)
+        .filter(|(ori, map)| ori == &current_ori && map.is_valid())
+        .map(|(_, map)| map.clone())
+}
+
+fn collect_shoot_face_guides_by_source(
+    ctx: &ActiveShootContext,
+) -> HashMap<String, Vec<PortraitFaceGuide>> {
+    let mut map: HashMap<String, Vec<PortraitFaceGuide>> = HashMap::new();
+    if ctx.is_clustered {
+        for cluster in &ctx.plan.clusters {
+            for entry in &cluster.entries {
+                if entry.face_bounding_box.area() > 0.0 {
+                    map.insert(
+                        entry.source_path.clone(),
+                        vec![entry_to_face_guide(entry.face_bounding_box, entry.landmarks)],
+                    );
+                }
+            }
+        }
+    }
+    for (pid, guides) in &ctx.detected_face_guides {
+        if !guides.is_empty()
+            && let Some(source_path) = ctx.photo_sources.get(pid)
+        {
+            map.insert(source_path.clone(), guides.clone());
+        }
+    }
+    map
+}
+
+fn collect_shoot_face_parse_maps_by_source(
+    ctx: &ActiveShootContext,
+) -> HashMap<String, FaceParseMap> {
+    let mut map: HashMap<String, FaceParseMap> = HashMap::new();
+    for (pid, (cached_ori, parse_map)) in &ctx.detected_face_parse_maps {
+        if !parse_map.is_valid() {
+            continue;
+        }
+        let crop = ctx
+            .recipes
+            .get(pid)
+            .map(|r| r.crop_transform)
+            .unwrap_or_default();
+        let current_ori = format!(
+            "{}:{}:{}",
+            crop.quarter_turns % 4,
+            crop.flip_horizontal as u8,
+            crop.flip_vertical as u8
+        );
+        if cached_ori == &current_ori
+            && let Some(source_path) = ctx.photo_sources.get(pid)
+        {
+            map.insert(source_path.clone(), parse_map.clone());
+        }
+    }
+    map
+}
+
+/// Fast on-demand YuNet 5-point face landmark detection for a single photo (used by Portrait
+/// Retouching in Single-Photo Mode or before full-shoot Face Clustering has been run).
+#[tauri::command]
+pub async fn detect_photo_face_overlay(
+    photo_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<FaceOverlayDto>, String> {
+    let (existing_overlay, preview_path) = {
+        let guard = state
+            .active_shoot
+            .lock()
+            .map_err(|_| "active_shoot state mutex poisoned".to_string())?;
+        let ctx = guard
+            .as_ref()
+            .ok_or_else(|| "no active shoot loaded".to_string())?;
+
+        if let Some(ov) = ctx.detected_face_overlays.get(&photo_id) {
+            return Ok(Some(ov.clone()));
+        }
+        if ctx.is_clustered {
+            for cluster in &ctx.plan.clusters {
+                if let Some(entry) = cluster
+                    .entries
+                    .iter()
+                    .find(|e| e.photo_id.as_str() == photo_id.as_str())
+                    && entry.face_bounding_box.area() > 0.0
+                {
+                    return Ok(Some(build_face_overlay(
+                        entry.face_bounding_box,
+                        entry.landmarks,
+                    )));
+                }
+            }
+        }
+        let source = ctx
+            .photo_sources
+            .get(&photo_id)
+            .cloned()
+            .ok_or_else(|| format!("photo '{photo_id}' not found in active shoot"))?;
+        let preview = ctx.preview_paths.get(&photo_id).cloned().unwrap_or(source);
+        (None::<FaceOverlayDto>, preview)
+    };
+    if let Some(ov) = existing_overlay {
+        return Ok(Some(ov));
+    }
+
+    let (yunet_path, _) = state.resolve_model_paths();
+    let Some(yunet_model_path) = yunet_path else {
+        return Ok(None);
+    };
+    let cached_yunet = state.cached_yunet_engine.clone();
+    let active_shoot = state.active_shoot.clone();
+    let pid_clone = photo_id.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let key = yunet_model_path.to_string_lossy().to_string();
+        let detector_arc = {
+            let existing = cached_yunet
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().filter(|(k, _)| *k == key).map(|(_, e)| Arc::clone(e)));
+            if let Some(det) = existing {
+                det
+            } else {
+                let det = YuNetOnnxDetector::from_model_file(&yunet_model_path, YuNetConfig::default())
+                    .map_err(|e| format!("failed to load YuNet detector: {e}"))?;
+                let arc = Arc::new(det);
+                if let Ok(mut g) = cached_yunet.lock() {
+                    *g = Some((key, Arc::clone(&arc)));
+                }
+                arc
+            }
+        };
+
+        let rgb = decode_fast_preview_max_dim(&preview_path, 1024)
+            .map_err(|e| format!("failed to decode preview for face detection: {e}"))?;
+        let detections = detector_arc
+            .detect_faces_in_rgb(&rgb)
+            .map_err(|e| format!("YuNet face detection failed: {e}"))?;
+
+        if detections.is_empty() {
+            return Ok(None);
+        }
+
+        // Sort largest primary face first
+        let mut sorted = detections;
+        sorted.sort_by(|a, b| {
+            b.bounding_box
+                .area()
+                .partial_cmp(&a.bounding_box.area())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let primary = &sorted[0];
+        let overlay = build_face_overlay(primary.bounding_box, primary.landmarks);
+        let guides: Vec<PortraitFaceGuide> = sorted
+            .iter()
+            .take(4)
+            .map(|d| entry_to_face_guide(d.bounding_box, d.landmarks))
+            .collect();
+
+        if let Ok(mut guard) = active_shoot.lock()
+            && let Some(ctx) = guard.as_mut()
+        {
+            ctx.detected_face_guides.insert(pid_clone.clone(), guides);
+            ctx.detected_face_overlays
+                .insert(pid_clone, overlay.clone());
+        }
+
+        Ok(Some(overlay))
+    })
+    .await
+    .map_err(|err| format!("face detection worker failed: {err}"))?
+}
+
+/// On-demand BiSeNet 19-class neural face parsing for Portrait Retouching (Phase 3 opt-in).
+/// Returns `Ok(None)` cleanly when `parsing_resnet18.onnx` is not installed so Studio stays on
+/// built-in YuNet 5-point landmark masks without errors.
+#[tauri::command]
+pub async fn parse_photo_face_retouch_map(
+    photo_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<FaceParseMapDto>, String> {
+    let Some(parser_path) = state.resolve_face_parser_model_path() else {
+        return Ok(None);
+    };
+
+    let (cached_hit, preview_path, crop_transform, existing_guides) = {
+        let guard = state
+            .active_shoot
+            .lock()
+            .map_err(|_| "active_shoot state mutex poisoned".to_string())?;
+        let ctx = guard
+            .as_ref()
+            .ok_or_else(|| "no active shoot loaded".to_string())?;
+        let source = ctx
+            .photo_sources
+            .get(&photo_id)
+            .cloned()
+            .ok_or_else(|| format!("photo '{photo_id}' not found in active shoot"))?;
+        let preview = ctx.preview_paths.get(&photo_id).cloned().unwrap_or(source);
+        let crop = ctx
+            .recipes
+            .get(&photo_id)
+            .map(|r| r.crop_transform)
+            .unwrap_or_default();
+        let ori_key = format!(
+            "{}:{}:{}",
+            crop.quarter_turns % 4,
+            crop.flip_horizontal as u8,
+            crop.flip_vertical as u8
+        );
+        let hit = ctx
+            .detected_face_parse_maps
+            .get(&photo_id)
+            .filter(|(k, map)| k == &ori_key && map.is_valid())
+            .map(|(_, map)| map.clone());
+        let guides = get_photo_face_guides(ctx, &photo_id);
+        (hit, preview, crop, guides)
+    };
+
+    if let Some(map) = cached_hit {
+        let label = AppState::face_parser_model_label(Some(&parser_path));
+        return Ok(Some(FaceParseMapDto::from_map(&map, label, 0)));
+    }
+
+    let (yunet_path, _) = state.resolve_model_paths();
+    let cached_parser = state.cached_face_parser_engine.clone();
+    let cached_yunet = state.cached_yunet_engine.clone();
+    let active_shoot = state.active_shoot.clone();
+    let pid_clone = photo_id.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = Instant::now();
+        let mut rgb = decode_fast_preview_max_dim(&preview_path, 1024)
+            .map_err(|e| format!("failed to decode preview for face parsing: {e}"))?;
+
+        let qt = crop_transform.quarter_turns % 4;
+        rgb = match qt {
+            1 => image::imageops::rotate90(&rgb),
+            2 => image::imageops::rotate180(&rgb),
+            3 => image::imageops::rotate270(&rgb),
+            _ => rgb,
+        };
+        if crop_transform.flip_horizontal {
+            rgb = image::imageops::flip_horizontal(&rgb);
+        }
+        if crop_transform.flip_vertical {
+            rgb = image::imageops::flip_vertical(&rgb);
+        }
+
+        let (ow, oh) = rgb.dimensions();
+        let mut oriented_guides: Vec<PortraitFaceGuide> = existing_guides
+            .iter()
+            .take(4)
+            .map(|g| g.into_oriented_uv(crop_transform, ow, oh, false))
+            .collect();
+
+        if oriented_guides.is_empty()
+            && let Some(ref yp) = yunet_path
+        {
+            let ykey = yp.to_string_lossy().to_string();
+            let det_arc = {
+                let existing = cached_yunet
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().filter(|(k, _)| *k == ykey).map(|(_, e)| Arc::clone(e)));
+                if let Some(det) = existing {
+                    Some(det)
+                } else {
+                    YuNetOnnxDetector::from_model_file(yp, YuNetConfig::default())
+                        .ok()
+                        .map(|det| {
+                            let arc = Arc::new(det);
+                            if let Ok(mut g) = cached_yunet.lock() {
+                                *g = Some((ykey, Arc::clone(&arc)));
+                            }
+                            arc
+                        })
+                }
+            };
+            if let Some(det) = det_arc
+                && let Ok(mut faces) = det.detect_faces_in_rgb(&rgb)
+            {
+                faces.sort_by(|a, b| {
+                    b.bounding_box
+                        .area()
+                        .partial_cmp(&a.bounding_box.area())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                oriented_guides = faces
+                    .iter()
+                    .take(4)
+                    .map(|f| entry_to_face_guide(f.bounding_box, f.landmarks))
+                    .collect();
+            }
+        }
+
+        let pkey = parser_path.to_string_lossy().to_string();
+        let parser_arc = {
+            let existing = cached_parser
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().filter(|(k, _)| *k == pkey).map(|(_, e)| Arc::clone(e)));
+            if let Some(eng) = existing {
+                eng
+            } else {
+                let eng = OnnxBiSeNetFaceParser::from_model_file(&parser_path, 4)
+                    .map_err(|e| format!("failed to load BiSeNet face parser: {e}"))?;
+                let arc = Arc::new(eng);
+                if let Ok(mut g) = cached_parser.lock() {
+                    *g = Some((pkey, Arc::clone(&arc)));
+                }
+                arc
+            }
+        };
+
+        let map = parser_arc
+            .parse_portrait_rgba(&rgb, &oriented_guides)
+            .map_err(|e| format!("BiSeNet face parsing failed: {e}"))?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let ori_key = format!(
+            "{}:{}:{}",
+            qt, crop_transform.flip_horizontal as u8, crop_transform.flip_vertical as u8
+        );
+
+        if let Ok(mut guard) = active_shoot.lock()
+            && let Some(ctx) = guard.as_mut()
+        {
+            ctx.detected_face_parse_maps
+                .insert(pid_clone, (ori_key, map.clone()));
+        }
+
+        Ok(Some(FaceParseMapDto::from_map(
+            &map,
+            parser_arc.engine_label(),
+            elapsed_ms,
+        )))
+    })
+    .await
+    .map_err(|err| format!("face parsing worker failed: {err}"))?
+}
+
+/// Generates a non-destructive Phase 3 `InpaintPatch` for painted brush strokes using LaMa ONNX
+/// (`lama_fp32.onnx`) when installed, or Kroma's fast built-in Pyramidal Harmonic Fill fallback.
+#[tauri::command]
+pub async fn inpaint_photo_region(
+    photo_id: String,
+    strokes: Vec<InpaintStrokeDto>,
+    state: State<'_, AppState>,
+) -> Result<GeneratedInpaintPatchDto, String> {
+    if strokes.is_empty() {
+        return Err("paint over an object before running AI Remove".to_string());
+    }
+
+    let (source_path, preview_path, recipe) = {
+        let guard = state
+            .active_shoot
+            .lock()
+            .map_err(|_| "active_shoot state mutex poisoned".to_string())?;
+        let ctx = guard
+            .as_ref()
+            .ok_or_else(|| "no active shoot loaded".to_string())?;
+        let source = ctx
+            .photo_sources
+            .get(&photo_id)
+            .cloned()
+            .ok_or_else(|| format!("photo '{photo_id}' not found in active shoot"))?;
+        let preview = ctx
+            .preview_paths
+            .get(&photo_id)
+            .cloned()
+            .unwrap_or_else(|| source.clone());
+        let rec = ctx.recipes.get(&photo_id).cloned().unwrap_or_default();
+        (source, preview, rec)
+    };
+
+    let cached_wire = state.get_cached_develop_wire_for_source(&source_path);
+    let lama_path = state.resolve_lama_model_path();
+    let cached_lama = state.cached_lama_engine.clone();
+    let stroke_inputs: Vec<InpaintStrokeInput> = strokes
+        .into_iter()
+        .map(|s| InpaintStrokeInput {
+            radius: s.radius,
+            points: s.points,
+        })
+        .collect();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        // Grade from the actual 32-bit scene-linear RAW working buffer (reusing Studio's hot
+        // KR32/KR16 RAM cache when available, or decoding `source_path` directly at <=1600px) so
+        // exposure & white-balance edits on `.ARW`/`.CR3`/`.NEF` match Studio's live canvas 1:1
+        // instead of double-exposing the embedded 8-bit camera JPEG preview.
+        let develop_buf = if let Some(wire) = cached_wire
+            && let Some(decoded) = decode_working_wire_downscaled_rgb32f(&wire, 1600)
+        {
+            decoded
+        } else {
+            match decode_develop_buffer(&source_path, 1600) {
+                Ok(buf) => buf,
+                Err(_) => {
+                    let rgb = decode_fast_preview_max_dim(&preview_path, 1600)
+                        .map_err(|e| format!("failed to decode photo for AI Remove: {e}"))?;
+                    DecodedDevelopBuffer {
+                        image: image::DynamicImage::ImageRgb8(rgb).to_rgb32f(),
+                        is_linear: false,
+                        is_wide_gamut: false,
+                        bit_depth: 8,
+                        is_raw_demosaic: false,
+                    }
+                }
+            }
+        };
+
+        // Grade in full-frame oriented space (preserving quarter-turns & flips + live color grade
+        // + existing patches/spots, while deferring fine crop, masks, portrait retouch & sharpening
+        // to the live non-destructive pipeline).
+        let mut full_frame_recipe = recipe;
+        full_frame_recipe.crop_transform.rect = NormalizedRect::full_frame();
+        full_frame_recipe.crop_transform.rotation_deg = 0.0;
+        full_frame_recipe.masks.clear();
+        full_frame_recipe.background_removal.enabled = false;
+        full_frame_recipe.retouch.portrait.enabled = false;
+        full_frame_recipe.detail_optics.sharpening_amount = 0;
+        full_frame_recipe.detail_optics.grain_amount = 0;
+
+        let engine = RayonImageDevelopEngine::new();
+        let graded_oriented = engine
+            .process_buffer_to_rgb8(&develop_buf, &full_frame_recipe)
+            .map_err(|e| format!("failed to prepare graded frame for AI Remove: {e}"))?;
+
+        let lama_arc: Option<Arc<OnnxLamaInpainter>> = if let Some(ref p) = lama_path {
+            let key = p.to_string_lossy().to_string();
+            let existing = cached_lama
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().filter(|(k, _)| *k == key).map(|(_, e)| Arc::clone(e)));
+            if let Some(eng) = existing {
+                Some(eng)
+            } else {
+                match OnnxLamaInpainter::from_model_file(p, 4) {
+                    Ok(eng) => {
+                        let arc = Arc::new(eng);
+                        if let Ok(mut g) = cached_lama.lock() {
+                            *g = Some((key, Arc::clone(&arc)));
+                        }
+                        Some(arc)
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[kroma] LaMa ONNX load failed ({}), using Harmonic Fill fallback: {err}",
+                            p.display()
+                        );
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        let generated = generate_inpaint_patch(&graded_oriented, &stroke_inputs, lama_arc.as_deref())
+            .map_err(|e| format!("AI Remove failed: {e}"))?;
+
+        Ok(GeneratedInpaintPatchDto {
+            patch: (&generated.patch).into(),
+            elapsed_ms: generated.elapsed_ms,
+        })
+    })
+    .await
+    .map_err(|err| format!("AI Remove worker failed: {err}"))?
+}
+
 #[tauri::command]
 pub async fn generate_ai_mask(
     photo_id: String,
@@ -2729,8 +3621,10 @@ pub async fn generate_ai_mask(
 
     let seg_path = state.resolve_segmenter_model_path();
     let (yunet_path, _) = state.resolve_model_paths();
+    let face_parser_path = state.resolve_face_parser_model_path();
     let cached_seg = state.cached_segmenter_engine.clone();
     let cached_yunet = state.cached_yunet_engine.clone();
+    let cached_face_parser = state.cached_face_parser_engine.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         let mut rgb = decode_fast_preview_max_dim(&preview_path, 1024)
@@ -2810,11 +3704,42 @@ pub async fn generate_ai_mask(
             None
         };
 
-        let result = generate_ai_mask_for_rgb(
+        // Optional Phase 3 BiSeNet face parser automatically upgrades AI Face & Skin masks
+        let face_parser_arc: Option<Arc<OnnxBiSeNetFaceParser>> =
+            if matches!(parsed_kind, AiMaskKind::FaceSkin) {
+                if let Some(ref p) = face_parser_path {
+                    let key = p.to_string_lossy().to_string();
+                    let existing = cached_face_parser.lock().ok().and_then(|g| {
+                        g.as_ref()
+                            .filter(|(k, _)| *k == key)
+                            .map(|(_, e)| Arc::clone(e))
+                    });
+                    if let Some(eng) = existing {
+                        Some(eng)
+                    } else {
+                        OnnxBiSeNetFaceParser::from_model_file(p, 4)
+                            .ok()
+                            .map(|eng| {
+                                let arc = Arc::new(eng);
+                                if let Ok(mut g) = cached_face_parser.lock() {
+                                    *g = Some((key, Arc::clone(&arc)));
+                                }
+                                arc
+                            })
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        let result = generate_ai_mask_for_rgb_with_face_parser(
             &rgb,
             parsed_kind,
             segmenter_arc.as_deref(),
             yunet_arc.as_deref(),
+            face_parser_arc.as_deref(),
         )
         .map_err(|e| format!("AI mask generation failed: {e}"))?;
 
@@ -3498,7 +4423,7 @@ pub async fn organize_and_export_shoot(
     request: ExportShootRequestDto,
     state: State<'_, AppState>,
 ) -> Result<ExportShootResultDto, String> {
-    let (plan, sidecars_dir) = {
+    let (plan, sidecars_dir, face_guides_by_source, face_parse_maps_by_source) = {
         let guard = state
             .active_shoot
             .lock()
@@ -3506,8 +4431,17 @@ pub async fn organize_and_export_shoot(
         let ctx = guard
             .as_ref()
             .ok_or_else(|| "no active shoot loaded".to_string())?;
-        (ctx.plan.clone(), ctx.sidecars_dir.clone())
+        (
+            ctx.plan.clone(),
+            ctx.sidecars_dir.clone(),
+            collect_shoot_face_guides_by_source(ctx),
+            collect_shoot_face_parse_maps_by_source(ctx),
+        )
     };
+    let (yunet_path, _) = state.resolve_model_paths();
+    let face_parser_path = state.resolve_face_parser_model_path();
+    let cached_yunet = state.cached_yunet_engine.clone();
+    let cached_face_parser = state.cached_face_parser_engine.clone();
 
     let app_handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -3534,9 +4468,62 @@ pub async fn organize_and_export_shoot(
             _ => OrganizeExecutionMode::TransferOriginals(OrganizeTransferMode::Copy),
         };
 
+        let fallback_yunet: Option<Arc<YuNetOnnxDetector>> = if let Some(ref p) = yunet_path {
+            let key = p.to_string_lossy().to_string();
+            let existing = cached_yunet
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().filter(|(k, _)| *k == key).map(|(_, e)| Arc::clone(e)));
+            if let Some(det) = existing {
+                Some(det)
+            } else {
+                YuNetOnnxDetector::from_model_file(p, YuNetConfig::default())
+                    .ok()
+                    .map(|det| {
+                        let arc = Arc::new(det);
+                        if let Ok(mut g) = cached_yunet.lock() {
+                            *g = Some((key, Arc::clone(&arc)));
+                        }
+                        arc
+                    })
+            }
+        } else {
+            None
+        };
+
+        let fallback_face_parser: Option<Arc<OnnxBiSeNetFaceParser>> =
+            if let Some(ref p) = face_parser_path {
+                let key = p.to_string_lossy().to_string();
+                let existing = cached_face_parser.lock().ok().and_then(|g| {
+                    g.as_ref()
+                        .filter(|(k, _)| *k == key)
+                        .map(|(_, e)| Arc::clone(e))
+                });
+                if let Some(eng) = existing {
+                    Some(eng)
+                } else {
+                    OnnxBiSeNetFaceParser::from_model_file(p, 4)
+                        .ok()
+                        .map(|eng| {
+                            let arc = Arc::new(eng);
+                            if let Ok(mut g) = cached_face_parser.lock() {
+                                *g = Some((key, Arc::clone(&arc)));
+                            }
+                            arc
+                        })
+                }
+            } else {
+                None
+            };
+
         let organizer = LocalFileOrganizer::new();
         let organize_uc = OrganizeShootFoldersUseCase::new(&organizer);
-        let engine = RayonImageDevelopEngine::new();
+        let engine = RayonImageDevelopEngine::with_retouch_context(
+            face_guides_by_source,
+            fallback_yunet,
+            face_parse_maps_by_source,
+            fallback_face_parser,
+        );
         let store = JsonSidecarRecipeStore::new(&sidecars_dir);
 
         let started = Instant::now();
@@ -4159,6 +5146,9 @@ fn run_instant_paths_load(
         recipes,
         scan_targets,
         cached_face_scans: None,
+        detected_face_guides: HashMap::new(),
+        detected_face_overlays: HashMap::new(),
+        detected_face_parse_maps: HashMap::new(),
         directory_summaries,
     };
 
@@ -4366,7 +5356,7 @@ fn build_session_dto(ctx: &ActiveShootContext) -> ShootSessionDto {
                     let overlay = if ctx.is_clustered && entry.face_bounding_box.area() > 0.0 {
                         Some(build_face_overlay(entry.face_bounding_box, entry.landmarks))
                     } else {
-                        None
+                        ctx.detected_face_overlays.get(pid_str).cloned()
                     };
 
                     let captured_at_epoch_sec = ctx
@@ -4750,6 +5740,56 @@ mod tests {
         let h_default = compute_32bit_thumbnail_hash("DSC0001.ARW", 24_000_000, &default_recipe);
         let h_edited = compute_32bit_thumbnail_hash("DSC0001.ARW", 24_000_000, &edited_recipe);
         assert_ne!(h_default, h_edited);
+
+        // Portrait retouching triggers 32-bit previews on JPGs too and invalidates cache hash when
+        // YuNet face guides or BiSeNet FaceParseMap become available
+        let mut portrait_recipe = DevelopRecipe::default();
+        portrait_recipe.retouch.portrait.enabled = true;
+        portrait_recipe.retouch.portrait.skin_smoothing = 45;
+        assert!(should_render_32bit_thumbnail(
+            ThumbnailPreviewRenderMode::Edited32Bit,
+            "IMG_0001.JPG",
+            &portrait_recipe
+        ));
+        let h_no_face = compute_32bit_thumbnail_hash_with_retouch(
+            "IMG_0001.JPG",
+            4_000_000,
+            &portrait_recipe,
+            &[],
+            None,
+        );
+        let guide = PortraitFaceGuide::from_normalized(
+            0.25,
+            0.2,
+            0.5,
+            0.55,
+            [0.4, 0.4],
+            [0.6, 0.4],
+            [0.5, 0.5],
+            [0.42, 0.62],
+            [0.58, 0.62],
+        );
+        let h_with_guide = compute_32bit_thumbnail_hash_with_retouch(
+            "IMG_0001.JPG",
+            4_000_000,
+            &portrait_recipe,
+            &[guide],
+            None,
+        );
+        let parse_map = FaceParseMap {
+            width: 8,
+            height: 8,
+            rgba: vec![200u8; 8 * 8 * 4],
+        };
+        let h_with_parse = compute_32bit_thumbnail_hash_with_retouch(
+            "IMG_0001.JPG",
+            4_000_000,
+            &portrait_recipe,
+            &[guide],
+            Some(&parse_map),
+        );
+        assert_ne!(h_no_face, h_with_guide);
+        assert_ne!(h_with_guide, h_with_parse);
     }
 
     #[test]

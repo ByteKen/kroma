@@ -84,7 +84,7 @@ export function DarkroomButton({
         if (!disabled && title) onLeave();
         onBlur?.(e);
       }}
-      className={`inline-flex items-center justify-center transition-colors cursor-pointer select-none disabled:opacity-45 disabled:pointer-events-none ${visualClasses} ${SIZE_CLASSES[size]} ${className}`}
+      className={`inline-flex items-center justify-center transition-colors duration-150 cursor-pointer select-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-amber-core/60 disabled:opacity-45 disabled:pointer-events-none ${visualClasses} ${SIZE_CLASSES[size]} ${className}`}
       {...rest}
     >
       {icon && (

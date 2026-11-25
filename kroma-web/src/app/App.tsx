@@ -11,10 +11,10 @@ import {
 } from 'react';
 import { BrowserPreviewGateway } from '../adapters/gateways/browserPreviewGateway';
 import {
+  getSharedTauriStudioGateway,
   isTauriDesktopEnvironment,
-  TauriStudioGateway,
 } from '../adapters/gateways/tauriStudioGateway';
-import { DarkroomTooltipProvider } from '../features/darkroom-kit';
+import { DarkroomTooltipProvider } from '../features/darkroom-kit/DarkroomTooltip';
 import { SplashScreen } from '../features/shell/SplashScreen';
 import { StatusFilmstripBar } from '../features/shell/StatusFilmstripBar';
 import { TopCommandBar } from '../features/shell/TopCommandBar';
@@ -276,12 +276,13 @@ function MotionPreferenceBoundary({ children }: { readonly children: ReactNode }
 }
 
 export function App() {
-  // Composition root: uses TauriStudioGateway inside the desktop app,
-  // and falls back to a read-only BrowserPreviewGateway if opened in a web browser.
+  // Composition root: uses a shared TauriStudioGateway inside the desktop app (surviving dev HMR
+  // reloads without dropping loaded-shoot state or hot RAW buffers), and falls back to a read-only
+  // BrowserPreviewGateway when opened in a regular browser.
   const gateway = useMemo(
     () =>
       isTauriDesktopEnvironment()
-        ? new TauriStudioGateway()
+        ? getSharedTauriStudioGateway()
         : new BrowserPreviewGateway(),
     [],
   );

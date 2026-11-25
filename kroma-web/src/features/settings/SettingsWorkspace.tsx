@@ -68,6 +68,7 @@ const OPEN_WORKSPACE_OPTIONS: readonly SegmentedOption<DefaultOpenWorkspace>[] =
 ];
 
 const SUBJECT_SORT_OPTIONS: readonly SegmentedOption<DefaultSubjectSortMode>[] = [
+  { id: 'alphabetical', label: 'A–Z', title: 'Sort subjects alphabetically by name' },
   { id: 'capture_time', label: 'Time', title: 'Sort subjects by first shutter capture time' },
   { id: 'confidence', label: 'Confidence', title: 'Sort subjects needing review first' },
   { id: 'exposures', label: 'Photos', title: 'Sort subjects by largest photo count first' },
@@ -141,8 +142,9 @@ const SHORTCUT_GROUPS: readonly ShortcutGroup[] = [
     title: 'Studio',
     items: [
       { action: 'Toggle Focus Mode (hide toolbars)', keys: ['Tab'] },
-      { action: 'Edit / Crop / Mask / Presets tools', keys: ['E', 'R', 'M', 'P'] },
+      { action: 'Edit / Crop / Retouch / Mask / Presets tools', keys: ['E', 'R', 'Q', 'M', 'P'] },
       { action: 'White Balance eyedropper', keys: ['W'] },
+      { action: 'Toggle retouch spot pins', keys: ['H'] },
       { action: 'Toggle shadow & highlight clipping', keys: ['J'] },
       { action: 'Toggle mask overlay', keys: ['O'] },
       { action: 'Decrease / increase brush size', keys: ['[', ']'] },
@@ -278,6 +280,8 @@ export function SettingsWorkspace() {
     isDesktopRuntime,
     session,
     runtimeInfo,
+    modelDownloadProgress,
+    downloadingOptionalModelId,
     preferences,
     recentProjects,
     settingsOpen,
@@ -285,6 +289,8 @@ export function SettingsWorkspace() {
     lastClusteredTemporalAssist,
     isScanningFolder,
     savePreferences,
+    downloadOptionalModel,
+    cancelOptionalModelDownload,
     clearRecentProjects,
     getStorageCacheSummary,
     pickCacheDirectory,
@@ -429,8 +435,12 @@ export function SettingsWorkspace() {
       patchDraft({ customDetectorModelPath: modelPath });
     } else if (role === 'recognizer') {
       patchDraft({ customRecognizerModelPath: modelPath });
-    } else {
+    } else if (role === 'segmenter') {
       patchDraft({ customSegmenterModelPath: modelPath });
+    } else if (role === 'face_parser') {
+      patchDraft({ customFaceParserModelPath: modelPath });
+    } else {
+      patchDraft({ customLamaModelPath: modelPath });
     }
   };
 
@@ -566,8 +576,66 @@ export function SettingsWorkspace() {
       runtimeInfo?.defaultSegmenterModelPath ||
       runtimeInfo?.segmenterModelsReady,
   );
+  const defaultFaceParserLabel =
+    runtimeInfo?.defaultFaceParserModelLabel ?? 'YuNet 5-Point (Built-in)';
+  const activeFaceParserLabel =
+    draft.customFaceParserModelPath &&
+    draft.customFaceParserModelPath !== preferences.customFaceParserModelPath
+      ? basenameOfPath(draft.customFaceParserModelPath)
+      : draft.customFaceParserModelPath === null
+        ? defaultFaceParserLabel
+        : (runtimeInfo?.faceParserModelLabel ?? defaultFaceParserLabel);
+  const activeFaceParserFile = basenameOfPath(
+    draft.customFaceParserModelPath ??
+      runtimeInfo?.defaultFaceParserModelPath ??
+      runtimeInfo?.faceParserModelPath,
+  );
+  const isCustomFaceParser = Boolean(draft.customFaceParserModelPath);
+  const hasFaceParser = Boolean(
+    draft.customFaceParserModelPath ||
+      runtimeInfo?.defaultFaceParserModelPath ||
+      runtimeInfo?.faceParserReady,
+  );
+
+  const defaultLamaLabel = runtimeInfo?.defaultLamaModelLabel ?? 'Harmonic Fill (Built-in)';
+  const activeLamaLabel =
+    draft.customLamaModelPath &&
+    draft.customLamaModelPath !== preferences.customLamaModelPath
+      ? basenameOfPath(draft.customLamaModelPath)
+      : draft.customLamaModelPath === null
+        ? defaultLamaLabel
+        : (runtimeInfo?.lamaModelLabel ?? defaultLamaLabel);
+  const activeLamaFile = basenameOfPath(
+    draft.customLamaModelPath ??
+      runtimeInfo?.defaultLamaModelPath ??
+      runtimeInfo?.lamaModelPath,
+  );
+  const isCustomLama = Boolean(draft.customLamaModelPath);
+  const hasLamaModel = Boolean(
+    draft.customLamaModelPath ||
+      runtimeInfo?.defaultLamaModelPath ||
+      runtimeInfo?.lamaReady,
+  );
+
   const customModelCount =
-    Number(isCustomRecognizer) + Number(isCustomDetector) + Number(isCustomSegmenter);
+    Number(isCustomRecognizer) +
+    Number(isCustomDetector) +
+    Number(isCustomSegmenter) +
+    Number(isCustomFaceParser) +
+    Number(isCustomLama);
+
+  const optionalDownloadPct =
+    modelDownloadProgress && modelDownloadProgress.totalBytes > 0
+      ? Math.min(
+          100,
+          Math.max(
+            0,
+            Math.round(
+              (modelDownloadProgress.downloadedBytes / modelDownloadProgress.totalBytes) * 100,
+            ),
+          ),
+        )
+      : 0;
 
   const aiGpuActive = Boolean(runtimeInfo?.gpuAvailable && draft.enableGpuAcceleration);
 
@@ -1097,6 +1165,108 @@ export function SettingsWorkspace() {
                           />
                         </motion.div>
 
+                        {/* Optional Phase 3 AI Retouch Packs (On-Demand Opt-In) */}
+                        <motion.div variants={SECTION_ITEM_VARIANTS} className="flex flex-col">
+                          <SectionHeading>Optional AI Retouch Packs</SectionHeading>
+
+                          <SettingRow
+                            title="BiSeNet Neural Face Parsing"
+                            description="Pixel-exact 19-class skin, eye, teeth & lip masks that protect glasses and hairlines during Portrait Retouch and upgrade AI Face & Skin masks (~51 MB)."
+                            control={
+                              downloadingOptionalModelId === 'bisenet-face-parsing' ? (
+                                <div className="flex items-center gap-2 min-w-[180px]">
+                                  <div className="flex-1 flex flex-col gap-1">
+                                    <div className="flex items-center justify-between tabular-nums-mono text-[10px] text-ink-secondary">
+                                      <span>Downloading…</span>
+                                      <span>{optionalDownloadPct}%</span>
+                                    </div>
+                                    <div className="h-1.5 w-full rounded-full bg-surface overflow-hidden">
+                                      <div
+                                        style={{ width: `${optionalDownloadPct}%` }}
+                                        className="h-full bg-emerald-400 transition-[width] duration-150"
+                                      />
+                                    </div>
+                                  </div>
+                                  <DarkroomButton
+                                    variant="ghost"
+                                    size="xs"
+                                    icon="close"
+                                    onClick={() => void cancelOptionalModelDownload()}
+                                    title="Cancel download"
+                                    aria-label="Cancel BiSeNet download"
+                                  />
+                                </div>
+                              ) : hasFaceParser ? (
+                                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-focus/12 border border-emerald-focus/35 text-emerald-bright tabular-nums-mono text-[10.5px]">
+                                  <span className="material-symbols-outlined text-[14px]">
+                                    check_circle
+                                  </span>
+                                  Installed
+                                </span>
+                              ) : (
+                                <DarkroomButton
+                                  variant="secondary"
+                                  size="xs"
+                                  icon="download"
+                                  disabled={!isDesktopRuntime || downloadingOptionalModelId !== null}
+                                  onClick={() => void downloadOptionalModel('bisenet-face-parsing')}
+                                >
+                                  Install (51 MB)
+                                </DarkroomButton>
+                              )
+                            }
+                          />
+
+                          <SettingRow
+                            title="LaMa Generative Object Removal"
+                            description="Neural inpainting model for erasing large distractions, microphone stands, and photobombers. Falls back to built-in Harmonic Fill when not installed (~198 MB)."
+                            last
+                            control={
+                              downloadingOptionalModelId === 'lama-inpainting' ? (
+                                <div className="flex items-center gap-2 min-w-[180px]">
+                                  <div className="flex-1 flex flex-col gap-1">
+                                    <div className="flex items-center justify-between tabular-nums-mono text-[10px] text-ink-secondary">
+                                      <span>Downloading…</span>
+                                      <span>{optionalDownloadPct}%</span>
+                                    </div>
+                                    <div className="h-1.5 w-full rounded-full bg-surface overflow-hidden">
+                                      <div
+                                        style={{ width: `${optionalDownloadPct}%` }}
+                                        className="h-full bg-amber-core transition-[width] duration-150"
+                                      />
+                                    </div>
+                                  </div>
+                                  <DarkroomButton
+                                    variant="ghost"
+                                    size="xs"
+                                    icon="close"
+                                    onClick={() => void cancelOptionalModelDownload()}
+                                    title="Cancel download"
+                                    aria-label="Cancel LaMa download"
+                                  />
+                                </div>
+                              ) : hasLamaModel ? (
+                                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-focus/12 border border-emerald-focus/35 text-emerald-bright tabular-nums-mono text-[10.5px]">
+                                  <span className="material-symbols-outlined text-[14px]">
+                                    check_circle
+                                  </span>
+                                  Installed
+                                </span>
+                              ) : (
+                                <DarkroomButton
+                                  variant="secondary"
+                                  size="xs"
+                                  icon="download"
+                                  disabled={!isDesktopRuntime || downloadingOptionalModelId !== null}
+                                  onClick={() => void downloadOptionalModel('lama-inpainting')}
+                                >
+                                  Install (198 MB)
+                                </DarkroomButton>
+                              )
+                            }
+                          />
+                        </motion.div>
+
                         {/* Collapsed Advanced: Custom ONNX Models */}
                         <motion.div
                           variants={SECTION_ITEM_VARIANTS}
@@ -1226,7 +1396,7 @@ export function SettingsWorkspace() {
                                   </div>
 
                                   {/* Subject Masking */}
-                                  <div className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                                  <div className="py-3 border-b border-hairline/70 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                                     <div className="min-w-0 flex-1">
                                       <div className="flex items-center gap-2">
                                         <span className="font-display text-[12.5px] font-medium text-ink-primary">
@@ -1268,6 +1438,104 @@ export function SettingsWorkspace() {
                                         icon="upload_file"
                                         disabled={isApplying}
                                         onClick={() => void handlePickCustomModel('segmenter')}
+                                      >
+                                        Choose .onnx…
+                                      </DarkroomButton>
+                                    </div>
+                                  </div>
+
+                                  {/* Face Parsing (BiSeNet) */}
+                                  <div className="py-3 border-b border-hairline/70 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                                    <div className="min-w-0 flex-1">
+                                      <div className="flex items-center gap-2">
+                                        <span className="font-display text-[12.5px] font-medium text-ink-primary">
+                                          Face Parsing (BiSeNet)
+                                        </span>
+                                        <span
+                                          className={`tabular-nums-mono text-[9px] px-1.5 py-0.5 rounded border ${
+                                            isCustomFaceParser
+                                              ? 'bg-amber-core/12 border-amber-core/40 text-amber-soft'
+                                              : 'bg-canvas border-hairline text-ink-telemetry'
+                                          }`}
+                                        >
+                                          {isCustomFaceParser
+                                            ? 'Custom'
+                                            : hasFaceParser
+                                              ? 'Installed'
+                                              : 'Optional'}
+                                        </span>
+                                      </div>
+                                      <div className="mt-0.5 tabular-nums-mono text-[10.5px] text-ink-telemetry truncate">
+                                        {activeFaceParserLabel}
+                                        {hasFaceParser ? ` • ${activeFaceParserFile}` : ''}
+                                      </div>
+                                    </div>
+                                    <div className="shrink-0 flex items-center gap-2">
+                                      {isCustomFaceParser && (
+                                        <button
+                                          type="button"
+                                          disabled={isApplying}
+                                          onClick={() => handleResetModelToDefault('face_parser')}
+                                          className="text-[11px] text-ink-telemetry hover:text-amber-soft cursor-pointer"
+                                        >
+                                          Use Default
+                                        </button>
+                                      )}
+                                      <DarkroomButton
+                                        variant="secondary"
+                                        size="xs"
+                                        icon="upload_file"
+                                        disabled={isApplying}
+                                        onClick={() => void handlePickCustomModel('face_parser')}
+                                      >
+                                        Choose .onnx…
+                                      </DarkroomButton>
+                                    </div>
+                                  </div>
+
+                                  {/* Generative Object Removal (LaMa) */}
+                                  <div className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                                    <div className="min-w-0 flex-1">
+                                      <div className="flex items-center gap-2">
+                                        <span className="font-display text-[12.5px] font-medium text-ink-primary">
+                                          Object Removal (LaMa)
+                                        </span>
+                                        <span
+                                          className={`tabular-nums-mono text-[9px] px-1.5 py-0.5 rounded border ${
+                                            isCustomLama
+                                              ? 'bg-amber-core/12 border-amber-core/40 text-amber-soft'
+                                              : 'bg-canvas border-hairline text-ink-telemetry'
+                                          }`}
+                                        >
+                                          {isCustomLama
+                                            ? 'Custom'
+                                            : hasLamaModel
+                                              ? 'Installed'
+                                              : 'Optional'}
+                                        </span>
+                                      </div>
+                                      <div className="mt-0.5 tabular-nums-mono text-[10.5px] text-ink-telemetry truncate">
+                                        {activeLamaLabel}
+                                        {hasLamaModel ? ` • ${activeLamaFile}` : ''}
+                                      </div>
+                                    </div>
+                                    <div className="shrink-0 flex items-center gap-2">
+                                      {isCustomLama && (
+                                        <button
+                                          type="button"
+                                          disabled={isApplying}
+                                          onClick={() => handleResetModelToDefault('inpainter')}
+                                          className="text-[11px] text-ink-telemetry hover:text-amber-soft cursor-pointer"
+                                        >
+                                          Use Default
+                                        </button>
+                                      )}
+                                      <DarkroomButton
+                                        variant="secondary"
+                                        size="xs"
+                                        icon="upload_file"
+                                        disabled={isApplying}
+                                        onClick={() => void handlePickCustomModel('inpainter')}
                                       >
                                         Choose .onnx…
                                       </DarkroomButton>

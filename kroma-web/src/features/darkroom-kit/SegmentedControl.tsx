@@ -29,7 +29,7 @@ export function SegmentedControl<T extends string>({
   return (
     <div
       role="radiogroup"
-      className={`inline-flex items-center bg-canvas rounded-lg p-0.5 border border-hairline ${className}`}
+      className={`inline-flex items-center bg-surface-lowest/90 rounded-lg p-0.5 border border-hairline/70 ${className}`}
     >
       {options.map((option) => {
         const isActive = option.id === value;
@@ -40,20 +40,20 @@ export function SegmentedControl<T extends string>({
               role="radio"
               aria-checked={isActive}
               onClick={() => onChange(option.id)}
-              className={`relative px-2 py-1 rounded-md text-[11px] flex items-center gap-1 transition-colors cursor-pointer ${
-                isActive ? 'text-amber-soft font-medium' : 'text-ink-telemetry hover:text-ink-primary'
+              className={`relative px-2.5 py-1 rounded-md text-[11px] flex items-center justify-center gap-1 transition-colors duration-150 cursor-pointer focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-amber-core/60 ${
+                isActive ? 'text-ink-primary font-medium' : 'text-ink-telemetry hover:text-ink-secondary'
               }`}
             >
               {isActive && (
                 <motion.span
                   layoutId={layoutId}
                   transition={TACTILE_SPRING}
-                  className="absolute inset-0 rounded-md bg-surface-active border border-hairline-strong"
+                  className="absolute inset-0 rounded-md bg-surface-active border border-hairline-strong/80 shadow-[0_1px_2px_rgba(0,0,0,0.3)]"
                 />
               )}
               <span className="relative z-10 flex items-center gap-1">
                 {option.icon && (
-                  <span className="material-symbols-outlined text-[16px]">{option.icon}</span>
+                  <span className="material-symbols-outlined text-[15px]">{option.icon}</span>
                 )}
                 {option.label && <span>{option.label}</span>}
               </span>

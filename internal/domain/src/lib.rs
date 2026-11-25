@@ -4,4 +4,5 @@ pub mod identity;
 pub mod masking;
 pub mod organization;
 pub mod photo;
+pub mod retouch;
 pub mod slate;

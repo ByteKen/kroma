@@ -31,6 +31,8 @@ pub enum ModelRole {
     Detector,
     Recognizer,
     Segmenter,
+    FaceParser,
+    Inpainter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +185,166 @@ pub fn inspect_onnx_model(path: &Path, role: ModelRole) -> ModelInspectionReport
         ModelRole::Segmenter => {
             evaluate_segmenter_contract(file_name, file_size_bytes, &inputs, &outputs)
         }
+        ModelRole::FaceParser => {
+            evaluate_face_parser_contract(file_name, file_size_bytes, &inputs, &outputs)
+        }
+        ModelRole::Inpainter => {
+            evaluate_inpainter_contract(file_name, file_size_bytes, &inputs, &outputs)
+        }
+    }
+}
+
+pub fn evaluate_face_parser_contract(
+    file_name: &str,
+    file_size_bytes: u64,
+    inputs: &[TensorSignature],
+    outputs: &[TensorSignature],
+) -> ModelInspectionReport {
+    let input_shape = inputs
+        .first()
+        .map(|i| format_shape(&i.shape))
+        .unwrap_or_else(|| "none".to_string());
+    let output_shape = outputs
+        .first()
+        .map(|o| format_shape(&o.shape))
+        .unwrap_or_else(|| "none".to_string());
+
+    let mut errors = Vec::new();
+    if inputs.is_empty() {
+        errors.push("Model declares no input tensors.".to_string());
+    } else {
+        let shape = &inputs[0].shape;
+        if shape.len() != 4 || (shape[1] != 3 && shape[1] > 0) {
+            errors.push(format!(
+                "Expected 4D NCHW RGB face input [N, 3, H, W], found {}.",
+                format_shape(shape)
+            ));
+        }
+    }
+    if outputs.is_empty() {
+        errors.push("Model declares no output tensors.".to_string());
+    } else {
+        let shape = &outputs[0].shape;
+        let classes_ok = shape.len() == 4 && (shape[1] == 19 || shape[1] < 0);
+        if !classes_ok {
+            errors.push(format!(
+                "Expected 19-class CelebAMask-HQ logits [N, 19, H, W], found {}.",
+                format_shape(shape)
+            ));
+        }
+    }
+
+    let label = if file_name.to_ascii_lowercase().contains("resnet34") {
+        "BiSeNet ResNet-34 Face Parser".to_string()
+    } else if file_name.to_ascii_lowercase().contains("resnet18")
+        || file_name.to_ascii_lowercase().contains("parsing")
+        || file_name.to_ascii_lowercase().contains("bisenet")
+    {
+        "BiSeNet 19-Class Face Parser".to_string()
+    } else {
+        friendly_stem(file_name)
+    };
+
+    if !errors.is_empty() {
+        return ModelInspectionReport {
+            compatibility: ModelCompatibility::Incompatible,
+            summary: "Not a compatible 19-class BiSeNet face parsing ONNX model.".to_string(),
+            warnings: errors,
+            detected_label: label,
+            input_shape,
+            output_shape,
+            embedding_dim: None,
+            file_size_bytes,
+        };
+    }
+
+    ModelInspectionReport {
+        compatibility: ModelCompatibility::Compatible,
+        summary: format!("Verified compatible 19-class face parsing ONNX model ({label})."),
+        warnings: Vec::new(),
+        detected_label: label,
+        input_shape,
+        output_shape,
+        embedding_dim: None,
+        file_size_bytes,
+    }
+}
+
+pub fn evaluate_inpainter_contract(
+    file_name: &str,
+    file_size_bytes: u64,
+    inputs: &[TensorSignature],
+    outputs: &[TensorSignature],
+) -> ModelInspectionReport {
+    let input_shape = inputs
+        .iter()
+        .map(|i| format!("{}:{}", i.name, format_shape(&i.shape)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let output_shape = outputs
+        .first()
+        .map(|o| format_shape(&o.shape))
+        .unwrap_or_else(|| "none".to_string());
+
+    let mut errors = Vec::new();
+    if inputs.len() < 2 {
+        errors.push(format!(
+            "Expected 2 inputs (image [1, 3, H, W] and mask [1, 1, H, W]), found {}.",
+            inputs.len()
+        ));
+    } else {
+        let has_rgb = inputs
+            .iter()
+            .any(|i| i.shape.len() == 4 && (i.shape[1] == 3 || i.shape[1] < 0));
+        let has_mask = inputs
+            .iter()
+            .any(|i| i.shape.len() == 4 && (i.shape[1] == 1 || i.shape[1] < 0));
+        if !has_rgb || !has_mask {
+            errors.push(
+                "Expected one 3-channel RGB image input and one 1-channel mask input.".to_string(),
+            );
+        }
+    }
+    if outputs.is_empty() {
+        errors.push("Model declares no output tensors.".to_string());
+    } else {
+        let shape = &outputs[0].shape;
+        if shape.len() != 4 || (shape[1] != 3 && shape[1] > 0) {
+            errors.push(format!(
+                "Expected RGB image output [1, 3, H, W], found {}.",
+                format_shape(shape)
+            ));
+        }
+    }
+
+    let label = if file_name.to_ascii_lowercase().contains("lama") {
+        "LaMa Neural Inpainter".to_string()
+    } else {
+        friendly_stem(file_name)
+    };
+
+    if !errors.is_empty() {
+        return ModelInspectionReport {
+            compatibility: ModelCompatibility::Incompatible,
+            summary: "Not a compatible LaMa image inpainting ONNX model.".to_string(),
+            warnings: errors,
+            detected_label: label,
+            input_shape,
+            output_shape,
+            embedding_dim: None,
+            file_size_bytes,
+        };
+    }
+
+    ModelInspectionReport {
+        compatibility: ModelCompatibility::Compatible,
+        summary: format!("Verified compatible LaMa inpainting ONNX model ({label})."),
+        warnings: Vec::new(),
+        detected_label: label,
+        input_shape,
+        output_shape,
+        embedding_dim: None,
+        file_size_bytes,
     }
 }
 

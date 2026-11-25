@@ -7,6 +7,7 @@ use kroma_domain::masking::{
     AiMaskKind, BackgroundRemoval, BackgroundReplaceMode, BrushStroke, LocalAdjustments,
     MaskCombineOp, MaskComponent, MaskLayer,
 };
+use kroma_domain::retouch::{HealSpot, HealSpotMode, PortraitRetouch, RetouchSettings};
 use serde::{Deserialize, Serialize};
 
 pub const CURRENT_SIDECAR_SCHEMA_VERSION: u32 = 3;
@@ -64,6 +65,247 @@ pub struct RecipeSidecarDto {
     pub masks: Vec<MaskLayerDto>,
     #[serde(default)]
     pub background_removal: BackgroundRemovalDto,
+    #[serde(default)]
+    pub retouch: RetouchSettingsDto,
+}
+
+fn default_heal_mode() -> String {
+    "heal".to_string()
+}
+
+fn default_heal_radius() -> f32 {
+    0.018
+}
+
+fn default_heal_feather() -> f32 {
+    0.55
+}
+
+fn default_one_f32() -> f32 {
+    1.0
+}
+
+fn default_seventy_u8() -> u8 {
+    70
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealSpotDto {
+    pub id: String,
+    #[serde(default = "default_heal_mode")]
+    pub mode: String,
+    pub target_x: f32,
+    pub target_y: f32,
+    pub source_x: f32,
+    pub source_y: f32,
+    #[serde(default = "default_heal_radius")]
+    pub radius: f32,
+    #[serde(default = "default_heal_feather")]
+    pub feather: f32,
+    #[serde(default = "default_one_f32")]
+    pub opacity: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<[f32; 2]>,
+}
+
+impl From<&HealSpot> for HealSpotDto {
+    fn from(s: &HealSpot) -> Self {
+        Self {
+            id: s.id.clone(),
+            mode: s.mode.as_str().to_string(),
+            target_x: s.target_x,
+            target_y: s.target_y,
+            source_x: s.source_x,
+            source_y: s.source_y,
+            radius: s.radius,
+            feather: s.feather,
+            opacity: s.opacity,
+            points: s.points.clone(),
+        }
+    }
+}
+
+impl From<HealSpotDto> for HealSpot {
+    fn from(d: HealSpotDto) -> Self {
+        Self {
+            id: d.id,
+            mode: HealSpotMode::parse(&d.mode),
+            target_x: d.target_x,
+            target_y: d.target_y,
+            source_x: d.source_x,
+            source_y: d.source_y,
+            radius: d.radius,
+            feather: d.feather,
+            opacity: d.opacity,
+            points: d.points,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortraitRetouchDto {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub skin_smoothing: u8,
+    #[serde(default = "default_seventy_u8")]
+    pub skin_texture_preserve: u8,
+    #[serde(default)]
+    pub skin_tone_evenness: u8,
+    #[serde(default)]
+    pub shine_removal: u8,
+    #[serde(default)]
+    pub under_eye_brighten: u8,
+    #[serde(default)]
+    pub eye_enhance: u8,
+    #[serde(default)]
+    pub teeth_whiten: u8,
+    #[serde(default)]
+    pub lip_enhance: u8,
+}
+
+impl Default for PortraitRetouchDto {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            skin_smoothing: 0,
+            skin_texture_preserve: 70,
+            skin_tone_evenness: 0,
+            shine_removal: 0,
+            under_eye_brighten: 0,
+            eye_enhance: 0,
+            teeth_whiten: 0,
+            lip_enhance: 0,
+        }
+    }
+}
+
+impl From<&PortraitRetouch> for PortraitRetouchDto {
+    fn from(p: &PortraitRetouch) -> Self {
+        Self {
+            enabled: p.enabled,
+            skin_smoothing: p.skin_smoothing,
+            skin_texture_preserve: p.skin_texture_preserve,
+            skin_tone_evenness: p.skin_tone_evenness,
+            shine_removal: p.shine_removal,
+            under_eye_brighten: p.under_eye_brighten,
+            eye_enhance: p.eye_enhance,
+            teeth_whiten: p.teeth_whiten,
+            lip_enhance: p.lip_enhance,
+        }
+    }
+}
+
+impl From<PortraitRetouchDto> for PortraitRetouch {
+    fn from(d: PortraitRetouchDto) -> Self {
+        Self {
+            enabled: d.enabled,
+            skin_smoothing: d.skin_smoothing,
+            skin_texture_preserve: d.skin_texture_preserve,
+            skin_tone_evenness: d.skin_tone_evenness,
+            shine_removal: d.shine_removal,
+            under_eye_brighten: d.under_eye_brighten,
+            eye_enhance: d.eye_enhance,
+            teeth_whiten: d.teeth_whiten,
+            lip_enhance: d.lip_enhance,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchBoundsDto {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InpaintPatchDto {
+    pub id: String,
+    pub bounds: PatchBoundsDto,
+    pub patch_width: u16,
+    pub patch_height: u16,
+    #[serde(default = "default_one_f32")]
+    pub opacity: f32,
+    #[serde(default)]
+    pub mask_rle_b64: String,
+    #[serde(default)]
+    pub patch_image_b64: String,
+    #[serde(default)]
+    pub engine_label: String,
+}
+
+impl From<&kroma_domain::retouch::InpaintPatch> for InpaintPatchDto {
+    fn from(p: &kroma_domain::retouch::InpaintPatch) -> Self {
+        Self {
+            id: p.id.clone(),
+            bounds: PatchBoundsDto {
+                left: p.bounds.left,
+                top: p.bounds.top,
+                width: p.bounds.width,
+                height: p.bounds.height,
+            },
+            patch_width: p.patch_width,
+            patch_height: p.patch_height,
+            opacity: p.opacity,
+            mask_rle_b64: p.mask_rle_b64.clone(),
+            patch_image_b64: p.patch_image_b64.clone(),
+            engine_label: p.engine_label.clone(),
+        }
+    }
+}
+
+impl From<InpaintPatchDto> for kroma_domain::retouch::InpaintPatch {
+    fn from(d: InpaintPatchDto) -> Self {
+        let mut out = Self {
+            id: d.id,
+            bounds: NormalizedRect {
+                left: d.bounds.left,
+                top: d.bounds.top,
+                width: d.bounds.width,
+                height: d.bounds.height,
+            },
+            patch_width: d.patch_width,
+            patch_height: d.patch_height,
+            opacity: d.opacity,
+            mask_rle_b64: d.mask_rle_b64,
+            patch_image_b64: d.patch_image_b64,
+            engine_label: d.engine_label,
+        };
+        out.clamp_invariants();
+        out
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RetouchSettingsDto {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub heal_spots: Vec<HealSpotDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inpaint_patches: Vec<InpaintPatchDto>,
+    #[serde(default)]
+    pub portrait: PortraitRetouchDto,
+}
+
+impl From<&RetouchSettings> for RetouchSettingsDto {
+    fn from(r: &RetouchSettings) -> Self {
+        Self {
+            heal_spots: r.heal_spots.iter().map(Into::into).collect(),
+            inpaint_patches: r.inpaint_patches.iter().map(Into::into).collect(),
+            portrait: (&r.portrait).into(),
+        }
+    }
+}
+
+impl From<RetouchSettingsDto> for RetouchSettings {
+    fn from(d: RetouchSettingsDto) -> Self {
+        Self {
+            heal_spots: d.heal_spots.into_iter().map(Into::into).collect(),
+            inpaint_patches: d.inpaint_patches.into_iter().map(Into::into).collect(),
+            portrait: d.portrait.into(),
+        }
+    }
 }
 
 fn default_white_rgb() -> [u8; 3] {
@@ -880,6 +1122,7 @@ impl From<&DevelopRecipe> for RecipeSidecarDto {
             },
             masks: recipe.masks.iter().map(Into::into).collect(),
             background_removal: (&recipe.background_removal).into(),
+            retouch: (&recipe.retouch).into(),
         }
     }
 }
@@ -993,6 +1236,7 @@ impl RecipeSidecarDto {
             },
             masks: self.masks.into_iter().map(Into::into).collect(),
             background_removal: self.background_removal.into(),
+            retouch: self.retouch.into(),
         };
         recipe.clamp_all_invariants();
         recipe
@@ -1104,5 +1348,43 @@ mod tests {
         assert_eq!(domain.detail_optics.grain_amount, 0);
         assert_eq!(domain.detail_optics.grain_size, 25);
         assert!(domain.crop_transform.is_identity());
+        assert!(!domain.retouch.is_active());
+        assert_eq!(domain.retouch.portrait.skin_texture_preserve, 70);
+    }
+
+    #[test]
+    fn roundtrips_sidecar_with_heal_spots_and_portrait_retouch() {
+        let mut recipe = DevelopRecipe::default();
+        recipe.retouch.heal_spots.push(HealSpot {
+            id: "h1".to_string(),
+            mode: HealSpotMode::Heal,
+            target_x: 0.45,
+            target_y: 0.35,
+            source_x: 0.52,
+            source_y: 0.36,
+            radius: 0.02,
+            feather: 0.6,
+            opacity: 0.9,
+            points: vec![[0.45, 0.35], [0.47, 0.36]],
+        });
+        recipe.retouch.portrait = PortraitRetouch {
+            enabled: true,
+            skin_smoothing: 48,
+            skin_texture_preserve: 75,
+            skin_tone_evenness: 35,
+            shine_removal: 30,
+            under_eye_brighten: 28,
+            eye_enhance: 24,
+            teeth_whiten: 32,
+            lip_enhance: 16,
+        };
+
+        let dto = RecipeSidecarDto::from(&recipe);
+        let json = serde_json::to_string(&dto).expect("serialize retouch sidecar");
+        let parsed: RecipeSidecarDto =
+            serde_json::from_str(&json).expect("deserialize retouch sidecar");
+        let restored = parsed.into_domain();
+
+        assert_eq!(restored.retouch, recipe.retouch);
     }
 }

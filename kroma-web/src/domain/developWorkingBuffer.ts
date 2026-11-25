@@ -10,6 +10,7 @@ export const KR16_FLAG_RAW_DEMOSAIC = 0x02;
 export const KR_FLAG_WIDE_GAMUT_REC2020 = 0x04;
 
 export type WorkingBufferPrecision = 'f32' | 'f16';
+export type DevelopBufferLoadPriority = 'active' | 'prefetch';
 
 export interface DevelopWorkingBuffer {
   readonly precision: WorkingBufferPrecision;
@@ -193,6 +194,25 @@ export function parseKr16WorkingBuffer(raw: ArrayBuffer): DevelopWorkingBuffer |
     sourceBitDepth,
     halfFloatRgba,
   };
+}
+
+/**
+ * Detects Kroma's 4-byte `"KRSK"` sentinel returned by the Rust RAW decode scheduler when an
+ * older or background prefetch decode was superseded by a newer active photo selection.
+ * Callers must treat this as a cancelled load and NEVER cache `null` in the LRU.
+ */
+export function isSupersededWorkingBuffer(raw: ArrayBuffer): boolean {
+  if (raw.byteLength !== 4) {
+    return false;
+  }
+  const view = new DataView(raw);
+  // Magic bytes "KRSK" (0x4B, 0x52, 0x53, 0x4B)
+  return (
+    view.getUint8(0) === 0x4b &&
+    view.getUint8(1) === 0x52 &&
+    view.getUint8(2) === 0x53 &&
+    view.getUint8(3) === 0x4b
+  );
 }
 
 /**

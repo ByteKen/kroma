@@ -629,6 +629,7 @@ impl Default for CropTransform {
 }
 
 use crate::masking::{BackgroundRemoval, MaskLayer};
+use crate::retouch::RetouchSettings;
 
 /// Non-destructive Lightroom-class Parametric Develop Recipe.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -644,6 +645,7 @@ pub struct DevelopRecipe {
     pub crop_transform: CropTransform,
     pub masks: Vec<MaskLayer>,
     pub background_removal: BackgroundRemoval,
+    pub retouch: RetouchSettings,
 }
 
 /// Selective checklist mask for Lightroom-style `Sync Settings` (`Ctrl+Shift+S`).
@@ -659,10 +661,14 @@ pub struct DevelopSyncMask {
     pub sync_detail_optics: bool,
     pub sync_crop_transform: bool,
     pub sync_masks: bool,
+    /// Batch-syncable frequency-separation portrait retouching sliders (resolved per-photo via YuNet).
+    pub sync_portrait_retouch: bool,
+    /// Per-photo spot heal/clone strokes (off by default to avoid copying blemish coordinates across subjects).
+    pub sync_heal_spots: bool,
 }
 
 impl DevelopSyncMask {
-    /// Default Lightroom batch sync: syncs all color/tone grading, preserves per-photo crops & masks.
+    /// Default Lightroom batch sync: syncs all color/tone grading, preserves per-photo crops, masks & heal spots.
     pub fn color_and_tone_only() -> Self {
         Self {
             sync_white_balance: true,
@@ -675,6 +681,8 @@ impl DevelopSyncMask {
             sync_detail_optics: true,
             sync_crop_transform: false,
             sync_masks: false,
+            sync_portrait_retouch: false,
+            sync_heal_spots: false,
         }
     }
 
@@ -690,6 +698,8 @@ impl DevelopSyncMask {
             sync_detail_optics: true,
             sync_crop_transform: true,
             sync_masks: true,
+            sync_portrait_retouch: true,
+            sync_heal_spots: true,
         }
     }
 }
@@ -757,15 +767,18 @@ impl DevelopRecipe {
         {
             return true;
         }
-        self.masks.iter().any(MaskLayer::is_effective) || self.background_removal.is_active()
+        self.masks.iter().any(MaskLayer::is_effective)
+            || self.background_removal.is_active()
+            || self.retouch.is_active()
     }
 
     /// Returns `true` when the recipe includes effects that cannot be represented by the
     /// lightweight per-channel SVG `<feComponentTransfer>` thumbnail LUT (e.g. AI background
-    /// cutout, local masks, 3D `.cube` LUTs, HSL/Calibration shifts, crops, or 90-degree turns).
+    /// cutout, local masks, retouching, 3D `.cube` LUTs, HSL/Calibration shifts, crops, or 90-degree turns).
     pub fn has_non_svg_thumbnail_effects(&self) -> bool {
         self.background_removal.is_active()
             || self.masks.iter().any(MaskLayer::is_effective)
+            || self.retouch.is_active()
             || self.lut_3d.as_ref().is_some_and(|l| l.intensity > 1e-4)
             || !self.hsl_mixer.is_neutral()
             || !self.camera_calibration.is_neutral()
@@ -795,6 +808,7 @@ impl DevelopRecipe {
             mask.clamp_invariants();
         }
         self.background_removal.clamp_invariants();
+        self.retouch.clamp_invariants();
     }
 
     /// Applies selected modules from `source` onto `self` according to `mask`.
@@ -829,6 +843,13 @@ impl DevelopRecipe {
         if mask.sync_masks {
             self.masks = source.masks.clone();
             self.background_removal = source.background_removal.clone();
+        }
+        if mask.sync_portrait_retouch {
+            self.retouch.portrait = source.retouch.portrait;
+        }
+        if mask.sync_heal_spots {
+            self.retouch.heal_spots = source.retouch.heal_spots.clone();
+            self.retouch.inpaint_patches = source.retouch.inpaint_patches.clone();
         }
         self.clamp_all_invariants();
     }

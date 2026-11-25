@@ -7,6 +7,14 @@ import {
   type BackgroundRemovalSettings,
   type MaskLayer,
 } from './masking';
+import {
+  createDefaultRetouchSettings,
+  hasEffectiveHealSpots,
+  hasEffectiveInpaintPatches,
+  hydrateRetouchSettings,
+  isPortraitRetouchActive,
+  type RetouchSettings,
+} from './retouch';
 import { isToneCurveModified, type ToneCurvePoint } from './toneCurve';
 
 export type { ToneCurveChannel, ToneCurvePoint } from './toneCurve';
@@ -149,6 +157,7 @@ export interface DevelopRecipe {
   readonly cropTransform: CropTransformSettings;
   readonly masks: readonly MaskLayer[];
   readonly backgroundRemoval?: BackgroundRemovalSettings;
+  readonly retouch?: RetouchSettings;
 }
 
 export interface DevelopSyncMask {
@@ -162,6 +171,8 @@ export interface DevelopSyncMask {
   readonly detailOptics: boolean;
   readonly cropTransform: boolean;
   readonly masks: boolean;
+  readonly portraitRetouch: boolean;
+  readonly healSpots: boolean;
 }
 
 export interface RelativeDevelopDelta {
@@ -265,6 +276,7 @@ export function createDefaultDevelopRecipe(): DevelopRecipe {
     cropTransform: createDefaultCropTransform(),
     masks: [],
     backgroundRemoval: createDefaultBackgroundRemoval(),
+    retouch: createDefaultRetouchSettings(),
   };
 }
 
@@ -319,6 +331,7 @@ export function hydrateDevelopRecipe(raw: Partial<DevelopRecipe> | null | undefi
     },
     masks: hydrateMaskLayers(raw.masks),
     backgroundRemoval: hydrateBackgroundRemoval(raw.backgroundRemoval),
+    retouch: hydrateRetouchSettings(raw.retouch),
   };
 }
 
@@ -334,6 +347,8 @@ export function createColorAndToneSyncMask(): DevelopSyncMask {
     detailOptics: true,
     cropTransform: false,
     masks: false,
+    portraitRetouch: false,
+    healSpots: false,
   };
 }
 
@@ -417,6 +432,8 @@ export function getModifiedDevelopModules(recipe: DevelopRecipe): DevelopSyncMas
     masks:
       (recipe.masks ?? []).some(isMaskLayerEffective) ||
       isBackgroundRemovalActive(recipe.backgroundRemoval),
+    portraitRetouch: isPortraitRetouchActive(recipe.retouch?.portrait),
+    healSpots: hasEffectiveHealSpots(recipe.retouch) || hasEffectiveInpaintPatches(recipe.retouch),
   };
 }
 
@@ -692,6 +709,23 @@ export function syncDevelopRecipe(
     backgroundRemoval: mask.masks
       ? hydrateBackgroundRemoval(source.backgroundRemoval)
       : hydrateBackgroundRemoval(target.backgroundRemoval),
+    retouch: {
+      portrait: mask.portraitRetouch
+        ? hydrateRetouchSettings(source.retouch).portrait
+        : hydrateRetouchSettings(target.retouch).portrait,
+      healSpots: mask.healSpots
+        ? hydrateRetouchSettings(source.retouch).healSpots.map((s) => ({
+            ...s,
+            ...(s.points ? { points: s.points.map((pt) => [pt[0], pt[1]] as const) } : {}),
+          }))
+        : hydrateRetouchSettings(target.retouch).healSpots,
+      inpaintPatches: mask.healSpots
+        ? (hydrateRetouchSettings(source.retouch).inpaintPatches ?? []).map((p) => ({
+            ...p,
+            bounds: { ...p.bounds },
+          }))
+        : hydrateRetouchSettings(target.retouch).inpaintPatches ?? [],
+    },
   };
 }
 

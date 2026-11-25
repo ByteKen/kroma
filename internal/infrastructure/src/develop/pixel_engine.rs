@@ -5,30 +5,192 @@ use crate::develop::image_decoder;
 use crate::develop::mask_engine::{
     apply_local_masks_f32, apply_opaque_backdrop_f32, compute_transparent_alpha_f32,
 };
+use crate::develop::retouch_engine::{
+    apply_heal_spots_f32, apply_inpaint_patches_f32, apply_portrait_retouch_with_parse_f32,
+};
 use crate::develop::wgpu_engine::shared_wgpu_develop_engine;
+use crate::vision::face_parser::OnnxBiSeNetFaceParser;
 use crate::vision::onnx_runtime::is_gpu_acceleration_enabled;
+use crate::vision::yunet_detector::YuNetOnnxDetector;
 use image::codecs::jpeg::JpegEncoder;
 use image::{imageops, DynamicImage, ImageFormat, Rgb, Rgb32FImage, RgbImage, Rgba, RgbaImage};
 use kroma_app::error::AppError;
 use kroma_app::ports::develop_engine::{
     BatchRenderItemOutcome, BatchRenderJob, ImageDevelopPort, OutputImageFormat, RenderMetrics,
 };
+use kroma_app::ports::vision::FaceDetectorPort;
 use kroma_domain::develop::{CropTransform, DevelopRecipe, NormalizedRect, RgbHistogram};
+use kroma_domain::retouch::{FaceParseMap, PortraitFaceGuide};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Cursor};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
-/// Multi-threaded CPU parametric image develop engine backed by `rawler` (RAW) + `image` + `rayon`.
+/// Multi-threaded CPU / `wgpu` parametric image develop engine backed by `rawler` (RAW) + `image` + `rayon`.
 /// Grades in 32-bit floating point so 16-bit camera RAW files retain full highlight/shadow latitude.
-#[derive(Debug, Default, Clone)]
-pub struct RayonImageDevelopEngine;
+#[derive(Default, Clone)]
+pub struct RayonImageDevelopEngine {
+    /// Optional per-source-path YuNet face guides cached from shoot indexing for landmark-guided
+    /// portrait retouching during batch export.
+    face_guides_by_source: Option<Arc<HashMap<String, Vec<PortraitFaceGuide>>>>,
+    /// Optional warmed-up YuNet detector used as an automatic on-demand fallback when exporting a
+    /// photo with active portrait retouching that was not previously face-scanned (e.g. Single-Photo mode).
+    fallback_yunet: Option<Arc<YuNetOnnxDetector>>,
+    /// Optional per-source-path precomputed BiSeNet 19-class semantic face parse maps.
+    face_parse_maps_by_source: Option<Arc<HashMap<String, FaceParseMap>>>,
+    /// Optional warmed-up BiSeNet face parser ONNX engine for pixel-exact neural portrait retouching.
+    fallback_face_parser: Option<Arc<OnnxBiSeNetFaceParser>>,
+}
+
+impl std::fmt::Debug for RayonImageDevelopEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RayonImageDevelopEngine")
+            .field(
+                "face_guide_entries",
+                &self.face_guides_by_source.as_ref().map(|m| m.len()).unwrap_or(0),
+            )
+            .field("has_fallback_yunet", &self.fallback_yunet.is_some())
+            .field(
+                "face_parse_entries",
+                &self
+                    .face_parse_maps_by_source
+                    .as_ref()
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+            )
+            .field(
+                "has_fallback_face_parser",
+                &self.fallback_face_parser.is_some(),
+            )
+            .finish()
+    }
+}
 
 impl RayonImageDevelopEngine {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_face_guides_and_detector(
+        face_guides_by_source: HashMap<String, Vec<PortraitFaceGuide>>,
+        fallback_yunet: Option<Arc<YuNetOnnxDetector>>,
+    ) -> Self {
+        Self::with_retouch_context(face_guides_by_source, fallback_yunet, HashMap::new(), None)
+    }
+
+    pub fn with_retouch_context(
+        face_guides_by_source: HashMap<String, Vec<PortraitFaceGuide>>,
+        fallback_yunet: Option<Arc<YuNetOnnxDetector>>,
+        face_parse_maps_by_source: HashMap<String, FaceParseMap>,
+        fallback_face_parser: Option<Arc<OnnxBiSeNetFaceParser>>,
+    ) -> Self {
+        Self {
+            face_guides_by_source: if face_guides_by_source.is_empty() {
+                None
+            } else {
+                Some(Arc::new(face_guides_by_source))
+            },
+            fallback_yunet,
+            face_parse_maps_by_source: if face_parse_maps_by_source.is_empty() {
+                None
+            } else {
+                Some(Arc::new(face_parse_maps_by_source))
+            },
+            fallback_face_parser,
+        }
+    }
+
+    fn resolve_face_parse_for_source(
+        &self,
+        source_path: &str,
+        recipe: &DevelopRecipe,
+        face_guides: &[PortraitFaceGuide],
+    ) -> Option<FaceParseMap> {
+        if !recipe.retouch.is_portrait_active() {
+            return None;
+        }
+        if let Some(ref map) = self.face_parse_maps_by_source
+            && let Some(parsed) = map.get(source_path)
+            && parsed.is_valid()
+        {
+            return Some(parsed.clone());
+        }
+        if let Some(ref parser) = self.fallback_face_parser
+            && let Ok(mut preview_rgb) = image_decoder::decode_fast_preview_max_dim(source_path, 1024)
+        {
+            let crop = recipe.crop_transform;
+            preview_rgb = match crop.quarter_turns % 4 {
+                1 => imageops::rotate90(&preview_rgb),
+                2 => imageops::rotate180(&preview_rgb),
+                3 => imageops::rotate270(&preview_rgb),
+                _ => preview_rgb,
+            };
+            if crop.flip_horizontal {
+                preview_rgb = imageops::flip_horizontal(&preview_rgb);
+            }
+            if crop.flip_vertical {
+                preview_rgb = imageops::flip_vertical(&preview_rgb);
+            }
+            let (ow, oh) = preview_rgb.dimensions();
+            let oriented_guides: Vec<PortraitFaceGuide> = face_guides
+                .iter()
+                .take(4)
+                .map(|g| g.into_oriented_uv(crop, ow, oh, false))
+                .collect();
+            if let Ok(parsed) = parser.parse_portrait_rgba(&preview_rgb, &oriented_guides) {
+                return Some(parsed);
+            }
+        }
+        None
+    }
+
+    fn resolve_face_guides_for_source(
+        &self,
+        source_path: &str,
+        recipe: &DevelopRecipe,
+    ) -> Vec<PortraitFaceGuide> {
+        if !recipe.retouch.is_portrait_active() {
+            return Vec::new();
+        }
+        if let Some(ref map) = self.face_guides_by_source
+            && let Some(guides) = map.get(source_path)
+            && !guides.is_empty()
+        {
+            return guides.clone();
+        }
+        if let Some(ref detector) = self.fallback_yunet
+            && let Ok(detections) = detector.detect_faces(source_path)
+            && !detections.is_empty()
+        {
+            return detections
+                .into_iter()
+                .take(4)
+                .map(|det| {
+                    PortraitFaceGuide::from_normalized(
+                        det.bounding_box.x,
+                        det.bounding_box.y,
+                        det.bounding_box.width,
+                        det.bounding_box.height,
+                        [det.landmarks.right_eye.x, det.landmarks.right_eye.y],
+                        [det.landmarks.left_eye.x, det.landmarks.left_eye.y],
+                        [det.landmarks.nose_tip.x, det.landmarks.nose_tip.y],
+                        [
+                            det.landmarks.right_mouth_corner.x,
+                            det.landmarks.right_mouth_corner.y,
+                        ],
+                        [
+                            det.landmarks.left_mouth_corner.x,
+                            det.landmarks.left_mouth_corner.y,
+                        ],
+                    )
+                })
+                .collect();
+        }
+        Vec::new()
     }
 
     /// Runs the full non-destructive DevelopRecipe in-memory on an 8-bit `RgbImage`.
@@ -39,6 +201,17 @@ impl RayonImageDevelopEngine {
     ) -> Result<RgbImage, AppError> {
         let dyn_img = DynamicImage::ImageRgb8(source.clone());
         let graded_f32 = self.process_dynamic_to_f32(&dyn_img, recipe)?;
+        Ok(finalize_rgb8(graded_f32))
+    }
+
+    /// Grades a high-bit-depth `DecodedDevelopBuffer` (preserving 32-bit scene-linear Rec.2020
+    /// RAW color math when `is_linear == true`) and finalizes it to 8-bit sRGB `RgbImage`.
+    pub fn process_buffer_to_rgb8(
+        &self,
+        buffer: &image_decoder::DecodedDevelopBuffer,
+        recipe: &DevelopRecipe,
+    ) -> Result<RgbImage, AppError> {
+        let graded_f32 = self.process_buffer_to_f32(buffer, recipe)?;
         Ok(finalize_rgb8(graded_f32))
     }
 
@@ -66,17 +239,43 @@ impl RayonImageDevelopEngine {
         buffer: &image_decoder::DecodedDevelopBuffer,
         recipe: &DevelopRecipe,
     ) -> Result<Rgb32FImage, AppError> {
-        let (mut working, alpha_opt) = self.process_buffer_with_alpha_f32(buffer, recipe)?;
+        self.process_buffer_to_f32_with_faces(buffer, recipe, &[])
+    }
+
+    pub fn process_buffer_to_f32_with_faces(
+        &self,
+        buffer: &image_decoder::DecodedDevelopBuffer,
+        recipe: &DevelopRecipe,
+        face_guides: &[PortraitFaceGuide],
+    ) -> Result<Rgb32FImage, AppError> {
+        self.process_buffer_to_f32_with_retouch(buffer, recipe, face_guides, None)
+    }
+
+    pub fn process_buffer_to_f32_with_retouch(
+        &self,
+        buffer: &image_decoder::DecodedDevelopBuffer,
+        recipe: &DevelopRecipe,
+        face_guides: &[PortraitFaceGuide],
+        face_parse_map: Option<&FaceParseMap>,
+    ) -> Result<Rgb32FImage, AppError> {
+        let (mut working, alpha_opt) = self.process_buffer_with_alpha_and_retouch_f32(
+            buffer,
+            recipe,
+            face_guides,
+            face_parse_map,
+        )?;
         if let Some(alpha) = alpha_opt {
             composite_over_white_f32(&mut working, &alpha);
         }
         Ok(working)
     }
 
-    fn process_buffer_with_alpha_f32(
+    fn process_buffer_with_alpha_and_retouch_f32(
         &self,
         buffer: &image_decoder::DecodedDevelopBuffer,
         recipe: &DevelopRecipe,
+        face_guides: &[PortraitFaceGuide],
+        face_parse_map: Option<&FaceParseMap>,
     ) -> Result<(Rgb32FImage, Option<Vec<f32>>), AppError> {
         let loaded_lut = match &recipe.lut_3d {
             Some(lut_ref) if lut_ref.intensity > f32::EPSILON => {
@@ -90,12 +289,24 @@ impl RayonImageDevelopEngine {
         // automatically to Rayon 32-bit CPU on CPU-only mode or unsupported edge cases.
         if is_gpu_acceleration_enabled()
             && let Some(gpu) = shared_wgpu_develop_engine()
-            && let Ok(res) = gpu.process_buffer_with_alpha_f32(buffer, recipe, loaded_lut.as_deref())
+            && let Ok(res) = gpu.process_buffer_with_alpha_and_retouch_f32(
+                buffer,
+                recipe,
+                loaded_lut.as_deref(),
+                face_guides,
+                face_parse_map,
+            )
         {
             return Ok(res);
         }
 
-        self.process_buffer_with_alpha_cpu_inner(buffer, recipe, loaded_lut.as_deref())
+        self.process_buffer_with_alpha_cpu_inner(
+            buffer,
+            recipe,
+            loaded_lut.as_deref(),
+            face_guides,
+            face_parse_map,
+        )
     }
 
     /// Pure 32-bit Rayon CPU implementation (used as automatic fallback, for fast 384px live
@@ -105,13 +316,38 @@ impl RayonImageDevelopEngine {
         buffer: &image_decoder::DecodedDevelopBuffer,
         recipe: &DevelopRecipe,
     ) -> Result<(Rgb32FImage, Option<Vec<f32>>), AppError> {
+        self.process_buffer_with_alpha_cpu_with_retouch_f32(buffer, recipe, &[], None)
+    }
+
+    pub fn process_buffer_with_alpha_cpu_with_faces_f32(
+        &self,
+        buffer: &image_decoder::DecodedDevelopBuffer,
+        recipe: &DevelopRecipe,
+        face_guides: &[PortraitFaceGuide],
+    ) -> Result<(Rgb32FImage, Option<Vec<f32>>), AppError> {
+        self.process_buffer_with_alpha_cpu_with_retouch_f32(buffer, recipe, face_guides, None)
+    }
+
+    pub fn process_buffer_with_alpha_cpu_with_retouch_f32(
+        &self,
+        buffer: &image_decoder::DecodedDevelopBuffer,
+        recipe: &DevelopRecipe,
+        face_guides: &[PortraitFaceGuide],
+        face_parse_map: Option<&FaceParseMap>,
+    ) -> Result<(Rgb32FImage, Option<Vec<f32>>), AppError> {
         let loaded_lut = match &recipe.lut_3d {
             Some(lut_ref) if lut_ref.intensity > f32::EPSILON => {
                 Some(CubeLut3D::load_cached(&lut_ref.cube_path)?)
             }
             _ => None,
         };
-        self.process_buffer_with_alpha_cpu_inner(buffer, recipe, loaded_lut.as_deref())
+        self.process_buffer_with_alpha_cpu_inner(
+            buffer,
+            recipe,
+            loaded_lut.as_deref(),
+            face_guides,
+            face_parse_map,
+        )
     }
 
     fn process_buffer_with_alpha_cpu_inner(
@@ -119,7 +355,36 @@ impl RayonImageDevelopEngine {
         buffer: &image_decoder::DecodedDevelopBuffer,
         recipe: &DevelopRecipe,
         loaded_lut: Option<&CubeLut3D>,
+        face_guides: &[PortraitFaceGuide],
+        face_parse_map: Option<&FaceParseMap>,
     ) -> Result<(Rgb32FImage, Option<Vec<f32>>), AppError> {
+        let (src_w, src_h) = buffer.image.dimensions();
+        let crop = recipe.crop_transform;
+        let qt = crop.quarter_turns % 4;
+        let (ori_w, ori_h) = if qt % 2 == 1 {
+            (src_h, src_w)
+        } else {
+            (src_w, src_h)
+        };
+        let snapped_crop_rect = if crop.rect.is_full_frame() {
+            [0.0_f32, 0.0, 1.0, 1.0]
+        } else {
+            let x = ((crop.rect.left * ori_w as f32).round() as u32).min(ori_w.saturating_sub(1));
+            let y = ((crop.rect.top * ori_h as f32).round() as u32).min(ori_h.saturating_sub(1));
+            let cw = ((crop.rect.width * ori_w as f32).round() as u32)
+                .max(1)
+                .min(ori_w.saturating_sub(x));
+            let ch = ((crop.rect.height * ori_h as f32).round() as u32)
+                .max(1)
+                .min(ori_h.saturating_sub(y));
+            [
+                x as f32 / (ori_w as f32).max(1.0),
+                y as f32 / (ori_h as f32).max(1.0),
+                cw as f32 / (ori_w as f32).max(1.0),
+                ch as f32 / (ori_h as f32).max(1.0),
+            ]
+        };
+
         // 1-2. Optional Crop & Bilinear Rotation on full 32-bit float pixels
         let mut working = apply_crop_and_rotation_f32(&buffer.image, recipe.crop_transform);
 
@@ -152,11 +417,34 @@ impl RayonImageDevelopEngine {
                 }
             });
 
-        // 3a. Optional Opaque Studio Backdrop (Solid / Gradient) composited BEFORE local masks so
-        // AI Background / Radial / Linear / Brush masks naturally adjust the replaced backdrop.
+        // 3a. Optional Opaque Studio Backdrop (Solid / Gradient) composited BEFORE retouch & local masks
         apply_opaque_backdrop_f32(&mut working, recipe);
 
-        // 3b. Parallel Local & AI Masking stack (Linear, Radial, Brush, Range, AI Matte)
+        // 3b. Non-Destructive Generative Inpaint Patches, Spot Heal / Clone & Portrait Retouching
+        if recipe.retouch.has_inpaint_patches() {
+            apply_inpaint_patches_f32(&mut working, recipe, snapped_crop_rect);
+        }
+        if recipe.retouch.has_heal_spots() {
+            apply_heal_spots_f32(&mut working, recipe, ori_w, ori_h, snapped_crop_rect);
+        }
+        if recipe.retouch.is_portrait_active() {
+            let oriented_faces: Vec<PortraitFaceGuide> = face_guides
+                .iter()
+                .take(4)
+                .map(|g| g.into_oriented_uv(crop, ori_w, ori_h, true))
+                .collect();
+            apply_portrait_retouch_with_parse_f32(
+                &mut working,
+                recipe,
+                ori_w,
+                ori_h,
+                snapped_crop_rect,
+                &oriented_faces,
+                face_parse_map,
+            );
+        }
+
+        // 3c. Parallel Local & AI Masking stack (Linear, Radial, Brush, Range, AI Matte)
         apply_local_masks_f32(&mut working, recipe);
 
         // 4. Parallel spatial detail pass (Luminance NR, Texture, Clarity, Sharpening, Film Grain)
@@ -279,7 +567,31 @@ impl RayonImageDevelopEngine {
         output_path: &Path,
         quality: u8,
     ) -> Result<(), AppError> {
-        let graded_f32 = self.process_buffer_to_f32(buffer, recipe)?;
+        self.render_buffer_to_jpeg_with_faces(buffer, recipe, &[], output_path, quality)
+    }
+
+    pub fn render_buffer_to_jpeg_with_faces(
+        &self,
+        buffer: &image_decoder::DecodedDevelopBuffer,
+        recipe: &DevelopRecipe,
+        face_guides: &[PortraitFaceGuide],
+        output_path: &Path,
+        quality: u8,
+    ) -> Result<(), AppError> {
+        self.render_buffer_to_jpeg_with_retouch(buffer, recipe, face_guides, None, output_path, quality)
+    }
+
+    pub fn render_buffer_to_jpeg_with_retouch(
+        &self,
+        buffer: &image_decoder::DecodedDevelopBuffer,
+        recipe: &DevelopRecipe,
+        face_guides: &[PortraitFaceGuide],
+        face_parse_map: Option<&FaceParseMap>,
+        output_path: &Path,
+        quality: u8,
+    ) -> Result<(), AppError> {
+        let graded_f32 =
+            self.process_buffer_to_f32_with_retouch(buffer, recipe, face_guides, face_parse_map)?;
         let rgb8 = finalize_rgb8(graded_f32);
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
@@ -344,8 +656,14 @@ impl ImageDevelopPort for RayonImageDevelopEngine {
     ) -> Result<RenderMetrics, AppError> {
         let start = Instant::now();
         let decoded = image_decoder::decode_develop_buffer(source_path, 0)?;
-        let (graded_f32, transparent_alpha) =
-            self.process_buffer_with_alpha_f32(&decoded, recipe)?;
+        let face_guides = self.resolve_face_guides_for_source(source_path, recipe);
+        let face_parse = self.resolve_face_parse_for_source(source_path, recipe, &face_guides);
+        let (graded_f32, transparent_alpha) = self.process_buffer_with_alpha_and_retouch_f32(
+            &decoded,
+            recipe,
+            &face_guides,
+            face_parse.as_ref(),
+        )?;
         let output_width = graded_f32.width();
         let output_height = graded_f32.height();
 

@@ -1,4 +1,6 @@
 pub mod face_align;
+pub mod face_parser;
+pub mod lama_inpainter;
 pub mod model_inspector;
 pub mod onnx_runtime;
 pub mod ppocr_v5;

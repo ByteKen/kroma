@@ -15,6 +15,7 @@ import type {
   ModelDownloadProgress,
   ModelInspectionResult,
   ModelManifestStatus,
+  OptionalRetouchModelId,
   PendingAmbiguousEntry,
   PreviewsReadyBatch,
   RuntimeInfo,
@@ -34,8 +35,10 @@ import {
   type WhiteBalanceSettings,
 } from '../../domain/develop';
 import {
+  isSupersededWorkingBuffer,
   isWebNativeFileName,
   parseDevelopWorkingBuffer,
+  type DevelopBufferLoadPriority,
   type DevelopWorkingBuffer,
   type WorkingBufferPrecision,
 } from '../../domain/developWorkingBuffer';
@@ -44,6 +47,11 @@ import type { AiMaskKind, GeneratedAiMaskResult } from '../../domain/masking';
 import { DEFAULT_OUTPUT_NAMING_RULE } from '../../domain/organization';
 import type { PhotoAsset, YuNetFaceOverlay } from '../../domain/photo';
 import type { ThumbnailPreviewMode } from '../../domain/preferences';
+import type {
+  FaceParseMapDto,
+  GeneratedInpaintPatchResult,
+  InpaintStrokeInput,
+} from '../../domain/retouch';
 import type {
   ClusterSlateOcrResult,
   OcrTextLine,
@@ -363,7 +371,7 @@ export class TauriStudioGateway implements StudioGateway {
   private cachedRuntimeStatus: RuntimeInfo | null = null;
   private readonly developBufferLru = new Map<string, DevelopWorkingBuffer | null>();
   private readonly hiResDevelopBufferLru = new Map<string, DevelopWorkingBuffer | null>();
-  private readonly inFlightDevelopBuffers = new Map<string, Promise<DevelopWorkingBuffer | null>>();
+  private readonly inFlightPrefetchBuffers = new Map<string, Promise<DevelopWorkingBuffer | null>>();
   private readonly nativeDimsCache = new Map<
     string,
     { readonly width: number; readonly height: number } | null
@@ -376,7 +384,7 @@ export class TauriStudioGateway implements StudioGateway {
   private clearDevelopBufferCache(): void {
     this.developBufferLru.clear();
     this.hiResDevelopBufferLru.clear();
-    this.inFlightDevelopBuffers.clear();
+    this.inFlightPrefetchBuffers.clear();
     this.nativeDimsCache.clear();
     this.inFlightNativeDims.clear();
   }
@@ -512,6 +520,14 @@ export class TauriStudioGateway implements StudioGateway {
     return outcome;
   }
 
+  async downloadOptionalModel(
+    modelId: OptionalRetouchModelId,
+  ): Promise<ModelDownloadOutcome | null> {
+    const outcome = await invoke<ModelDownloadOutcome>('download_optional_model', { modelId });
+    this.cachedRuntimeStatus = outcome.runtime;
+    return outcome;
+  }
+
   async cancelModelDownloads(): Promise<void> {
     await invoke<void>('cancel_model_downloads');
   }
@@ -581,14 +597,49 @@ export class TauriStudioGateway implements StudioGateway {
     yunetPath: string | null,
     recognizerPath: string | null,
     segmenterPath: string | null = null,
+    faceParserPath: string | null = null,
+    lamaPath: string | null = null,
   ): Promise<RuntimeInfo | null> {
     const updated = await invoke<RuntimeInfo>('set_custom_ai_models', {
       yunetPath,
       recognizerPath,
       segmenterPath,
+      faceParserPath,
+      lamaPath,
     });
     this.cachedRuntimeStatus = updated;
     return updated;
+  }
+
+  async detectPhotoFaceOverlay(photoId: string): Promise<PhotoAsset['faceOverlay']> {
+    if (!this.hasLoadedLocalShoot) {
+      return null;
+    }
+    return invoke<PhotoAsset['faceOverlay']>('detect_photo_face_overlay', {
+      photoId,
+    });
+  }
+
+  async parsePhotoFaceRetouchMap(photoId: string): Promise<FaceParseMapDto | null> {
+    if (!this.hasLoadedLocalShoot) {
+      return null;
+    }
+    return invoke<FaceParseMapDto | null>('parse_photo_face_retouch_map', {
+      photoId,
+    });
+  }
+
+  async inpaintPhotoRegion(
+    photoId: string,
+    strokes: readonly InpaintStrokeInput[],
+  ): Promise<GeneratedInpaintPatchResult | null> {
+    if (!this.hasLoadedLocalShoot) {
+      return null;
+    }
+    return invoke<GeneratedInpaintPatchResult>('inpaint_photo_region', {
+      photoId,
+      strokes,
+    });
   }
 
   async generateAiMask(
@@ -883,9 +934,6 @@ export class TauriStudioGateway implements StudioGateway {
     maxDim = 1600,
     precision: WorkingBufferPrecision = 'f16',
   ): DevelopWorkingBuffer | null {
-    if (!this.hasLoadedLocalShoot) {
-      return null;
-    }
     const isHiRes = maxDim === 0 || maxDim > 2560;
     const lru = isHiRes ? this.hiResDevelopBufferLru : this.developBufferLru;
     const cacheKey = `${photoId}@${maxDim}@${precision}`;
@@ -902,10 +950,8 @@ export class TauriStudioGateway implements StudioGateway {
     photoId: string,
     maxDim = 1600,
     precision: WorkingBufferPrecision = 'f16',
+    priority: DevelopBufferLoadPriority = 'active',
   ): Promise<DevelopWorkingBuffer | null> {
-    if (!this.hasLoadedLocalShoot) {
-      return null;
-    }
     const isHiRes = maxDim === 0 || maxDim > 2560;
     const lru = isHiRes ? this.hiResDevelopBufferLru : this.developBufferLru;
     const maxEntries = isHiRes
@@ -918,18 +964,31 @@ export class TauriStudioGateway implements StudioGateway {
       lru.set(cacheKey, hit);
       return hit;
     }
-    const existing = this.inFlightDevelopBuffers.get(cacheKey);
-    if (existing) {
-      return existing;
+
+    // Only deduplicate background prefetch calls. Active foreground loads must always invoke Rust
+    // fresh so they bump the backend latest-wins generation and never inherit a doomed promise
+    // (e.g., rapid click A -> B -> A, or clicking a photo while it is being prefetched).
+    if (priority === 'prefetch') {
+      const existingPrefetch = this.inFlightPrefetchBuffers.get(cacheKey);
+      if (existingPrefetch) {
+        return existingPrefetch;
+      }
     }
 
     const request = invoke<ArrayBuffer>('load_develop_working_buffer', {
       photoId,
       maxDim,
       precision,
+      priority,
     })
       .then((raw) => {
-        const parsed = raw instanceof ArrayBuffer ? parseDevelopWorkingBuffer(raw) : null;
+        // Auto-heal local shoot flag after Vite HMR reloads while the Rust shoot is still active
+        this.hasLoadedLocalShoot = true;
+        if (!(raw instanceof ArrayBuffer) || isSupersededWorkingBuffer(raw)) {
+          // Superseded by a newer active selection: never poison the LRU cache with `null`.
+          return null;
+        }
+        const parsed = parseDevelopWorkingBuffer(raw);
         if (lru.size >= maxEntries) {
           const oldestKey = lru.keys().next().value;
           if (oldestKey !== undefined) {
@@ -939,21 +998,24 @@ export class TauriStudioGateway implements StudioGateway {
         lru.set(cacheKey, parsed);
         return parsed;
       })
-      .catch(() => null)
-      .finally(() => {
-        this.inFlightDevelopBuffers.delete(cacheKey);
-      });
+      .catch(() => null);
 
-    this.inFlightDevelopBuffers.set(cacheKey, request);
+    if (priority === 'prefetch') {
+      const tracked = request.finally(() => {
+        if (this.inFlightPrefetchBuffers.get(cacheKey) === tracked) {
+          this.inFlightPrefetchBuffers.delete(cacheKey);
+        }
+      });
+      this.inFlightPrefetchBuffers.set(cacheKey, tracked);
+      return tracked;
+    }
+
     return request;
   }
 
   async getPhotoNativeDimensions(
     photoId: string,
   ): Promise<{ readonly width: number; readonly height: number } | null> {
-    if (!this.hasLoadedLocalShoot) {
-      return null;
-    }
     if (this.nativeDimsCache.has(photoId)) {
       return this.nativeDimsCache.get(photoId) ?? null;
     }
@@ -964,6 +1026,7 @@ export class TauriStudioGateway implements StudioGateway {
 
     const request = invoke<[number, number] | null>('get_photo_native_dimensions', { photoId })
       .then((tuple) => {
+        this.hasLoadedLocalShoot = true;
         const dims =
           Array.isArray(tuple) && tuple.length === 2 && tuple[0] > 0 && tuple[1] > 0
             ? { width: tuple[0], height: tuple[1] }
@@ -1203,4 +1266,21 @@ export class TauriStudioGateway implements StudioGateway {
   async exitApp(): Promise<void> {
     await invoke('exit_app');
   }
+}
+
+const SHARED_TAURI_GATEWAY_KEY = Symbol.for('kroma.tauriStudioGateway');
+
+/**
+ * Returns a singleton `TauriStudioGateway` that survives Vite HMR reloads of `App.tsx` without
+ * resetting `hasLoadedLocalShoot` or dropping the hot in-memory RAW working buffer LRU cache.
+ */
+export function getSharedTauriStudioGateway(): TauriStudioGateway {
+  const holder = globalThis as Record<symbol, unknown>;
+  const existing = holder[SHARED_TAURI_GATEWAY_KEY];
+  if (existing instanceof TauriStudioGateway) {
+    return existing;
+  }
+  const created = new TauriStudioGateway();
+  holder[SHARED_TAURI_GATEWAY_KEY] = created;
+  return created;
 }

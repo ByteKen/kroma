@@ -569,7 +569,7 @@ fn packbits_decode(rle: &[u8], max_out: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn base64_encode(bytes: &[u8]) -> String {
+pub fn base64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let (chunks, rem) = bytes.as_chunks::<3>();
     for chunk in chunks {
@@ -606,7 +606,7 @@ fn b64_val(b: u8) -> Option<u8> {
     }
 }
 
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let clean: Vec<u8> = s
         .bytes()
         .filter(|b| !b.is_ascii_whitespace())

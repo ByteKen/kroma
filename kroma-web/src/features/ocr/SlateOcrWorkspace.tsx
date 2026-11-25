@@ -2,6 +2,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useStudio } from '../../app/StudioContext';
 import { createDefaultDevelopRecipe } from '../../domain/develop';
+import { compareSubjectClustersAlphabetically } from '../../domain/identity';
 import type { PhotoAsset } from '../../domain/photo';
 import {
   classifySlateOcrConfidence,
@@ -113,7 +114,8 @@ export function SlateOcrWorkspace() {
   const subjectClusters = useMemo(() => {
     if (!session) return [];
     const primary = session.clusters.filter((c) => !c.anchor.id.startsWith('_'));
-    return primary.length > 0 ? primary : session.clusters;
+    const pool = primary.length > 0 ? primary : session.clusters;
+    return [...pool].sort(compareSubjectClustersAlphabetically);
   }, [session]);
 
   const ocrResultMap = useMemo(() => {

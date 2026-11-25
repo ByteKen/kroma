@@ -12,7 +12,11 @@ import {
   type ExportRenderFormat,
   type MeasuredExportSizePayload,
 } from '../../domain/exportEstimate';
-import { isFaceOnlySlateCode } from '../../domain/identity';
+import {
+  compareNaturalAlphabetical,
+  compareSubjectClustersAlphabetically,
+  isFaceOnlySlateCode,
+} from '../../domain/identity';
 import {
   allocateUniqueExportPath,
   buildSimpleExportPattern,
@@ -309,6 +313,12 @@ export function BatchExportWorkspace() {
         };
       });
 
+      mappedFiles.sort(
+        (a, b) =>
+          compareNaturalAlphabetical(a.finalPath, b.finalPath) ||
+          compareNaturalAlphabetical(a.photo.fileName, b.photo.fileName),
+      );
+
       const firstPhotoFolderSegments = resolveVirtualFolderPath(
         virtualFolders,
         clientPhotos[0]?.virtualFolderId,
@@ -332,6 +342,16 @@ export function BatchExportWorkspace() {
         gradedInFolder,
         slateCount: slates.length,
       };
+    });
+
+    folderEntries.sort((a, b) => {
+      const aSpecial = a.cluster.anchor.id.startsWith('_');
+      const bSpecial = b.cluster.anchor.id.startsWith('_');
+      if (aSpecial !== bSpecial) return aSpecial ? 1 : -1;
+      return (
+        compareNaturalAlphabetical(a.folderLabel, b.folderLabel) ||
+        compareSubjectClustersAlphabetically(a.cluster, b.cluster)
+      );
     });
 
     return {

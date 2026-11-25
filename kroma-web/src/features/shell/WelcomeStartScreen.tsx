@@ -342,18 +342,6 @@ export function WelcomeStartScreen() {
             <DarkroomButton
               variant="subtle"
               size="xs"
-              icon="add_photo_alternate"
-              disabled={isScanningFolder}
-              onClick={() => void openPhotoFiles()}
-              title={`Open one or more specific photos (${openPhotosShortcutLabel})`}
-              className="h-7 px-2.5"
-            >
-              Open Photo(s)
-            </DarkroomButton>
-
-            <DarkroomButton
-              variant="subtle"
-              size="xs"
               onClick={cycleSort}
               title="Change sort order"
               className="h-7 px-2.5 tabular-nums-mono text-[10.5px]"

@@ -1,9 +1,23 @@
 import { memo, useEffect, useRef, useState } from 'react';
 import gradePassWgsl from '../../../../shaders/develop/grade_pass.wgsl?raw';
+import healPassWgsl from '../../../../shaders/develop/heal_pass.wgsl?raw';
+import inpaintPassWgsl from '../../../../shaders/develop/inpaint_pass.wgsl?raw';
 import maskPassWgsl from '../../../../shaders/develop/mask_pass.wgsl?raw';
+import portraitRetouchPassWgsl from '../../../../shaders/develop/portrait_retouch_pass.wgsl?raw';
 import presentWgsl from '../../../../shaders/develop/present.wgsl?raw';
 import spatialPassWgsl from '../../../../shaders/develop/spatial_pass.wgsl?raw';
 import type { DevelopRecipe } from '../../domain/develop';
+import type { YuNetFaceOverlay } from '../../domain/photo';
+import {
+  compileHealSpotsForGpu,
+  decodeInpaintPatchRgba,
+  faceOverlayToOrientedGuide,
+  hasEffectiveHealSpots,
+  isInpaintPatchEffective,
+  isPortraitRetouchActive,
+  type FaceParseMapData,
+  type InpaintPatch,
+} from '../../domain/retouch';
 import {
   ensureCubeLut3DLoaded,
   getCachedCubeLut3D,
@@ -39,11 +53,17 @@ import {
 } from '../../domain/masking';
 import {
   GRADE_UNIFORM_FLOATS,
+  HEAL_UNIFORM_FLOATS,
+  INPAINT_UNIFORM_FLOATS,
   MASK_UNIFORM_FLOATS,
+  PORTRAIT_RETOUCH_UNIFORM_FLOATS,
   PRESENT_UNIFORM_FLOATS,
   SPATIAL_UNIFORM_FLOATS,
   packGradeUniforms,
+  packHealUniforms,
+  packInpaintUniforms,
   packMaskUniforms,
+  packPortraitRetouchUniforms,
   packPresentUniforms,
   packSpatialUniforms,
 } from '../../domain/wgslUniformPacker';
@@ -52,6 +72,8 @@ export interface DevelopViewportCanvasProps {
   readonly src: string;
   readonly alt: string;
   readonly recipe: DevelopRecipe;
+  readonly faceOverlay?: YuNetFaceOverlay | null;
+  readonly faceParseMap?: FaceParseMapData | null;
   readonly workingBuffer?: DevelopWorkingBuffer | null;
   readonly previewMaxDim?: number;
   readonly fit?: 'cover' | 'contain';
@@ -138,6 +160,12 @@ interface SharedWebGpuCore {
   readonly maxTextureDim: number;
   readonly gradeBgl: GPUBindGroupLayout;
   readonly gradePipeline: GPUComputePipeline;
+  readonly inpaintBgl: GPUBindGroupLayout;
+  readonly inpaintPipeline: GPUComputePipeline;
+  readonly healBgl: GPUBindGroupLayout;
+  readonly healPipeline: GPUComputePipeline;
+  readonly portraitBgl: GPUBindGroupLayout;
+  readonly portraitPipeline: GPUComputePipeline;
   readonly maskBgl: GPUBindGroupLayout;
   readonly maskPipeline: GPUComputePipeline;
   readonly spatialBgl: GPUBindGroupLayout;
@@ -147,6 +175,8 @@ interface SharedWebGpuCore {
   readonly dummyLut3dBuf: GPUBuffer;
   readonly dummyWhiteTex: GPUTexture;
   readonly dummyWhiteView: GPUTextureView;
+  readonly dummyTransparentTex: GPUTexture;
+  readonly dummyTransparentView: GPUTextureView;
   readonly dummyToneLutTex: GPUTexture;
   readonly dummyToneLutView: GPUTextureView;
   readonly lostListeners: Set<() => void>;
@@ -186,6 +216,15 @@ function createSharedWebGpuCore(): Promise<SharedWebGpuCore | null> {
       const maxTextureDim = device.limits.maxTextureDimension2D || 8192;
 
       const gradeModule = device.createShaderModule({ label: 'kroma-grade-wgsl', code: gradePassWgsl });
+      const inpaintModule = device.createShaderModule({
+        label: 'kroma-inpaint-wgsl',
+        code: inpaintPassWgsl,
+      });
+      const healModule = device.createShaderModule({ label: 'kroma-heal-wgsl', code: healPassWgsl });
+      const portraitModule = device.createShaderModule({
+        label: 'kroma-portrait-retouch-wgsl',
+        code: portraitRetouchPassWgsl,
+      });
       const maskModule = device.createShaderModule({ label: 'kroma-mask-wgsl', code: maskPassWgsl });
       const spatialModule = device.createShaderModule({
         label: 'kroma-spatial-wgsl',
@@ -227,6 +266,84 @@ function createSharedWebGpuCore(): Promise<SharedWebGpuCore | null> {
         label: 'kroma-grade-pipeline',
         layout: device.createPipelineLayout({ bindGroupLayouts: [gradeBgl] }),
         compute: { module: gradeModule, entryPoint: 'main' },
+      });
+
+      const inpaintBgl = device.createBindGroupLayout({
+        label: 'kroma-inpaint-bgl',
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.COMPUTE,
+            texture: { sampleType: 'unfilterable-float' },
+          },
+          {
+            binding: 2,
+            visibility: GPUShaderStage.COMPUTE,
+            texture: { sampleType: 'unfilterable-float' },
+          },
+          {
+            binding: 3,
+            visibility: GPUShaderStage.COMPUTE,
+            storageTexture: { access: 'write-only', format: 'rgba32float' },
+          },
+        ],
+      });
+      const inpaintPipeline = await device.createComputePipelineAsync({
+        label: 'kroma-inpaint-pipeline',
+        layout: device.createPipelineLayout({ bindGroupLayouts: [inpaintBgl] }),
+        compute: { module: inpaintModule, entryPoint: 'main' },
+      });
+
+      const healBgl = device.createBindGroupLayout({
+        label: 'kroma-heal-bgl',
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.COMPUTE,
+            texture: { sampleType: 'unfilterable-float' },
+          },
+          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          {
+            binding: 4,
+            visibility: GPUShaderStage.COMPUTE,
+            storageTexture: { access: 'write-only', format: 'rgba32float' },
+          },
+        ],
+      });
+      const healPipeline = await device.createComputePipelineAsync({
+        label: 'kroma-heal-pipeline',
+        layout: device.createPipelineLayout({ bindGroupLayouts: [healBgl] }),
+        compute: { module: healModule, entryPoint: 'main' },
+      });
+
+      const portraitBgl = device.createBindGroupLayout({
+        label: 'kroma-portrait-bgl',
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.COMPUTE,
+            texture: { sampleType: 'unfilterable-float' },
+          },
+          {
+            binding: 2,
+            visibility: GPUShaderStage.COMPUTE,
+            storageTexture: { access: 'write-only', format: 'rgba32float' },
+          },
+          {
+            binding: 3,
+            visibility: GPUShaderStage.COMPUTE,
+            texture: { sampleType: 'unfilterable-float' },
+          },
+        ],
+      });
+      const portraitPipeline = await device.createComputePipelineAsync({
+        label: 'kroma-portrait-pipeline',
+        layout: device.createPipelineLayout({ bindGroupLayouts: [portraitBgl] }),
+        compute: { module: portraitModule, entryPoint: 'main' },
       });
 
       const maskBgl = device.createBindGroupLayout({
@@ -326,6 +443,19 @@ function createSharedWebGpuCore(): Promise<SharedWebGpuCore | null> {
         [1, 1],
       );
 
+      const dummyTransparentTex = device.createTexture({
+        label: 'kroma-dummy-transparent',
+        size: [1, 1],
+        format: 'rgba8unorm',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      });
+      device.queue.writeTexture(
+        { texture: dummyTransparentTex },
+        new Uint8Array([0, 0, 0, 0]),
+        { bytesPerRow: 4, rowsPerImage: 1 },
+        [1, 1],
+      );
+
       const identityLut = new Float32Array(256 * 4);
       for (let i = 0; i < 256; i++) {
         const v = i / 255;
@@ -354,6 +484,12 @@ function createSharedWebGpuCore(): Promise<SharedWebGpuCore | null> {
         maxTextureDim,
         gradeBgl,
         gradePipeline,
+        inpaintBgl,
+        inpaintPipeline,
+        healBgl,
+        healPipeline,
+        portraitBgl,
+        portraitPipeline,
         maskBgl,
         maskPipeline,
         spatialBgl,
@@ -363,6 +499,8 @@ function createSharedWebGpuCore(): Promise<SharedWebGpuCore | null> {
         dummyLut3dBuf,
         dummyWhiteTex,
         dummyWhiteView: dummyWhiteTex.createView(),
+        dummyTransparentTex,
+        dummyTransparentView: dummyTransparentTex.createView(),
         dummyToneLutTex,
         dummyToneLutView: dummyToneLutTex.createView(),
         lostListeners,
@@ -384,6 +522,15 @@ interface CachedSpatialMaskGpu {
   readonly compiled: CompiledWebGlMaskData;
 }
 
+interface CachedInpaintPatchGpu {
+  readonly sig: string;
+  status: 'loading' | 'ready' | 'error';
+  tex?: GPUTexture;
+  view?: GPUTextureView;
+  w: number;
+  h: number;
+}
+
 interface CachedGradeBindGroup {
   readonly srcView: GPUTextureView;
   readonly toneView: GPUTextureView;
@@ -397,6 +544,8 @@ interface CanvasGpuResources {
   readonly core: SharedWebGpuCore;
   readonly ctx: GPUCanvasContext;
   readonly gradeUbo: GPUBuffer;
+  readonly healUbo: GPUBuffer;
+  readonly portraitUbo: GPUBuffer;
   readonly spatialUbo: GPUBuffer;
   readonly presentUbo: GPUBuffer;
   readonly toneLutTex: GPUTexture;
@@ -416,6 +565,15 @@ interface CanvasGpuResources {
   lut3dBuf: GPUBuffer | null;
   lut3dPath: string;
   lut3dParsed: ParsedCubeLut3D | null;
+  healSpotsBuf: GPUBuffer | null;
+  healSpotsCap: number;
+  healSegsBuf: GPUBuffer | null;
+  healSegsCap: number;
+  faceParseTex: GPUTexture | null;
+  faceParseView: GPUTextureView | null;
+  faceParseRef: FaceParseMapData | null;
+  readonly inpaintPatchCache: Map<string, CachedInpaintPatchGpu>;
+  inpaintUboPool: GPUBuffer[];
   gradeBgCache: CachedGradeBindGroup | null;
   presentBgA: GPUBindGroup | null;
   presentBgB: GPUBindGroup | null;
@@ -580,6 +738,90 @@ function getOrUploadSpatialMaskGpu(
   return entry;
 }
 
+function ensureFaceParseTextureGpu(
+  res: CanvasGpuResources,
+  faceParseMap: FaceParseMapData | null | undefined,
+): boolean {
+  if (!faceParseMap || faceParseMap.width <= 0 || faceParseMap.height <= 0) {
+    return false;
+  }
+  if (res.faceParseRef === faceParseMap && res.faceParseTex && res.faceParseView) {
+    return true;
+  }
+  const { width, height, rgba } = faceParseMap;
+  if (rgba.length !== width * height * 4) return false;
+
+  res.faceParseTex?.destroy();
+  const tex = res.core.device.createTexture({
+    label: 'kroma-face-parse-rgba',
+    size: [width, height],
+    format: 'rgba8unorm',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+  res.core.queue.writeTexture(
+    { texture: tex },
+    rgba as Uint8Array<ArrayBuffer>,
+    { bytesPerRow: width * 4, rowsPerImage: height },
+    [width, height],
+  );
+  res.faceParseTex = tex;
+  res.faceParseView = tex.createView();
+  res.faceParseRef = faceParseMap;
+  return true;
+}
+
+function getOrLoadInpaintPatchGpu(
+  res: CanvasGpuResources,
+  patch: InpaintPatch,
+  isCurrentRes: () => boolean,
+  onDecoded: () => void,
+): CachedInpaintPatchGpu | null {
+  const sig = `${patch.id}:${patch.patchWidth}x${patch.patchHeight}:${patch.patchImageB64.length}:${patch.maskRleB64.length}`;
+  const existing = res.inpaintPatchCache.get(patch.id);
+  if (existing && existing.sig === sig) {
+    return existing.status === 'ready' ? existing : null;
+  }
+
+  existing?.tex?.destroy();
+  const pending: CachedInpaintPatchGpu = {
+    sig,
+    status: 'loading',
+    w: patch.patchWidth,
+    h: patch.patchHeight,
+  };
+  res.inpaintPatchCache.set(patch.id, pending);
+
+  void decodeInpaintPatchRgba(patch).then((decoded) => {
+    if (!isCurrentRes() || res.core.isLost) return;
+    const latest = res.inpaintPatchCache.get(patch.id);
+    if (!latest || latest.sig !== sig) return;
+    if (!decoded) {
+      latest.status = 'error';
+      return;
+    }
+    const tex = res.core.device.createTexture({
+      label: `kroma-inpaint-patch-${patch.id}`,
+      size: [decoded.width, decoded.height],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    res.core.queue.writeTexture(
+      { texture: tex },
+      decoded.rgba as Uint8Array<ArrayBuffer>,
+      { bytesPerRow: decoded.width * 4, rowsPerImage: decoded.height },
+      [decoded.width, decoded.height],
+    );
+    latest.tex = tex;
+    latest.view = tex.createView();
+    latest.w = decoded.width;
+    latest.h = decoded.height;
+    latest.status = 'ready';
+    onDecoded();
+  });
+
+  return null;
+}
+
 /**
  * Unified 32-Bit Scene-Referred Wide-Gamut (Linear Rec.2020) WebGPU Develop Viewport.
  * Executes the EXACT same WGSL compute shaders (`shaders/develop/*.wgsl`) as Kroma's Rust `wgpu`
@@ -589,6 +831,8 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
   src,
   alt,
   recipe,
+  faceOverlay = null,
+  faceParseMap = null,
   workingBuffer = null,
   previewMaxDim = 2048,
   fit = 'cover',
@@ -622,6 +866,8 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
   const lastBgTransparentRef = useRef(false);
   const workingBufferRef = useRef<DevelopWorkingBuffer | null>(workingBuffer);
   const recipeRef = useRef(recipe);
+  const faceOverlayRef = useRef<YuNetFaceOverlay | null>(faceOverlay);
+  const faceParseMapRef = useRef<FaceParseMapData | null>(faceParseMap);
   const fitRef = useRef(fit);
   const viewportZoomRef = useRef(viewportZoom);
   const viewportPanRef = useRef(viewportPan);
@@ -635,6 +881,8 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
 
   workingBufferRef.current = workingBuffer;
   recipeRef.current = recipe;
+  faceOverlayRef.current = faceOverlay;
+  faceParseMapRef.current = faceParseMap;
   fitRef.current = fit;
   viewportZoomRef.current = viewportZoom;
   viewportPanRef.current = viewportPan;
@@ -753,8 +1001,31 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
       const bgCfg = curRecipe.backgroundRemoval;
       bgTransparent = Boolean(bgReady && bgCfg?.mode === 'transparent');
 
+      const effectiveInpaint = (curRecipe.retouch?.inpaintPatches ?? []).filter(
+        isInpaintPatchEffective,
+      );
+      if (res.inpaintPatchCache.size > 0) {
+        const livePatchIds = new Set(effectiveInpaint.map((p) => p.id));
+        for (const [id, entry] of res.inpaintPatchCache.entries()) {
+          if (!livePatchIds.has(id)) {
+            entry.tex?.destroy();
+            res.inpaintPatchCache.delete(id);
+          }
+        }
+      }
+
+      const needInpaint = effectiveInpaint.length > 0;
+      const needHeal = hasEffectiveHealSpots(curRecipe.retouch);
+      const needPortrait = isPortraitRetouchActive(curRecipe.retouch?.portrait);
+
       const needPingPong =
-        effectiveMasks.length > 0 || u.spatialStageActive || bgTransparent || overlayMask !== null;
+        needInpaint ||
+        needHeal ||
+        needPortrait ||
+        effectiveMasks.length > 0 ||
+        u.spatialStageActive ||
+        bgTransparent ||
+        overlayMask !== null;
       ensureWorkTextures(res, workW, workH, needPingPong);
       if (!res.workTexA || !res.workViewA) return;
       if (needPingPong && (!res.workTexB || !res.workViewB)) return;
@@ -863,6 +1134,171 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
       }
 
       currentIsA = true;
+
+      // Pass 1a-0: Non-Destructive Phase 3 Generative Inpaint Patches (LaMa / Harmonic Fill)
+      if (needInpaint) {
+        let inpaintUboIdx = 0;
+        for (const patch of effectiveInpaint) {
+          const cachedPatch = getOrLoadInpaintPatchGpu(
+            res,
+            patch,
+            () => resRef.current === res,
+            () => {
+              gradeDirtyRef.current = true;
+              scheduleRender();
+            },
+          );
+          if (!cachedPatch?.view) continue;
+          let inpaintUbo = res.inpaintUboPool[inpaintUboIdx];
+          if (!inpaintUbo) {
+            inpaintUbo = device.createBuffer({
+              label: `kroma-inpaint-ubo-${inpaintUboIdx}`,
+              size: INPAINT_UNIFORM_FLOATS * 4,
+              usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            res.inpaintUboPool.push(inpaintUbo);
+          }
+          inpaintUboIdx += 1;
+
+          const inpaintData = packInpaintUniforms({
+            outWidth: workW,
+            outHeight: workH,
+            patchWidth: cachedPatch.w,
+            patchHeight: cachedPatch.h,
+            bounds: patch.bounds,
+            opacity: patch.opacity,
+          });
+          queue.writeBuffer(inpaintUbo, 0, inpaintData as Float32Array<ArrayBuffer>);
+
+          const inpaintBg = device.createBindGroup({
+            layout: core.inpaintBgl,
+            entries: [
+              { binding: 0, resource: { buffer: inpaintUbo } },
+              { binding: 1, resource: currentIsA ? viewA : viewB! },
+              { binding: 2, resource: cachedPatch.view },
+              { binding: 3, resource: currentIsA ? viewB! : viewA },
+            ],
+          });
+          const pass = encoder.beginComputePass({ label: 'kroma-inpaint-compute' });
+          pass.setPipeline(core.inpaintPipeline);
+          pass.setBindGroup(0, inpaintBg);
+          pass.dispatchWorkgroups(wgX, wgY, 1);
+          pass.end();
+          currentIsA = !currentIsA;
+        }
+      }
+
+      // Pass 1a: Non-Destructive Spot Heal & Clone (runs pre-portrait so healed blemishes never bleed into skin smoothing)
+      if (needHeal && curRecipe.retouch) {
+        const compiledHeal = compileHealSpotsForGpu(
+          curRecipe.retouch.healSpots,
+          orientedW,
+          orientedH,
+        );
+        if (compiledHeal.spotCount > 0) {
+          const healUboData = packHealUniforms({
+            outWidth: workW,
+            outHeight: workH,
+            oriWidth: orientedW,
+            oriHeight: orientedH,
+            spotCount: compiledHeal.spotCount,
+          });
+          queue.writeBuffer(res.healUbo, 0, healUboData as Float32Array<ArrayBuffer>);
+
+          const spotsBytes = Math.max(64, compiledHeal.spotsData.byteLength);
+          if (!res.healSpotsBuf || res.healSpotsCap < spotsBytes) {
+            res.healSpotsBuf?.destroy();
+            res.healSpotsBuf = device.createBuffer({
+              label: 'kroma-heal-spots-buf',
+              size: spotsBytes,
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            res.healSpotsCap = spotsBytes;
+          }
+          queue.writeBuffer(
+            res.healSpotsBuf,
+            0,
+            compiledHeal.spotsData as Float32Array<ArrayBuffer>,
+          );
+
+          const segsBytes = Math.max(16, compiledHeal.segmentsData.byteLength);
+          if (!res.healSegsBuf || res.healSegsCap < segsBytes) {
+            res.healSegsBuf?.destroy();
+            res.healSegsBuf = device.createBuffer({
+              label: 'kroma-heal-segs-buf',
+              size: segsBytes,
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            res.healSegsCap = segsBytes;
+          }
+          queue.writeBuffer(
+            res.healSegsBuf,
+            0,
+            compiledHeal.segmentsData as Float32Array<ArrayBuffer>,
+          );
+
+          const healBg = device.createBindGroup({
+            layout: core.healBgl,
+            entries: [
+              { binding: 0, resource: { buffer: res.healUbo } },
+              { binding: 1, resource: currentIsA ? viewA : viewB! },
+              { binding: 2, resource: { buffer: res.healSpotsBuf } },
+              { binding: 3, resource: { buffer: res.healSegsBuf } },
+              { binding: 4, resource: currentIsA ? viewB! : viewA },
+            ],
+          });
+          const pass = encoder.beginComputePass({ label: 'kroma-heal-compute' });
+          pass.setPipeline(core.healPipeline);
+          pass.setBindGroup(0, healBg);
+          pass.dispatchWorkgroups(wgX, wgY, 1);
+          pass.end();
+          currentIsA = !currentIsA;
+        }
+      }
+
+      // Pass 1a-2: Frequency-Separation & Landmark-Guided (or BiSeNet Neural) Portrait Retouching
+      if (needPortrait && curRecipe.retouch?.portrait) {
+        const orientedGuide = faceOverlayToOrientedGuide(
+          faceOverlayRef.current,
+          crop,
+          orientedW,
+          orientedH,
+          true,
+        );
+        const faceParseReady = ensureFaceParseTextureGpu(res, faceParseMapRef.current);
+        const portraitData = packPortraitRetouchUniforms({
+          outWidth: workW,
+          outHeight: workH,
+          oriWidth: orientedW,
+          oriHeight: orientedH,
+          portrait: curRecipe.retouch.portrait,
+          faceGuides: orientedGuide ? [orientedGuide] : [],
+          hasFaceParseMap: faceParseReady,
+        });
+        queue.writeBuffer(res.portraitUbo, 0, portraitData as Float32Array<ArrayBuffer>);
+        const portraitBg = device.createBindGroup({
+          layout: core.portraitBgl,
+          entries: [
+            { binding: 0, resource: { buffer: res.portraitUbo } },
+            { binding: 1, resource: currentIsA ? viewA : viewB! },
+            { binding: 2, resource: currentIsA ? viewB! : viewA },
+            {
+              binding: 3,
+              resource:
+                faceParseReady && res.faceParseView
+                  ? res.faceParseView
+                  : core.dummyTransparentView,
+            },
+          ],
+        });
+        const pass = encoder.beginComputePass({ label: 'kroma-portrait-compute' });
+        pass.setPipeline(core.portraitPipeline);
+        pass.setBindGroup(0, portraitBg);
+        pass.dispatchWorkgroups(wgX, wgY, 1);
+        pass.end();
+        currentIsA = !currentIsA;
+      }
+
       let maskUboIdx = 0;
       const acquireMaskUbo = (): GPUBuffer => {
         let buf = res.maskUboPool[maskUboIdx];
@@ -1271,6 +1707,16 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
         size: GRADE_UNIFORM_FLOATS * 4,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
+      const healUbo = device.createBuffer({
+        label: 'kroma-heal-ubo',
+        size: HEAL_UNIFORM_FLOATS * 4,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      const portraitUbo = device.createBuffer({
+        label: 'kroma-portrait-ubo',
+        size: PORTRAIT_RETOUCH_UNIFORM_FLOATS * 4,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
       const spatialUbo = device.createBuffer({
         label: 'kroma-spatial-ubo',
         size: SPATIAL_UNIFORM_FLOATS * 4,
@@ -1292,6 +1738,8 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
         core,
         ctx,
         gradeUbo,
+        healUbo,
+        portraitUbo,
         spatialUbo,
         presentUbo,
         toneLutTex,
@@ -1311,6 +1759,15 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
         lut3dBuf: null,
         lut3dPath: '',
         lut3dParsed: null,
+        healSpotsBuf: null,
+        healSpotsCap: 0,
+        healSegsBuf: null,
+        healSegsCap: 0,
+        faceParseTex: null,
+        faceParseView: null,
+        faceParseRef: null,
+        inpaintPatchCache: new Map(),
+        inpaintUboPool: [],
         gradeBgCache: null,
         presentBgA: null,
         presentBgB: null,
@@ -1342,10 +1799,18 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
         res.workTexB?.destroy();
         res.bgMatteTex?.destroy();
         res.lut3dBuf?.destroy();
+        res.healSpotsBuf?.destroy();
+        res.healSegsBuf?.destroy();
+        res.faceParseTex?.destroy();
         res.toneLutTex.destroy();
         res.gradeUbo.destroy();
+        res.healUbo.destroy();
+        res.portraitUbo.destroy();
         res.spatialUbo.destroy();
         res.presentUbo.destroy();
+        for (const buf of res.inpaintUboPool) buf.destroy();
+        for (const entry of res.inpaintPatchCache.values()) entry.tex?.destroy();
+        res.inpaintPatchCache.clear();
         for (const buf of res.maskUboPool) buf.destroy();
         for (const entry of res.spatialMaskCache.values()) entry.tex.destroy();
         res.spatialMaskCache.clear();
@@ -1524,13 +1989,13 @@ export const WebGpuDevelopCanvas = memo(function WebGpuDevelopCanvas({
     };
   }, [src, hasWorkingBuffer, gpuReady, clampedPreviewMaxDim]);
 
-  // Mark GPU compute grade dirty only when recipe, masks, overlay, or source texture changes
+  // Mark GPU compute grade dirty only when recipe, face landmarks/parse map, masks, overlay, or source texture changes
   useEffect(() => {
     if (gpuReady) {
       gradeDirtyRef.current = true;
       scheduleRender();
     }
-  }, [gpuReady, recipe, activeMaskId, showMaskOverlay, textureVersion]);
+  }, [gpuReady, recipe, faceOverlay, faceParseMap, activeMaskId, showMaskOverlay, textureVersion]);
 
   // Pan, zoom, padding, fit, crop preview bounds, and clipping warnings run Pass 3 present-only (~0.2ms!)
   useEffect(() => {

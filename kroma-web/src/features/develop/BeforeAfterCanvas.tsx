@@ -5,7 +5,17 @@ import {
   createDefaultDevelopRecipe,
   type CropTransformSettings,
 } from '../../domain/develop';
+import {
+  compressRec2020ToLinearSrgb,
+  linearToSrgb,
+  softClip,
+} from '../../domain/developShaderMath';
 import type { BrushStroke, MaskComponent, MaskLayer } from '../../domain/masking';
+import {
+  type FaceParseMapData,
+  type HealSpot,
+  type InpaintStrokeInput,
+} from '../../domain/retouch';
 import {
   isRawFileName,
   shouldProbeHighBitDepthBuffer,
@@ -26,16 +36,52 @@ import { detectWebGpuAvailable } from '../../domain/wgslUniformPacker';
 import type { PhotoAsset } from '../../domain/photo';
 import { TelemetryPill } from '../darkroom-kit';
 import { CropOverlay } from './CropOverlay';
+import { peekDevelopBitmap } from './developBitmapCache';
 import {
   DevelopViewportCanvas,
   type ActiveViewportBackend,
 } from './DevelopViewportCanvas';
 import { MaskCanvasOverlay, type BrushToolOptions } from './MaskCanvasOverlay';
+import { RetouchCanvasOverlay } from './RetouchCanvasOverlay';
+import type { HealToolOptions } from './RetouchPanel';
 
 export type CompareViewportMode = 'single' | 'split' | 'before_after';
 
 const NEUTRAL_DEVELOP_RECIPE = createDefaultDevelopRecipe();
+const EMPTY_HEAL_SPOTS: readonly HealSpot[] = [];
+const DEFAULT_HEAL_TOOL: HealToolOptions = {
+  mode: 'heal',
+  radius: 0.018,
+  feather: 0.55,
+  opacity: 1,
+};
+
+function f16BitsToF32(h: number): number {
+  const sign = (h & 0x8000) !== 0 ? -1 : 1;
+  const exp = (h >> 10) & 0x1f;
+  const frac = h & 0x03ff;
+  if (exp === 0) return sign * Math.pow(2, -14) * (frac / 1024);
+  if (exp === 31) return frac === 0 ? sign * 65504 : 0;
+  return sign * Math.pow(2, exp - 15) * (1 + frac / 1024);
+}
+
+function orientSourceUv(
+  u: number,
+  v: number,
+  flipH: boolean,
+  flipV: boolean,
+  quarterTurns: number,
+): readonly [number, number] {
+  const px = flipH ? 1 - u : u;
+  const py = flipV ? 1 - v : v;
+  const qt = ((quarterTurns % 4) + 4) % 4;
+  if (qt === 1) return [py, 1 - px] as const;
+  if (qt === 2) return [1 - px, 1 - py] as const;
+  if (qt === 3) return [1 - py, px] as const;
+  return [px, py] as const;
+}
 export const DEVELOP_WORKING_MAX_DIM = 1600;
+const ACTIVE_RAW_SETTLE_MS = 45;
 const HI_RES_DEBOUNCE_MS = 120;
 const WHEEL_ZOOM_STEP = 1.25;
 const EDGE_PAN_CUSHION_PX = 20;
@@ -72,6 +118,20 @@ interface BeforeAfterCanvasProps {
     stroke: BrushStroke,
     isFinal: boolean,
   ) => void;
+  readonly retouchActive?: boolean;
+  readonly healTool?: HealToolOptions;
+  readonly selectedSpotId?: string | null;
+  readonly showSpotPins?: boolean;
+  readonly faceParseMap?: FaceParseMapData | null;
+  readonly pendingRemoveStrokes?: readonly InpaintStrokeInput[];
+  readonly busyInpainting?: boolean;
+  readonly onSelectSpot?: (spotId: string | null) => void;
+  readonly onChangeHealSpots?: (
+    nextSpots: readonly HealSpot[],
+    label: string,
+    coalesce?: boolean,
+  ) => void;
+  readonly onChangePendingRemoveStrokes?: (next: readonly InpaintStrokeInput[]) => void;
   readonly floatingOverlay?: ReactNode;
   readonly focusMode?: boolean;
 }
@@ -104,6 +164,16 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
   onSampleColorRangeRgb,
   onUpdateMaskComponent,
   onEnsureBrushStroke,
+  retouchActive = false,
+  healTool = DEFAULT_HEAL_TOOL,
+  selectedSpotId = null,
+  showSpotPins = true,
+  faceParseMap = null,
+  pendingRemoveStrokes,
+  busyInpainting = false,
+  onSelectSpot,
+  onChangeHealSpots,
+  onChangePendingRemoveStrokes,
   floatingOverlay,
   focusMode = false,
 }: BeforeAfterCanvasProps) {
@@ -227,26 +297,33 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
     }
 
     let cancelled = false;
-    if (isRawSource) {
-      setDecodingRawPhotoId(photo.id);
-    }
+    // Brief 45ms settle window for uncached RAWs: rapid clicks or arrow-key scrubbing skip wasted
+    // IPC/demosaic work while 8-bit previews render immediately; RAM LRU hits stay 0ms above.
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      if (isRawSource) {
+        setDecodingRawPhotoId(photo.id);
+      }
 
-    void loadDevelopWorkingBuffer(photo.id, workingMaxDim, requestedPrecision)
-      .then((buffer) => {
-        if (cancelled) return;
-        setDecodingRawPhotoId((prev) => (prev === photo.id ? null : prev));
-        if (buffer) {
-          setLoadedWorking({ photoId: photo.id, maxDim: workingMaxDim, buffer });
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
+      void loadDevelopWorkingBuffer(photo.id, workingMaxDim, requestedPrecision, 'active')
+        .then((buffer) => {
+          if (cancelled) return;
           setDecodingRawPhotoId((prev) => (prev === photo.id ? null : prev));
-        }
-      });
+          if (buffer) {
+            setLoadedWorking({ photoId: photo.id, maxDim: workingMaxDim, buffer });
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setDecodingRawPhotoId((prev) => (prev === photo.id ? null : prev));
+          }
+        });
+    }, ACTIVE_RAW_SETTLE_MS);
 
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
+      setDecodingRawPhotoId((prev) => (prev === photo.id ? null : prev));
     };
   }, [
     photo.id,
@@ -354,7 +431,7 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
       : null;
 
   useEffect(() => {
-    if (!shouldProbe || !wantsHiRes) {
+    if (!shouldProbe || !wantsHiRes || !baseWorkingBuffer) {
       setUpgradingHiResPhotoId((prev) => (prev === photo.id ? null : prev));
       return;
     }
@@ -372,7 +449,7 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
     const timer = window.setTimeout(() => {
       if (cancelled) return;
       setUpgradingHiResPhotoId(photo.id);
-      void loadDevelopWorkingBuffer(photo.id, hiResMaxDim, requestedPrecision)
+      void loadDevelopWorkingBuffer(photo.id, hiResMaxDim, requestedPrecision, 'active')
         .then((buf) => {
           if (cancelled) return;
           setUpgradingHiResPhotoId((prev) => (prev === photo.id ? null : prev));
@@ -395,6 +472,7 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
     photo.id,
     shouldProbe,
     wantsHiRes,
+    baseWorkingBuffer,
     hiResMaxDim,
     requestedPrecision,
     syncHiResBuffer,
@@ -538,6 +616,7 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
   // Lightroom-style double-click toggles Fit <-> true 100% (1:1) centered right on the clicked pixel
   const handleStageDoubleClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!onChangeZoomFactor || cropModeActive || eyedropperActive || colorPickActive) return;
+    if (retouchActive) return;
     if (maskingActive && activeMaskLayer) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const cursorX = e.clientX - rect.left;
@@ -568,6 +647,7 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
     if (effectiveZoom <= 1.01 || eyedropperActive || colorPickActive || cropModeActive || draggingSplit)
       return;
     if (maskingActive && activeMaskLayer) return;
+    if (retouchActive && !e.shiftKey) return;
     e.currentTarget.setPointerCapture(e.pointerId);
     setPanning(true);
     panStartRef.current = { x: e.clientX, y: e.clientY, panX: clampedPan.x, panY: clampedPan.y };
@@ -618,8 +698,151 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
   );
 
   const developSrc = photo.studioSourceUrl ?? photo.imageUrl;
+  const retouchSpots = photo.developRecipe.retouch?.healSpots ?? EMPTY_HEAL_SPOTS;
+
+  // Lightweight cached pixel grid for 8-bit previews so auto-donor selection scores real skin patches in <0.2ms
+  const patchGridCacheRef = useRef<{
+    readonly key: string;
+    readonly w: number;
+    readonly h: number;
+    readonly data: Uint8ClampedArray;
+  } | null>(null);
+
+  const samplePatchStats = useCallback(
+    (u: number, v: number, radiusNorm: number) => {
+      const ct = photo.developRecipe.cropTransform;
+      const qt = ((ct.quarterTurns ?? 0) % 4 + 4) % 4;
+      const swap = qt % 2 === 1;
+      const flipH = Boolean(ct.flipHorizontal);
+      const flipV = Boolean(ct.flipVertical);
+
+      const wb = activeWorkingBuffer;
+      if (wb && (wb.float32Rgba || wb.halfFloatRgba)) {
+        const oriW = swap ? wb.height : wb.width;
+        const oriH = swap ? wb.width : wb.height;
+        const minSide = Math.min(oriW, oriH);
+        const rx = (radiusNorm * minSide) / Math.max(1, oriW);
+        const ry = (radiusNorm * minSide) / Math.max(1, oriH);
+        let sumR = 0;
+        let sumG = 0;
+        let sumB = 0;
+        let sumL = 0;
+        let sumL2 = 0;
+        let n = 0;
+        for (let gy = -2; gy <= 2; gy++) {
+          const sv = Math.min(1, Math.max(0, v + (gy * 0.5) * ry));
+          for (let gx = -2; gx <= 2; gx++) {
+            const su = Math.min(1, Math.max(0, u + (gx * 0.5) * rx));
+            const [rawU, rawV] = orientSourceUv(su, sv, flipH, flipV, qt);
+            const px = Math.min(wb.width - 1, Math.max(0, Math.round(rawU * (wb.width - 1))));
+            const py = Math.min(wb.height - 1, Math.max(0, Math.round(rawV * (wb.height - 1))));
+            const idx = (py * wb.width + px) * 4;
+            let r = wb.float32Rgba
+              ? (wb.float32Rgba[idx] ?? 0)
+              : f16BitsToF32(wb.halfFloatRgba![idx] ?? 0);
+            let g = wb.float32Rgba
+              ? (wb.float32Rgba[idx + 1] ?? 0)
+              : f16BitsToF32(wb.halfFloatRgba![idx + 1] ?? 0);
+            let b = wb.float32Rgba
+              ? (wb.float32Rgba[idx + 2] ?? 0)
+              : f16BitsToF32(wb.halfFloatRgba![idx + 2] ?? 0);
+            if (wb.isLinear) {
+              const lin709 = wb.isWideGamut
+                ? compressRec2020ToLinearSrgb([r, g, b])
+                : ([r, g, b] as [number, number, number]);
+              r = linearToSrgb(softClip(lin709[0]));
+              g = linearToSrgb(softClip(lin709[1]));
+              b = linearToSrgb(softClip(lin709[2]));
+            }
+            const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            sumR += r;
+            sumG += g;
+            sumB += b;
+            sumL += l;
+            sumL2 += l * l;
+            n += 1;
+          }
+        }
+        if (n === 0) return null;
+        const meanL = sumL / n;
+        return {
+          meanR: sumR / n,
+          meanG: sumG / n,
+          meanB: sumB / n,
+          variance: Math.max(0, sumL2 / n - meanL * meanL),
+        };
+      }
+
+      const cachedBitmap = peekDevelopBitmap(developSrc, effectivePreviewMaxDim);
+      if (!cachedBitmap || cachedBitmap.width <= 0 || cachedBitmap.height <= 0) return null;
+
+      const cacheKey = `${developSrc}:${cachedBitmap.width}x${cachedBitmap.height}`;
+      let grid = patchGridCacheRef.current;
+      if (!grid || grid.key !== cacheKey) {
+        try {
+          const maxGrid = 192;
+          const scale = Math.min(1, maxGrid / Math.max(cachedBitmap.width, cachedBitmap.height));
+          const gw = Math.max(16, Math.round(cachedBitmap.width * scale));
+          const gh = Math.max(16, Math.round(cachedBitmap.height * scale));
+          const c = document.createElement('canvas');
+          c.width = gw;
+          c.height = gh;
+          const ctx = c.getContext('2d');
+          if (!ctx) return null;
+          ctx.drawImage(cachedBitmap.bitmap, 0, 0, gw, gh);
+          const data = ctx.getImageData(0, 0, gw, gh).data;
+          grid = { key: cacheKey, w: gw, h: gh, data };
+          patchGridCacheRef.current = grid;
+        } catch {
+          return null;
+        }
+      }
+
+      const oriW = swap ? grid.h : grid.w;
+      const oriH = swap ? grid.w : grid.h;
+      const minSide = Math.min(oriW, oriH);
+      const rx = (radiusNorm * minSide) / Math.max(1, oriW);
+      const ry = (radiusNorm * minSide) / Math.max(1, oriH);
+      let sumR = 0;
+      let sumG = 0;
+      let sumB = 0;
+      let sumL = 0;
+      let sumL2 = 0;
+      let n = 0;
+      for (let gy = -2; gy <= 2; gy++) {
+        const sv = Math.min(1, Math.max(0, v + (gy * 0.5) * ry));
+        for (let gx = -2; gx <= 2; gx++) {
+          const su = Math.min(1, Math.max(0, u + (gx * 0.5) * rx));
+          const [rawU, rawV] = orientSourceUv(su, sv, flipH, flipV, qt);
+          const px = Math.min(grid.w - 1, Math.max(0, Math.round(rawU * (grid.w - 1))));
+          const py = Math.min(grid.h - 1, Math.max(0, Math.round(rawV * (grid.h - 1))));
+          const idx = (py * grid.w + px) * 4;
+          const r = (grid.data[idx] ?? 0) / 255;
+          const g = (grid.data[idx + 1] ?? 0) / 255;
+          const b = (grid.data[idx + 2] ?? 0) / 255;
+          const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+          sumR += r;
+          sumG += g;
+          sumB += b;
+          sumL += l;
+          sumL2 += l * l;
+          n += 1;
+        }
+      }
+      if (n === 0) return null;
+      const meanL = sumL / n;
+      return {
+        meanR: sumR / n,
+        meanG: sumG / n,
+        meanB: sumB / n,
+        variance: Math.max(0, sumL2 / n - meanL * meanL),
+      };
+    },
+    [photo.developRecipe.cropTransform, activeWorkingBuffer, developSrc, effectivePreviewMaxDim],
+  );
+
   const panCursorClass =
-    effectiveZoom > 1.01 && !eyedropperActive && !colorPickActive && !cropModeActive
+    effectiveZoom > 1.01 && !eyedropperActive && !colorPickActive && !cropModeActive && (!retouchActive || panning)
       ? panning
         ? 'cursor-grabbing'
         : 'cursor-grab'
@@ -701,6 +924,8 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
               src={developSrc}
               alt={`${photo.fileName} edited`}
               recipe={photo.developRecipe}
+              faceOverlay={photo.faceOverlay}
+              faceParseMap={faceParseMap}
               workingBuffer={activeWorkingBuffer}
               previewMaxDim={effectivePreviewMaxDim}
               preferWebGpu={preferWebGpu}
@@ -720,6 +945,33 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
               onSampleColorRangeRgb={onSampleColorRangeRgb}
               onNaturalSize={handleNaturalSize}
             />
+            {retouchActive &&
+              !cropModeActive &&
+              !eyedropperActive &&
+              onSelectSpot &&
+              onChangeHealSpots && (
+                <RetouchCanvasOverlay
+                  spots={retouchSpots}
+                  selectedSpotId={selectedSpotId}
+                  showPins={showSpotPins}
+                  healTool={healTool}
+                  pendingRemoveStrokes={pendingRemoveStrokes}
+                  busyInpainting={busyInpainting}
+                  faceOverlay={photo.faceOverlay}
+                  cropTransform={photo.developRecipe.cropTransform}
+                  applyCrop={!cropModeActive}
+                  fit="contain"
+                  viewportPadPx={padPx}
+                  viewportZoom={effectiveZoom}
+                  viewportPan={clampedPan}
+                  naturalWidth={naturalSize.w}
+                  naturalHeight={naturalSize.h}
+                  samplePatchStats={samplePatchStats}
+                  onSelectSpot={onSelectSpot}
+                  onChangeSpots={onChangeHealSpots}
+                  onChangePendingRemoveStrokes={onChangePendingRemoveStrokes}
+                />
+              )}
           </div>
           {showFrameOutline && (
             <div
@@ -757,6 +1009,8 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
           src={developSrc}
           alt={`${photo.fileName} graded`}
           recipe={photo.developRecipe}
+          faceOverlay={photo.faceOverlay}
+          faceParseMap={faceParseMap}
           workingBuffer={activeWorkingBuffer}
           previewMaxDim={effectivePreviewMaxDim}
           preferWebGpu={preferWebGpu}
@@ -777,6 +1031,35 @@ export const BeforeAfterCanvas = memo(function BeforeAfterCanvas({
           onSampleColorRangeRgb={onSampleColorRangeRgb}
           onNaturalSize={handleNaturalSize}
         />
+
+        {/* Interactive Spot Heal & Clone Pin/Stroke Overlay aligned 1:1 across the full stage */}
+        {retouchActive &&
+          !cropModeActive &&
+          !eyedropperActive &&
+          onSelectSpot &&
+          onChangeHealSpots && (
+            <RetouchCanvasOverlay
+              spots={retouchSpots}
+              selectedSpotId={selectedSpotId}
+              showPins={showSpotPins}
+              healTool={healTool}
+              pendingRemoveStrokes={pendingRemoveStrokes}
+              busyInpainting={busyInpainting}
+              faceOverlay={photo.faceOverlay}
+              cropTransform={photo.developRecipe.cropTransform}
+              applyCrop={!cropModeActive}
+              fit="contain"
+              viewportPadPx={padPx}
+              viewportZoom={effectiveZoom}
+              viewportPan={clampedPan}
+              naturalWidth={naturalSize.w}
+              naturalHeight={naturalSize.h}
+              samplePatchStats={samplePatchStats}
+              onSelectSpot={onSelectSpot}
+              onChangeSpots={onChangeHealSpots}
+              onChangePendingRemoveStrokes={onChangePendingRemoveStrokes}
+            />
+          )}
 
         {/* Interactive Local Mask Handles & Freehand Brush Painter aligned 1:1 across the full stage */}
         {maskingActive &&

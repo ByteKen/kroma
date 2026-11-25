@@ -12,7 +12,11 @@ import {
   loadCustomPresetsFromStorage,
   saveCustomPresetsToStorage,
 } from '../../adapters/storage/customPresetsStorage';
-import type { LiveRgbHistogram } from '../../application/ports/studioGateway';
+import type {
+  LiveRgbHistogram,
+  ModelDownloadProgress,
+  OptionalRetouchModelId,
+} from '../../application/ports/studioGateway';
 import { cacheParsedCubeLut3D, parseCubeLut3D } from '../../domain/cubeLut3d';
 import {
   computeAutoToneFromHistogram,
@@ -43,6 +47,15 @@ import {
   type MaskCombineOp,
   type MaskLayer,
 } from '../../domain/masking';
+import {
+  createDefaultRetouchSettings,
+  hasEffectiveHealSpots,
+  hasEffectiveInpaintPatches,
+  hydrateRetouchSettings,
+  isPortraitRetouchActive,
+  type FaceParseMapData,
+  type RetouchSettings,
+} from '../../domain/retouch';
 import type { PhotoAsset } from '../../domain/photo';
 import {
   DarkroomButton,
@@ -61,8 +74,9 @@ import { HistogramView } from './HistogramView';
 import { InteractiveToneCurveEditor } from './InteractiveToneCurveEditor';
 import type { BrushToolOptions } from './MaskCanvasOverlay';
 import { MaskingPanel } from './MaskingPanel';
+import { RetouchPanel, type HealToolOptions } from './RetouchPanel';
 
-export type DevelopToolMode = 'edit' | 'crop' | 'mask' | 'presets';
+export type DevelopToolMode = 'edit' | 'crop' | 'retouch' | 'mask' | 'presets';
 
 type EditAccordionKey =
   | 'basic'
@@ -75,23 +89,26 @@ type EditAccordionKey =
 
 const TOOL_STRIP_ITEMS: readonly {
   readonly id: DevelopToolMode;
-  readonly icon: string;
   readonly label: string;
   readonly shortcut: string;
   readonly title: string;
 }[] = [
-  { id: 'edit', icon: 'tune', label: 'Edit', shortcut: 'E', title: 'Develop Panels (E)' },
-  { id: 'crop', icon: 'crop', label: 'Crop', shortcut: 'R', title: 'Crop & Straighten (R)' },
+  { id: 'edit', label: 'Edit', shortcut: 'E', title: 'Develop Panels (E)' },
+  { id: 'crop', label: 'Crop', shortcut: 'R', title: 'Crop & Straighten (R)' },
+  {
+    id: 'retouch',
+    label: 'Retouch',
+    shortcut: 'Q',
+    title: 'Spot Heal, Clone, Object Remove & Portrait Retouch (Q)',
+  },
   {
     id: 'mask',
-    icon: 'layers',
     label: 'Mask',
     shortcut: 'M',
     title: 'Masks & Background Removal (M)',
   },
   {
     id: 'presets',
-    icon: 'auto_fix_high',
     label: 'Presets',
     shortcut: 'P',
     title: 'Quick Develop & Presets (P)',
@@ -200,6 +217,31 @@ interface DevelopInspectorPanelProps {
     label: string,
     coalesce?: boolean,
   ) => void;
+  readonly healTool: HealToolOptions;
+  readonly selectedSpotId: string | null;
+  readonly showSpotPins: boolean;
+  readonly detectingFace: boolean;
+  readonly faceParseMap: FaceParseMapData | null;
+  readonly parsingFace: boolean;
+  readonly faceParserReady: boolean;
+  readonly lamaReady: boolean;
+  readonly downloadingOptionalModelId: OptionalRetouchModelId | null;
+  readonly modelDownloadProgress: ModelDownloadProgress | null;
+  readonly pendingRemoveStrokesCount: number;
+  readonly busyInpainting: boolean;
+  readonly isDesktopRuntime: boolean;
+  readonly onChangeHealTool: (next: HealToolOptions) => void;
+  readonly onSelectSpot: (spotId: string | null) => void;
+  readonly onToggleShowSpotPins: () => void;
+  readonly onDeleteSpot: (spotId: string) => void;
+  readonly onClearAllSpots: () => void;
+  readonly onApplyInpaint: () => void;
+  readonly onClearPendingRemoveStrokes: () => void;
+  readonly onDeleteInpaintPatch: (patchId: string) => void;
+  readonly onClearAllInpaintPatches: () => void;
+  readonly onDownloadOptionalModel: (modelId: OptionalRetouchModelId) => void;
+  readonly onCancelOptionalModelDownload: () => void;
+  readonly onDetectFace: () => void;
   readonly onToggleShadowClip: () => void;
   readonly onToggleHighlightClip: () => void;
   readonly onToggleEyedropper: () => void;
@@ -247,6 +289,31 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
   onCreateAiMask,
   onRemoveBackground,
   onChangeBackgroundRemoval,
+  healTool,
+  selectedSpotId,
+  showSpotPins,
+  detectingFace,
+  faceParseMap,
+  parsingFace,
+  faceParserReady,
+  lamaReady,
+  downloadingOptionalModelId,
+  modelDownloadProgress,
+  pendingRemoveStrokesCount,
+  busyInpainting,
+  isDesktopRuntime,
+  onChangeHealTool,
+  onSelectSpot,
+  onToggleShowSpotPins,
+  onDeleteSpot,
+  onClearAllSpots,
+  onApplyInpaint,
+  onClearPendingRemoveStrokes,
+  onDeleteInpaintPatch,
+  onClearAllInpaintPatches,
+  onDownloadOptionalModel,
+  onCancelOptionalModelDownload,
+  onDetectFace,
   onToggleShadowClip,
   onToggleHighlightClip,
   onToggleEyedropper,
@@ -290,6 +357,13 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
   const bgRemoval = recipe.backgroundRemoval ?? createDefaultBackgroundRemoval();
   const bgActive = isBackgroundRemovalActive(bgRemoval);
   const maskBadgeCount = (recipe.masks?.length ?? 0) + (bgActive ? 1 : 0);
+  const retouchSettings = hydrateRetouchSettings(recipe.retouch ?? createDefaultRetouchSettings());
+  const retouchSpotCount =
+    retouchSettings.healSpots.length + (retouchSettings.inpaintPatches?.length ?? 0);
+  const retouchActive =
+    hasEffectiveHealSpots(retouchSettings) ||
+    hasEffectiveInpaintPatches(retouchSettings) ||
+    isPortraitRetouchActive(retouchSettings.portrait);
 
   const toggleSection = (key: EditAccordionKey) =>
     setOpenSections((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -490,8 +564,8 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
       style={{ width: `${widthPx}px` }}
       className="shrink-0 bg-surface-low flex flex-col overflow-hidden"
     >
-      {/* Top RGB Histogram + Authentic Lightroom 4-Icon Tool Strip */}
-      <div className="p-3 pb-2 border-b border-hairline flex flex-col gap-2.5 shrink-0 bg-surface">
+      {/* Top RGB Histogram + Minimal Icon-Free Mode Tabs */}
+      <div className="px-3 pt-3.5 pb-3 border-b border-hairline/60 flex flex-col gap-3 shrink-0 bg-surface-low">
         <HistogramView
           recipe={recipe}
           exif={photo.exif}
@@ -502,12 +576,23 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
           onToggleHighlightClip={onToggleHighlightClip}
         />
 
-        {/* Lightroom Classic / CC Tool Strip directly beneath Histogram */}
-        <nav aria-label="Develop Tools" className="grid grid-cols-4 gap-1">
+        {/* Minimal Swiss-Darkroom Text Tab Strip */}
+        <nav
+          aria-label="Develop Tools"
+          className="grid grid-cols-5 p-0.5 rounded-lg bg-surface-lowest/90 border border-hairline/65"
+        >
           {TOOL_STRIP_ITEMS.map((item) => {
             const active = toolMode === item.id;
             const showCropDot = item.id === 'crop' && modifiedModules.cropTransform;
-            const showMaskCount = item.id === 'mask' && maskBadgeCount > 0;
+            const showRetouchDot =
+              item.id === 'retouch' && (retouchSpotCount > 0 || retouchActive);
+            const showMaskDot = item.id === 'mask' && maskBadgeCount > 0;
+            const badgeCount =
+              item.id === 'retouch' && retouchSpotCount > 0
+                ? retouchSpotCount
+                : item.id === 'mask' && maskBadgeCount > 0
+                  ? maskBadgeCount
+                  : null;
             return (
               <button
                 key={item.id}
@@ -515,35 +600,29 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
                 title={item.title}
                 aria-pressed={active}
                 onClick={() => onChangeToolMode(item.id)}
-                className={`relative py-1.5 px-1 rounded-lg flex flex-col items-center justify-center gap-0.5 transition-colors cursor-pointer ${
+                className={`relative py-1.5 px-0.5 rounded-md flex items-center justify-center gap-0.5 transition-colors duration-150 cursor-pointer focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-amber-core/60 ${
                   active
-                    ? 'text-amber-soft'
-                    : 'text-ink-secondary hover:text-ink-primary hover:bg-surface-low/80'
+                    ? 'text-ink-primary'
+                    : 'text-ink-telemetry hover:text-ink-secondary'
                 }`}
               >
                 {active && (
                   <motion.span
                     layoutId="lightroom-tool-strip-indicator"
                     transition={TACTILE_SPRING}
-                    className="absolute inset-0 rounded-lg bg-surface-active border border-amber-core/50"
+                    className="absolute inset-0 rounded-md bg-surface-active border border-hairline-strong/80 shadow-[0_1px_2px_rgba(0,0,0,0.3)]"
                   />
                 )}
-                <span className="relative z-10 flex items-center justify-center">
-                  <span className="material-symbols-outlined text-[18px] leading-none">
-                    {item.icon}
-                  </span>
-                  {showCropDot && (
-                    <span className="absolute -top-0.5 -right-1.5 w-1.5 h-1.5 rounded-full bg-amber-core" />
-                  )}
-                  {showMaskCount && (
-                    <span className="absolute -top-1.5 -right-3 min-w-[14px] h-[14px] px-1 rounded-full bg-amber-core text-amber-ink tabular-nums-mono text-[8.5px] font-bold flex items-center justify-center leading-none">
-                      {maskBadgeCount}
-                    </span>
-                  )}
-                </span>
-                <span className="relative z-10 font-display text-[10px] font-medium leading-none">
+                <span className="relative z-10 font-display text-[10.5px] font-medium leading-none">
                   {item.label}
                 </span>
+                {badgeCount !== null ? (
+                  <span className="relative z-10 tabular-nums-mono text-[9px] font-semibold text-amber-soft leading-none">
+                    {badgeCount}
+                  </span>
+                ) : (showCropDot || showRetouchDot || showMaskDot) ? (
+                  <span className="relative z-10 w-1.5 h-1.5 rounded-full bg-amber-core shrink-0" />
+                ) : null}
               </button>
             );
           })}
@@ -596,9 +675,8 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
                     }
                   />
                   <DarkroomButton
-                    variant="subtle"
+                    variant="ghost"
                     size="xs"
-                    icon="auto_awesome"
                     onClick={handleAutoTone}
                     title="Auto-balance Exposure, Contrast, Highlights, Shadows, Whites & Blacks"
                   >
@@ -609,7 +687,7 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
                 {/* White Balance */}
                 <div className="flex items-center gap-1.5 pt-1">
                   <DarkroomButton
-                    variant={eyedropperActive ? 'emerald' : 'subtle'}
+                    variant={eyedropperActive ? 'emerald' : 'ghost'}
                     size="xs"
                     icon="colorize"
                     onClick={onToggleEyedropper}
@@ -634,7 +712,7 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
                         false,
                       );
                     }}
-                    className="flex-1 min-w-0 h-7 px-2 rounded-md bg-canvas border border-hairline hover:border-hairline-strong text-[11px] text-ink-primary focus:outline-none focus:border-amber-core"
+                    className="flex-1 min-w-0 h-8 px-2.5 rounded-lg bg-surface-lowest/85 border border-hairline/70 hover:border-hairline-strong text-[11px] text-ink-primary focus:outline-none focus:border-amber-core/70"
                   >
                     {matchedWbPresetId === 'custom' && <option value="custom">Custom</option>}
                     {WHITE_BALANCE_PRESETS.map((preset) => (
@@ -1527,6 +1605,50 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
             </motion.div>
           )}
 
+          {/* 2b. RETOUCH MODE: Spot Heal/Clone & Frequency-Separation Portrait Retouching */}
+          {toolMode === 'retouch' && (
+            <motion.div
+              key="mode-retouch"
+              initial={{ opacity: 0, y: 4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              transition={FAST_FADE}
+            >
+              <RetouchPanel
+                retouch={retouchSettings}
+                faceOverlay={photo.faceOverlay}
+                faceParseMap={faceParseMap}
+                detectingFace={detectingFace}
+                parsingFace={parsingFace}
+                faceParserReady={faceParserReady}
+                lamaReady={lamaReady}
+                downloadingOptionalModelId={downloadingOptionalModelId}
+                modelDownloadProgress={modelDownloadProgress}
+                pendingRemoveStrokesCount={pendingRemoveStrokesCount}
+                busyInpainting={busyInpainting}
+                isDesktopRuntime={isDesktopRuntime}
+                healTool={healTool}
+                selectedSpotId={selectedSpotId}
+                showSpotPins={showSpotPins}
+                onChangeHealTool={onChangeHealTool}
+                onSelectSpot={onSelectSpot}
+                onToggleShowSpotPins={onToggleShowSpotPins}
+                onDeleteSpot={onDeleteSpot}
+                onClearAllSpots={onClearAllSpots}
+                onApplyInpaint={onApplyInpaint}
+                onClearPendingRemoveStrokes={onClearPendingRemoveStrokes}
+                onDeleteInpaintPatch={onDeleteInpaintPatch}
+                onClearAllInpaintPatches={onClearAllInpaintPatches}
+                onDownloadOptionalModel={onDownloadOptionalModel}
+                onCancelOptionalModelDownload={onCancelOptionalModelDownload}
+                onDetectFace={onDetectFace}
+                onChangeRetouch={(nextRetouch: RetouchSettings, label: string, coalesce = true) =>
+                  onChangeRecipe({ ...recipe, retouch: nextRetouch }, label, coalesce)
+                }
+              />
+            </motion.div>
+          )}
+
           {/* 3. MASK MODE: Background Cutout & Local Masking */}
           {toolMode === 'mask' && (
             <motion.div
@@ -1677,29 +1799,26 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
               </section>
 
               {/* Built-In Studio Develop Presets */}
-              <section className="p-3 rounded-lg bg-surface border border-hairline flex flex-col gap-2">
+              <section className="p-3 rounded-xl bg-surface/65 border border-hairline/60 flex flex-col gap-2">
                 <span className="tabular-nums-mono text-[10px] uppercase tracking-wider text-ink-telemetry font-semibold">
                   Studio Presets
                 </span>
-                <div className="flex flex-col gap-1.5">
+                <div className="flex flex-col gap-1">
                   {builtInPresets.map((preset) => (
                     <button
                       key={preset.id}
                       type="button"
                       onClick={() => onApplyPreset(preset.name, preset.recipe)}
-                      className="p-2 rounded-lg bg-surface-low border border-hairline hover:bg-surface-active hover:border-amber-core/45 transition-colors text-left flex items-center justify-between gap-2 cursor-pointer group"
+                      className="px-2.5 py-2 rounded-lg hover:bg-surface-active transition-colors text-left flex items-center justify-between gap-2 cursor-pointer group"
                     >
                       <div className="min-w-0">
                         <div className="text-[12px] text-ink-primary font-medium truncate group-hover:text-amber-soft transition-colors">
                           {preset.name}
                         </div>
                         <div className="tabular-nums-mono text-[9.5px] text-ink-telemetry">
-                          {preset.category} • {preset.recipe.whiteBalance.temperatureKelvin}K
+                          {preset.category} · {preset.recipe.whiteBalance.temperatureKelvin}K
                         </div>
                       </div>
-                      <span className="material-symbols-outlined text-[15px] text-ink-telemetry group-hover:text-amber-core shrink-0">
-                        auto_fix_high
-                      </span>
                     </button>
                   ))}
                 </div>
@@ -1852,35 +1971,35 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
         </AnimatePresence>
       </div>
 
-      {/* Pinned Lightroom Batch Sync Command Footer */}
-      <div className="p-3 border-t border-hairline bg-surface flex flex-col gap-2 shrink-0">
-        <div className="grid grid-cols-3 gap-1.5">
+      {/* Calm Pinned Studio Action Footer */}
+      <div className="px-4 py-3 border-t border-hairline/60 bg-surface-low flex flex-col gap-2 shrink-0">
+        <div className="grid grid-cols-3 gap-1">
           <DarkroomButton
-            variant="subtle"
+            variant="ghost"
             size="xs"
-            icon="restart_alt"
             disabled={!modified}
             onClick={() => onChangeRecipe(createDefaultDevelopRecipe(), 'Reset edits', false)}
             title="Reset all edits"
+            className="justify-center"
           >
             Reset
           </DarkroomButton>
           <DarkroomButton
-            variant="secondary"
+            variant="ghost"
             size="xs"
-            icon="content_copy"
             onClick={onCopyRecipe}
             title="Copy recipe (Ctrl+Shift+C)"
+            className="justify-center"
           >
             Copy
           </DarkroomButton>
           <DarkroomButton
-            variant="secondary"
+            variant="ghost"
             size="xs"
-            icon="content_paste"
             disabled={!hasCopiedRecipe}
             onClick={onPasteRecipe}
             title="Paste recipe (Ctrl+Shift+V)"
+            className="justify-center"
           >
             Paste
           </DarkroomButton>
@@ -1890,10 +2009,9 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
           <DarkroomButton
             variant="primary"
             size="md"
-            icon="download"
             onClick={onOpenExport}
             title="Edits auto-save to .kroma.json sidecar. Open Export to save your final image."
-            className="w-full justify-center"
+            className="w-full h-9 justify-center"
           >
             Export Photo
           </DarkroomButton>
@@ -1901,13 +2019,12 @@ export const DevelopInspectorPanel = memo(function DevelopInspectorPanel({
           <DarkroomButton
             variant="primary"
             size="md"
-            icon="tune"
             onClick={onOpenSyncModal}
             title="Edits on this photo auto-save automatically. Click to copy settings to other photos (Ctrl+Shift+S)"
-            className="w-full justify-between"
+            className="w-full h-9 justify-between px-3.5"
           >
             <span>Sync to Other Photos</span>
-            <kbd className="tabular-nums-mono text-[9.5px] opacity-75">Ctrl+Shift+S</kbd>
+            <kbd className="tabular-nums-mono text-[9.5px] opacity-70 font-normal">Ctrl+Shift+S</kbd>
           </DarkroomButton>
         )}
       </div>

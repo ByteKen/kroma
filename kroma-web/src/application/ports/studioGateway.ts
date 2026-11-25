@@ -5,14 +5,20 @@ import type {
   WhiteBalanceSettings,
 } from '../../domain/develop';
 import type {
+  DevelopBufferLoadPriority,
   DevelopWorkingBuffer,
   WorkingBufferPrecision,
 } from '../../domain/developWorkingBuffer';
 import type { SubjectCluster } from '../../domain/identity';
 import type { AiMaskKind, GeneratedAiMaskResult } from '../../domain/masking';
 import type { OutputNamingRule } from '../../domain/organization';
-import type { PhotoAsset } from '../../domain/photo';
+import type { PhotoAsset, YuNetFaceOverlay } from '../../domain/photo';
 import type { ThumbnailPreviewMode } from '../../domain/preferences';
+import type {
+  FaceParseMapDto,
+  GeneratedInpaintPatchResult,
+  InpaintStrokeInput,
+} from '../../domain/retouch';
 import type {
   ClusterSlateOcrResult,
   PhotoOcrResult,
@@ -48,7 +54,8 @@ export interface EngineTelemetrySnapshot {
   readonly engineLoadPct: number;
 }
 
-export type AiModelRole = 'detector' | 'recognizer' | 'segmenter';
+export type AiModelRole = 'detector' | 'recognizer' | 'segmenter' | 'face_parser' | 'inpainter';
+export type OptionalRetouchModelId = 'bisenet-face-parsing' | 'lama-inpainting';
 export type ModelCompatibility = 'compatible' | 'warning' | 'incompatible';
 
 export interface ModelInspectionResult {
@@ -85,6 +92,18 @@ export interface RuntimeInfo {
   readonly defaultSegmenterModelLabel?: string;
   readonly isCustomSegmenter?: boolean;
   readonly segmenterModelsReady?: boolean;
+  readonly faceParserModelPath?: string | null;
+  readonly faceParserModelLabel?: string;
+  readonly defaultFaceParserModelPath?: string | null;
+  readonly defaultFaceParserModelLabel?: string;
+  readonly isCustomFaceParser?: boolean;
+  readonly faceParserReady?: boolean;
+  readonly lamaModelPath?: string | null;
+  readonly lamaModelLabel?: string;
+  readonly defaultLamaModelPath?: string | null;
+  readonly defaultLamaModelLabel?: string;
+  readonly isCustomLama?: boolean;
+  readonly lamaReady?: boolean;
   readonly supportedRawCount: number;
   readonly backendLabel: string;
   readonly developGpuBackendLabel?: string;
@@ -270,6 +289,7 @@ export interface StudioGateway {
   checkRuntimeInfo(): Promise<RuntimeInfo | null>;
   checkModelsManifest?(): Promise<ModelManifestStatus | null>;
   downloadMissingModels?(): Promise<ModelDownloadOutcome | null>;
+  downloadOptionalModel?(modelId: OptionalRetouchModelId): Promise<ModelDownloadOutcome | null>;
   cancelModelDownloads?(): Promise<void>;
   setGpuAcceleration?(enabled: boolean): Promise<RuntimeInfo | null>;
   getStorageCacheSummary?(): Promise<StorageCacheSummary | null>;
@@ -282,6 +302,8 @@ export interface StudioGateway {
     yunetPath: string | null,
     recognizerPath: string | null,
     segmenterPath?: string | null,
+    faceParserPath?: string | null,
+    lamaPath?: string | null,
   ): Promise<RuntimeInfo | null>;
   loadSession(): Promise<StudioSessionSnapshot | null>;
   openShootFolder(): Promise<StudioSessionSnapshot | null>;
@@ -335,6 +357,7 @@ export interface StudioGateway {
     photoId: string,
     maxDim?: number,
     precision?: WorkingBufferPrecision,
+    priority?: DevelopBufferLoadPriority,
   ): Promise<DevelopWorkingBuffer | null>;
   getPhotoNativeDimensions?(
     photoId: string,
@@ -343,6 +366,12 @@ export interface StudioGateway {
     mode: ThumbnailPreviewMode,
     photoIds?: readonly string[],
   ): Promise<void>;
+  detectPhotoFaceOverlay?(photoId: string): Promise<YuNetFaceOverlay | null>;
+  parsePhotoFaceRetouchMap?(photoId: string): Promise<FaceParseMapDto | null>;
+  inpaintPhotoRegion?(
+    photoId: string,
+    strokes: readonly InpaintStrokeInput[],
+  ): Promise<GeneratedInpaintPatchResult | null>;
   generateAiMask?(photoId: string, kind: AiMaskKind): Promise<GeneratedAiMaskResult | null>;
   savePhotoDevelopRecipe(photoId: string, recipe: DevelopRecipe): Promise<LiveRgbHistogram | null>;
   savePhotoDevelopRecipesBatch?(

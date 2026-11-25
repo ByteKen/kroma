@@ -11,6 +11,11 @@ use crate::develop::color_math::{
 use crate::develop::cube_lut::CubeLut3D;
 use crate::develop::image_decoder::DecodedDevelopBuffer;
 use crate::develop::mask_engine::{compile_local_linear, compile_mask_layer_for_gpu};
+use crate::develop::retouch_engine::{
+    build_heal_uniforms, build_portrait_retouch_uniforms, pack_heal_spots_for_gpu, HealUniforms,
+    InpaintUniforms, PortraitRetouchUniforms,
+};
+use crate::vision::lama_inpainter::decode_inpaint_patch_rgba;
 use bytemuck::{Pod, Zeroable};
 use image::Rgb32FImage;
 use kroma_app::error::AppError;
@@ -19,10 +24,15 @@ use kroma_domain::masking::{
     decode_matte_rle_b64, BackgroundGradientStyle, BackgroundReplaceMode, MaskCombineOp,
     MaskComponent, MaskLayer,
 };
+use kroma_domain::retouch::{FaceParseMap, PortraitFaceGuide, MAX_INPAINT_PATCHES};
 use rayon::prelude::*;
 use std::sync::{Mutex, OnceLock};
 
 const GRADE_PASS_WGSL: &str = include_str!("../../../../shaders/develop/grade_pass.wgsl");
+const INPAINT_PASS_WGSL: &str = include_str!("../../../../shaders/develop/inpaint_pass.wgsl");
+const HEAL_PASS_WGSL: &str = include_str!("../../../../shaders/develop/heal_pass.wgsl");
+const PORTRAIT_RETOUCH_PASS_WGSL: &str =
+    include_str!("../../../../shaders/develop/portrait_retouch_pass.wgsl");
 const MASK_PASS_WGSL: &str = include_str!("../../../../shaders/develop/mask_pass.wgsl");
 const SPATIAL_PASS_WGSL: &str = include_str!("../../../../shaders/develop/spatial_pass.wgsl");
 
@@ -89,6 +99,8 @@ struct WgpuExportScratch {
     work_b: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
     staging_buf: Option<(u64, wgpu::Buffer)>,
     grade_ubo: wgpu::Buffer,
+    heal_ubo: wgpu::Buffer,
+    portrait_ubo: wgpu::Buffer,
     spatial_ubo: wgpu::Buffer,
     tone_lut_tex: wgpu::Texture,
     tone_lut_view: wgpu::TextureView,
@@ -101,13 +113,18 @@ pub struct WgpuDevelopEngine {
     max_texture_dim: u32,
     grade_bgl: wgpu::BindGroupLayout,
     grade_pipeline: wgpu::ComputePipeline,
-    mask_bgl: wgpu::BindGroupLayout,
-    mask_pipeline: wgpu::ComputePipeline,
-    spatial_bgl: wgpu::BindGroupLayout,
-    spatial_pipeline: wgpu::ComputePipeline,
+    /// Optional pass pipelines are compiled lazily on first actual use so cold DX12/Metal startup
+    /// only compiles `grade_pass.wgsl` (~1s instead of ~4.5-5s compiling all 6 shaders up front).
+    inpaint_pass: OnceLock<(wgpu::BindGroupLayout, wgpu::ComputePipeline)>,
+    heal_pass: OnceLock<(wgpu::BindGroupLayout, wgpu::ComputePipeline)>,
+    portrait_pass: OnceLock<(wgpu::BindGroupLayout, wgpu::ComputePipeline)>,
+    mask_pass: OnceLock<(wgpu::BindGroupLayout, wgpu::ComputePipeline)>,
+    spatial_pass: OnceLock<(wgpu::BindGroupLayout, wgpu::ComputePipeline)>,
     dummy_lut3d_buf: wgpu::Buffer,
     _dummy_white_tex: wgpu::Texture,
     dummy_white_view: wgpu::TextureView,
+    _dummy_transparent_tex: wgpu::Texture,
+    dummy_transparent_view: wgpu::TextureView,
     _dummy_tone_lut_tex: wgpu::Texture,
     dummy_tone_lut_view: wgpu::TextureView,
     /// Serializes GPU dispatch + readback and owns reusable textures/buffers so parallel Rayon
@@ -214,14 +231,6 @@ impl WgpuDevelopEngine {
             label: Some("kroma-grade-pass-wgsl"),
             source: wgpu::ShaderSource::Wgsl(GRADE_PASS_WGSL.into()),
         });
-        let mask_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("kroma-mask-pass-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(MASK_PASS_WGSL.into()),
-        });
-        let spatial_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("kroma-spatial-pass-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(SPATIAL_PASS_WGSL.into()),
-        });
 
         let grade_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("kroma-grade-bgl"),
@@ -248,52 +257,6 @@ impl WgpuDevelopEngine {
             cache: None,
         });
 
-        let mask_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("kroma-mask-bgl"),
-            entries: &[
-                uniform_entry(0),
-                unfilterable_tex_entry(1),
-                unfilterable_tex_entry(2),
-                write_storage_tex_entry(3),
-            ],
-        });
-        let mask_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("kroma-mask-pl"),
-            bind_group_layouts: &[&mask_bgl],
-            push_constant_ranges: &[],
-        });
-        let mask_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("kroma-mask-pipeline"),
-            layout: Some(&mask_pl),
-            module: &mask_module,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
-        let spatial_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("kroma-spatial-bgl"),
-            entries: &[
-                uniform_entry(0),
-                unfilterable_tex_entry(1),
-                unfilterable_tex_entry(2),
-                write_storage_tex_entry(3),
-            ],
-        });
-        let spatial_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("kroma-spatial-pl"),
-            bind_group_layouts: &[&spatial_bgl],
-            push_constant_ranges: &[],
-        });
-        let spatial_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("kroma-spatial-pipeline"),
-            layout: Some(&spatial_pl),
-            module: &spatial_module,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
         let dummy_lut3d_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kroma-dummy-lut3d"),
             size: 16,
@@ -304,6 +267,9 @@ impl WgpuDevelopEngine {
 
         let dummy_white_tex = upload_rgba8_texture(&device, &queue, 1, 1, &[255, 255, 255, 255]);
         let dummy_white_view = dummy_white_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let dummy_transparent_tex = upload_rgba8_texture(&device, &queue, 1, 1, &[0, 0, 0, 0]);
+        let dummy_transparent_view =
+            dummy_transparent_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut identity_lut = Vec::with_capacity(256 * 4);
         for i in 0..256 {
@@ -323,6 +289,18 @@ impl WgpuDevelopEngine {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let heal_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kroma-heal-ubo-pool"),
+            size: std::mem::size_of::<HealUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let portrait_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kroma-portrait-ubo-pool"),
+            size: std::mem::size_of::<PortraitRetouchUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let spatial_ubo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kroma-spatial-ubo-pool"),
             size: std::mem::size_of::<SpatialUniforms>() as u64,
@@ -336,13 +314,16 @@ impl WgpuDevelopEngine {
             max_texture_dim,
             grade_bgl,
             grade_pipeline,
-            mask_bgl,
-            mask_pipeline,
-            spatial_bgl,
-            spatial_pipeline,
+            inpaint_pass: OnceLock::new(),
+            heal_pass: OnceLock::new(),
+            portrait_pass: OnceLock::new(),
+            mask_pass: OnceLock::new(),
+            spatial_pass: OnceLock::new(),
             dummy_lut3d_buf,
             _dummy_white_tex: dummy_white_tex,
             dummy_white_view,
+            _dummy_transparent_tex: dummy_transparent_tex,
+            dummy_transparent_view,
             _dummy_tone_lut_tex: dummy_tone_lut_tex,
             dummy_tone_lut_view,
             scratch: Mutex::new(WgpuExportScratch {
@@ -351,6 +332,8 @@ impl WgpuDevelopEngine {
                 work_b: None,
                 staging_buf: None,
                 grade_ubo,
+                heal_ubo,
+                portrait_ubo,
                 spatial_ubo,
                 tone_lut_tex,
                 tone_lut_view,
@@ -359,13 +342,241 @@ impl WgpuDevelopEngine {
         })
     }
 
-    /// Executes the full 32-bit `rgba32float` WGSL compute pipeline (`grade_pass` → `mask_pass` × N →
-    /// `spatial_pass`) on GPU and returns the graded `Rgb32FImage` plus optional transparent cutout alpha.
+    fn inpaint_pass(&self) -> &(wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+        self.inpaint_pass.get_or_init(|| {
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("kroma-inpaint-pass-wgsl"),
+                    source: wgpu::ShaderSource::Wgsl(INPAINT_PASS_WGSL.into()),
+                });
+            let bgl = self
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("kroma-inpaint-bgl"),
+                    entries: &[
+                        uniform_entry(0),
+                        unfilterable_tex_entry(1),
+                        unfilterable_tex_entry(2),
+                        write_storage_tex_entry(3),
+                    ],
+                });
+            let pl = self
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("kroma-inpaint-pl"),
+                    bind_group_layouts: &[&bgl],
+                    push_constant_ranges: &[],
+                });
+            let pipeline = self
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("kroma-inpaint-pipeline"),
+                    layout: Some(&pl),
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+            (bgl, pipeline)
+        })
+    }
+
+    fn heal_pass(&self) -> &(wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+        self.heal_pass.get_or_init(|| {
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("kroma-heal-pass-wgsl"),
+                    source: wgpu::ShaderSource::Wgsl(HEAL_PASS_WGSL.into()),
+                });
+            let bgl = self
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("kroma-heal-bgl"),
+                    entries: &[
+                        uniform_entry(0),
+                        unfilterable_tex_entry(1),
+                        readonly_storage_entry(2),
+                        readonly_storage_entry(3),
+                        write_storage_tex_entry(4),
+                    ],
+                });
+            let pl = self
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("kroma-heal-pl"),
+                    bind_group_layouts: &[&bgl],
+                    push_constant_ranges: &[],
+                });
+            let pipeline = self
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("kroma-heal-pipeline"),
+                    layout: Some(&pl),
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+            (bgl, pipeline)
+        })
+    }
+
+    fn portrait_pass(&self) -> &(wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+        self.portrait_pass.get_or_init(|| {
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("kroma-portrait-retouch-pass-wgsl"),
+                    source: wgpu::ShaderSource::Wgsl(PORTRAIT_RETOUCH_PASS_WGSL.into()),
+                });
+            let bgl = self
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("kroma-portrait-bgl"),
+                    entries: &[
+                        uniform_entry(0),
+                        unfilterable_tex_entry(1),
+                        write_storage_tex_entry(2),
+                        unfilterable_tex_entry(3),
+                    ],
+                });
+            let pl = self
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("kroma-portrait-pl"),
+                    bind_group_layouts: &[&bgl],
+                    push_constant_ranges: &[],
+                });
+            let pipeline = self
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("kroma-portrait-pipeline"),
+                    layout: Some(&pl),
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+            (bgl, pipeline)
+        })
+    }
+
+    fn mask_pass(&self) -> &(wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+        self.mask_pass.get_or_init(|| {
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("kroma-mask-pass-wgsl"),
+                    source: wgpu::ShaderSource::Wgsl(MASK_PASS_WGSL.into()),
+                });
+            let bgl = self
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("kroma-mask-bgl"),
+                    entries: &[
+                        uniform_entry(0),
+                        unfilterable_tex_entry(1),
+                        unfilterable_tex_entry(2),
+                        write_storage_tex_entry(3),
+                    ],
+                });
+            let pl = self
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("kroma-mask-pl"),
+                    bind_group_layouts: &[&bgl],
+                    push_constant_ranges: &[],
+                });
+            let pipeline = self
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("kroma-mask-pipeline"),
+                    layout: Some(&pl),
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+            (bgl, pipeline)
+        })
+    }
+
+    fn spatial_pass(&self) -> &(wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+        self.spatial_pass.get_or_init(|| {
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("kroma-spatial-pass-wgsl"),
+                    source: wgpu::ShaderSource::Wgsl(SPATIAL_PASS_WGSL.into()),
+                });
+            let bgl = self
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("kroma-spatial-bgl"),
+                    entries: &[
+                        uniform_entry(0),
+                        unfilterable_tex_entry(1),
+                        unfilterable_tex_entry(2),
+                        write_storage_tex_entry(3),
+                    ],
+                });
+            let pl = self
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("kroma-spatial-pl"),
+                    bind_group_layouts: &[&bgl],
+                    push_constant_ranges: &[],
+                });
+            let pipeline = self
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("kroma-spatial-pipeline"),
+                    layout: Some(&pl),
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+            (bgl, pipeline)
+        })
+    }
+
+    /// Executes the full 32-bit `rgba32float` WGSL compute pipeline (`grade_pass` → `heal_pass` →
+    /// `portrait_retouch_pass` → `mask_pass` × N → `spatial_pass`) on GPU and returns the graded
+    /// `Rgb32FImage` plus optional transparent cutout alpha.
     pub fn process_buffer_with_alpha_f32(
         &self,
         buffer: &DecodedDevelopBuffer,
         recipe: &DevelopRecipe,
         loaded_lut: Option<&CubeLut3D>,
+    ) -> Result<(Rgb32FImage, Option<Vec<f32>>), AppError> {
+        self.process_buffer_with_alpha_and_faces_f32(buffer, recipe, loaded_lut, &[])
+    }
+
+    /// Executes the full 32-bit `rgba32float` WGSL compute pipeline with per-photo YuNet face guides
+    /// for landmark-guided portrait retouching.
+    pub fn process_buffer_with_alpha_and_faces_f32(
+        &self,
+        buffer: &DecodedDevelopBuffer,
+        recipe: &DevelopRecipe,
+        loaded_lut: Option<&CubeLut3D>,
+        face_guides: &[PortraitFaceGuide],
+    ) -> Result<(Rgb32FImage, Option<Vec<f32>>), AppError> {
+        self.process_buffer_with_alpha_and_retouch_f32(buffer, recipe, loaded_lut, face_guides, None)
+    }
+
+    /// Executes the full 32-bit `rgba32float` WGSL compute pipeline (`grade_pass` → `inpaint_pass` × N
+    /// → `heal_pass` → `portrait_retouch_pass` [with optional BiSeNet `FaceParseMap`] → `mask_pass` × N
+    /// → `spatial_pass`) on GPU and returns the graded `Rgb32FImage` plus optional cutout alpha.
+    pub fn process_buffer_with_alpha_and_retouch_f32(
+        &self,
+        buffer: &DecodedDevelopBuffer,
+        recipe: &DevelopRecipe,
+        loaded_lut: Option<&CubeLut3D>,
+        face_guides: &[PortraitFaceGuide],
+        face_parse_map: Option<&FaceParseMap>,
     ) -> Result<(Rgb32FImage, Option<Vec<f32>>), AppError> {
         let (src_w, src_h) = buffer.image.dimensions();
         if src_w == 0 || src_h == 0 {
@@ -499,6 +710,78 @@ impl WgpuDevelopEngine {
         };
         let lut3d_fp = loaded_lut.map(CubeLut3D::fingerprint);
 
+        // Decode optional Phase 3 inpaint patches & pack retouch data before locking GPU scratch
+        type DecodedGpuInpaintPatch = (u32, u32, Vec<u8>, [f32; 4], f32);
+        let decoded_inpaint_patches: Vec<DecodedGpuInpaintPatch> =
+            if recipe.retouch.has_inpaint_patches() {
+                recipe
+                    .retouch
+                    .inpaint_patches
+                    .iter()
+                    .filter(|p| p.is_effective())
+                    .take(MAX_INPAINT_PATCHES)
+                    .filter_map(|p| {
+                        let (pw, ph, rgba) = decode_inpaint_patch_rgba(p)?;
+                        Some((
+                            pw,
+                            ph,
+                            rgba,
+                            [p.bounds.left, p.bounds.top, p.bounds.width, p.bounds.height],
+                            p.opacity.clamp(0.05, 1.0),
+                        ))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let valid_face_parse = face_parse_map.filter(|m| m.is_valid());
+
+        let need_inpaint = !decoded_inpaint_patches.is_empty();
+        let need_heal = recipe.retouch.has_heal_spots();
+        let need_portrait = recipe.retouch.is_portrait_active();
+        let (heal_spots_gpu, heal_segs_gpu) = if need_heal {
+            pack_heal_spots_for_gpu(recipe, ori_w, ori_h)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let oriented_faces: Vec<PortraitFaceGuide> = if need_portrait {
+            face_guides
+                .iter()
+                .take(4)
+                .map(|g| g.into_oriented_uv(crop, ori_w, ori_h, true))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Compile only the optional GPU compute pipelines actually needed by this recipe before
+        // locking `self.scratch`, eliminating multi-second unused shader compilation stalls.
+        let inpaint_pass = if need_inpaint {
+            Some(self.inpaint_pass())
+        } else {
+            None
+        };
+        let heal_pass = if need_heal && !heal_spots_gpu.is_empty() {
+            Some(self.heal_pass())
+        } else {
+            None
+        };
+        let portrait_pass = if need_portrait {
+            Some(self.portrait_pass())
+        } else {
+            None
+        };
+        let mask_pass = if !prepared_masks.is_empty() {
+            Some(self.mask_pass())
+        } else {
+            None
+        };
+        let spatial_pass = if need_spatial {
+            Some(self.spatial_pass())
+        } else {
+            None
+        };
+
         let mut scratch = self.scratch.lock().map_err(|_| {
             AppError::ImageProcessingFailure("wgpu scratch mutex poisoned".to_string())
         })?;
@@ -562,7 +845,11 @@ impl WgpuDevelopEngine {
             scratch.work_a = Some((out_w, out_h, tex, view));
         }
 
-        let need_ping_pong = !prepared_masks.is_empty() || need_spatial;
+        let need_ping_pong = need_inpaint
+            || need_heal
+            || need_portrait
+            || !prepared_masks.is_empty()
+            || need_spatial;
         if need_ping_pong {
             let recreate_b = scratch
                 .work_b
@@ -683,62 +970,32 @@ impl WgpuDevelopEngine {
         // Track which ping-pong texture currently holds the latest image (`true` = A, `false` = B)
         let mut current_is_a = true;
 
-        // Pass 2: Local & AI Masks
-        let mut mask_temp_resources: Vec<(wgpu::Texture, wgpu::Buffer, wgpu::BindGroup)> = Vec::new();
-        for (layer, (has_spatial, mw, mh, rgba, ranges)) in &prepared_masks {
-            let spatial_tex = if *has_spatial {
-                upload_rgba8_texture(&self.device, &self.queue, *mw, *mh, rgba)
-            } else {
-                upload_rgba8_texture(&self.device, &self.queue, 1, 1, &[255, 255, 255, 255])
-            };
-            let spatial_view = spatial_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-            let adj = layer.adjustments;
-            let has_tone_or_color = adj.temperature_shift != 0
-                || adj.tint_shift != 0
-                || adj.exposure_ev.abs() > 1e-4
-                || adj.contrast != 0
-                || adj.highlights != 0
-                || adj.shadows != 0
-                || adj.whites != 0
-                || adj.blacks != 0
-                || adj.dehaze != 0
-                || adj.saturation != 0;
-            let has_spatial_detail = adj.has_spatial_adjustments();
-
-            // When both local tone AND local spatial detail are active on the same layer, run
-            // Stage 1 (tone-only, storing alpha in .a) then Stage 2 (spatial-only) for exact
-            // parity with `mask_engine.rs`.
-            let stages: &[f32] = if has_tone_or_color && has_spatial_detail {
-                &[1.0, 2.0]
-            } else {
-                &[0.0]
-            };
-
-            let mut last_tex_holder = Some(spatial_tex);
-            for &pass_mode in stages {
-                let u_mask = build_mask_uniforms(
-                    out_w,
-                    out_h,
-                    snapped_crop_rect,
-                    layer,
-                    *has_spatial,
-                    ranges,
-                    pass_mode,
-                );
-                let mask_ubo = create_uniform_buffer(&self.device, &self.queue, &u_mask);
+        // Pass 1a: Phase 3 Non-Destructive Generative Inpaint Patches (LaMa / Harmonic)
+        let mut inpaint_temp_resources: Vec<(wgpu::Texture, wgpu::Buffer, wgpu::BindGroup)> =
+            Vec::new();
+        if let Some((inpaint_bgl, inpaint_pipeline)) = inpaint_pass {
+            for (pw, ph, rgba, bounds, opacity) in &decoded_inpaint_patches {
+                let patch_tex = upload_rgba8_texture(&self.device, &self.queue, *pw, *ph, rgba);
+                let patch_view = patch_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                let u_inpaint = InpaintUniforms {
+                    dims: [out_w as f32, out_h as f32, *pw as f32, *ph as f32],
+                    crop_rect: snapped_crop_rect,
+                    bounds: *bounds,
+                    params: [*opacity, 0.0, 0.0, 0.0],
+                };
+                let inpaint_ubo = create_uniform_buffer(&self.device, &self.queue, &u_inpaint);
                 let (src_v, dst_v) = if current_is_a {
                     (view_a, view_b.expect("ping-pong B"))
                 } else {
                     (view_b.expect("ping-pong B"), view_a)
                 };
-                let mask_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("kroma-mask-bg"),
-                    layout: &self.mask_bgl,
+                let inpaint_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("kroma-inpaint-bg"),
+                    layout: inpaint_bgl,
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
-                            resource: mask_ubo.as_entire_binding(),
+                            resource: inpaint_ubo.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
@@ -746,7 +1003,7 @@ impl WgpuDevelopEngine {
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&spatial_view),
+                            resource: wgpu::BindingResource::TextureView(&patch_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
@@ -756,23 +1013,259 @@ impl WgpuDevelopEngine {
                 });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("kroma-mask-pass"),
+                        label: Some("kroma-inpaint-pass"),
                         timestamp_writes: None,
                     });
-                    pass.set_pipeline(&self.mask_pipeline);
-                    pass.set_bind_group(0, &mask_bg, &[]);
+                    pass.set_pipeline(inpaint_pipeline);
+                    pass.set_bind_group(0, &inpaint_bg, &[]);
                     pass.dispatch_workgroups(wg_x, wg_y, 1);
                 }
                 current_is_a = !current_is_a;
-                let dummy_keep = last_tex_holder.take().unwrap_or_else(|| {
-                    upload_rgba8_texture(&self.device, &self.queue, 1, 1, &[0, 0, 0, 255])
+                inpaint_temp_resources.push((patch_tex, inpaint_ubo, inpaint_bg));
+            }
+        }
+
+        // Pass 1b: Non-Destructive Spot Heal & Clone
+        let _heal_keep = if let Some((heal_bgl, heal_pipeline)) = heal_pass {
+            let u_heal = build_heal_uniforms(
+                out_w,
+                out_h,
+                ori_w,
+                ori_h,
+                snapped_crop_rect,
+                heal_spots_gpu.len() as u32,
+            );
+            self.queue
+                .write_buffer(&scratch.heal_ubo, 0, bytemuck::bytes_of(&u_heal));
+
+            let spots_bytes: &[u8] = bytemuck::cast_slice(&heal_spots_gpu);
+            let spots_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("kroma-heal-spots-storage"),
+                size: spots_bytes.len().max(64) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&spots_buf, 0, spots_bytes);
+
+            let segs_bytes: &[u8] = bytemuck::cast_slice(&heal_segs_gpu);
+            let segs_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("kroma-heal-segs-storage"),
+                size: segs_bytes.len().max(16) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&segs_buf, 0, segs_bytes);
+
+            let (src_v, dst_v) = if current_is_a {
+                (view_a, view_b.expect("ping-pong B"))
+            } else {
+                (view_b.expect("ping-pong B"), view_a)
+            };
+            let heal_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("kroma-heal-bg"),
+                layout: heal_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: scratch.heal_ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(src_v),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: spots_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: segs_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(dst_v),
+                    },
+                ],
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("kroma-heal-pass"),
+                    timestamp_writes: None,
                 });
-                mask_temp_resources.push((dummy_keep, mask_ubo, mask_bg));
+                pass.set_pipeline(heal_pipeline);
+                pass.set_bind_group(0, &heal_bg, &[]);
+                pass.dispatch_workgroups(wg_x, wg_y, 1);
+            }
+            current_is_a = !current_is_a;
+            Some((spots_buf, segs_buf, heal_bg))
+        } else {
+            None
+        };
+
+        // Pass 1c: Frequency-Separation & Landmark/BiSeNet-Guided Portrait Retouching
+        let _portrait_keep = if let Some((portrait_bgl, portrait_pipeline)) = portrait_pass {
+            let u_portrait = build_portrait_retouch_uniforms(
+                out_w,
+                out_h,
+                ori_w,
+                ori_h,
+                snapped_crop_rect,
+                recipe.retouch.portrait,
+                &oriented_faces,
+                valid_face_parse.is_some(),
+            );
+            self.queue
+                .write_buffer(&scratch.portrait_ubo, 0, bytemuck::bytes_of(&u_portrait));
+            let face_parse_tex_owned = valid_face_parse.map(|fp| {
+                upload_rgba8_texture(
+                    &self.device,
+                    &self.queue,
+                    fp.width as u32,
+                    fp.height as u32,
+                    &fp.rgba,
+                )
+            });
+            let face_parse_view_owned = face_parse_tex_owned
+                .as_ref()
+                .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
+            let face_parse_view = face_parse_view_owned
+                .as_ref()
+                .unwrap_or(&self.dummy_transparent_view);
+
+            let (src_v, dst_v) = if current_is_a {
+                (view_a, view_b.expect("ping-pong B"))
+            } else {
+                (view_b.expect("ping-pong B"), view_a)
+            };
+            let portrait_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("kroma-portrait-bg"),
+                layout: portrait_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: scratch.portrait_ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(src_v),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(dst_v),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(face_parse_view),
+                    },
+                ],
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("kroma-portrait-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(portrait_pipeline);
+                pass.set_bind_group(0, &portrait_bg, &[]);
+                pass.dispatch_workgroups(wg_x, wg_y, 1);
+            }
+            current_is_a = !current_is_a;
+            Some((face_parse_tex_owned, portrait_bg))
+        } else {
+            None
+        };
+
+        // Pass 2: Local & AI Masks
+        let mut mask_temp_resources: Vec<(wgpu::Texture, wgpu::Buffer, wgpu::BindGroup)> = Vec::new();
+        if let Some((mask_bgl, mask_pipeline)) = mask_pass {
+            for (layer, (has_spatial, mw, mh, rgba, ranges)) in &prepared_masks {
+                let spatial_tex = if *has_spatial {
+                    upload_rgba8_texture(&self.device, &self.queue, *mw, *mh, rgba)
+                } else {
+                    upload_rgba8_texture(&self.device, &self.queue, 1, 1, &[255, 255, 255, 255])
+                };
+                let spatial_view = spatial_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+                let adj = layer.adjustments;
+                let has_tone_or_color = adj.temperature_shift != 0
+                    || adj.tint_shift != 0
+                    || adj.exposure_ev.abs() > 1e-4
+                    || adj.contrast != 0
+                    || adj.highlights != 0
+                    || adj.shadows != 0
+                    || adj.whites != 0
+                    || adj.blacks != 0
+                    || adj.dehaze != 0
+                    || adj.saturation != 0;
+                let has_spatial_detail = adj.has_spatial_adjustments();
+
+                // When both local tone AND local spatial detail are active on the same layer, run
+                // Stage 1 (tone-only, storing alpha in .a) then Stage 2 (spatial-only) for exact
+                // parity with `mask_engine.rs`.
+                let stages: &[f32] = if has_tone_or_color && has_spatial_detail {
+                    &[1.0, 2.0]
+                } else {
+                    &[0.0]
+                };
+
+                let mut last_tex_holder = Some(spatial_tex);
+                for &pass_mode in stages {
+                    let u_mask = build_mask_uniforms(
+                        out_w,
+                        out_h,
+                        snapped_crop_rect,
+                        layer,
+                        *has_spatial,
+                        ranges,
+                        pass_mode,
+                    );
+                    let mask_ubo = create_uniform_buffer(&self.device, &self.queue, &u_mask);
+                    let (src_v, dst_v) = if current_is_a {
+                        (view_a, view_b.expect("ping-pong B"))
+                    } else {
+                        (view_b.expect("ping-pong B"), view_a)
+                    };
+                    let mask_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("kroma-mask-bg"),
+                        layout: mask_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: mask_ubo.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(src_v),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(&spatial_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(dst_v),
+                            },
+                        ],
+                    });
+                    {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("kroma-mask-pass"),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(mask_pipeline);
+                        pass.set_bind_group(0, &mask_bg, &[]);
+                        pass.dispatch_workgroups(wg_x, wg_y, 1);
+                    }
+                    current_is_a = !current_is_a;
+                    let dummy_keep = last_tex_holder.take().unwrap_or_else(|| {
+                        upload_rgba8_texture(&self.device, &self.queue, 1, 1, &[0, 0, 0, 255])
+                    });
+                    mask_temp_resources.push((dummy_keep, mask_ubo, mask_bg));
+                }
             }
         }
 
         // Pass 3: Global Spatial Detail (Color NR, Luma NR, Texture, Clarity, Sharpening, Grain) + Transparent Cutout Alpha
-        let spatial_bg_keep = if need_spatial {
+        let spatial_bg_keep = if let Some((spatial_bgl, spatial_pipeline)) = spatial_pass {
             let spatial_scale = (out_w.max(out_h) as f32 / 1024.0).max(1.0);
             let u_spatial = SpatialUniforms {
                 dims: [out_w as f32, out_h as f32, spatial_scale, 0.0],
@@ -805,7 +1298,7 @@ impl WgpuDevelopEngine {
             };
             let spatial_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("kroma-spatial-bg"),
-                layout: &self.spatial_bgl,
+                layout: spatial_bgl,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -830,7 +1323,7 @@ impl WgpuDevelopEngine {
                     label: Some("kroma-spatial-pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.spatial_pipeline);
+                pass.set_pipeline(spatial_pipeline);
                 pass.set_bind_group(0, &spatial_bg, &[]);
                 pass.dispatch_workgroups(wg_x, wg_y, 1);
             }
@@ -875,6 +1368,7 @@ impl WgpuDevelopEngine {
         // Keep bind groups alive until submit completes
         drop(spatial_bg_keep);
         drop(mask_temp_resources);
+        drop(inpaint_temp_resources);
         drop(grade_bg);
 
         let readback_result: Result<(Vec<f32>, Option<Vec<f32>>), AppError> = (|| {
@@ -1629,5 +2123,147 @@ mod tests {
             .expect("cpu masks + backdrop");
         // Allow tiny 2/255 margin for 8-bit spatial mask quantization on radial gradient boundaries
         assert_images_match("local masks + backdrop", &gpu_mk, &cpu_mk, 2.0 / 255.0);
+
+        // 5. Phase 1 + Phase 2 Retouching (Spot Heal circle + stray-hair stroke + Clone +
+        //    3-Band Frequency Separation + Landmark-Guided Eye/Under-Eye/Teeth/Lip)
+        use kroma_domain::retouch::{HealSpot, HealSpotMode, PortraitFaceGuide, PortraitRetouch};
+        let portrait_buf = synthetic_srgb_buffer(64, 64);
+        let mut retouch_recipe = DevelopRecipe::default();
+        retouch_recipe.retouch.heal_spots.push(HealSpot {
+            id: "spot-1".to_string(),
+            mode: HealSpotMode::Heal,
+            target_x: 0.44,
+            target_y: 0.48,
+            source_x: 0.54,
+            source_y: 0.48,
+            radius: 0.06,
+            feather: 0.55,
+            opacity: 0.95,
+            points: vec![[0.44, 0.48]],
+        });
+        retouch_recipe.retouch.heal_spots.push(HealSpot {
+            id: "stroke-2".to_string(),
+            mode: HealSpotMode::Heal,
+            target_x: 0.36,
+            target_y: 0.30,
+            source_x: 0.46,
+            source_y: 0.30,
+            radius: 0.04,
+            feather: 0.5,
+            opacity: 0.9,
+            points: vec![[0.36, 0.30], [0.42, 0.33], [0.48, 0.35]],
+        });
+        retouch_recipe.retouch.heal_spots.push(HealSpot {
+            id: "clone-3".to_string(),
+            mode: HealSpotMode::Clone,
+            target_x: 0.72,
+            target_y: 0.72,
+            source_x: 0.25,
+            source_y: 0.25,
+            radius: 0.05,
+            feather: 0.4,
+            opacity: 0.85,
+            points: vec![],
+        });
+        retouch_recipe.retouch.portrait = PortraitRetouch {
+            enabled: true,
+            skin_smoothing: 60,
+            skin_texture_preserve: 70,
+            skin_tone_evenness: 45,
+            shine_removal: 40,
+            under_eye_brighten: 40,
+            eye_enhance: 35,
+            teeth_whiten: 50,
+            lip_enhance: 30,
+        };
+
+        let guide = PortraitFaceGuide::from_normalized(
+            0.25,
+            0.20,
+            0.50,
+            0.55,
+            [0.40, 0.40],
+            [0.60, 0.40],
+            [0.50, 0.52],
+            [0.42, 0.64],
+            [0.58, 0.64],
+        );
+
+        let (gpu_rt, _) = gpu
+            .process_buffer_with_alpha_and_faces_f32(&portrait_buf, &retouch_recipe, None, &[guide])
+            .expect("gpu retouch");
+        let (cpu_rt, _) = cpu
+            .process_buffer_with_alpha_cpu_with_faces_f32(&portrait_buf, &retouch_recipe, &[guide])
+            .expect("cpu retouch");
+        assert_images_match(
+            "spot heal + portrait frequency separation",
+            &gpu_rt,
+            &cpu_rt,
+            tolerance,
+        );
+
+        // 6. Phase 3 Generative InpaintPatch + BiSeNet 4-Channel FaceParseMap GPU-vs-CPU parity
+        use crate::vision::lama_inpainter::{generate_inpaint_patch, InpaintStrokeInput};
+        let synthetic_rgb8 = image::RgbImage::from_fn(64, 64, |x, y| {
+            image::Rgb([
+                ((x * 4) % 256) as u8,
+                ((y * 4) % 256) as u8,
+                (((x + y) * 2) % 256) as u8,
+            ])
+        });
+        let generated_patch = generate_inpaint_patch(
+            &synthetic_rgb8,
+            &[InpaintStrokeInput {
+                radius: 0.10,
+                points: vec![[0.28, 0.28], [0.36, 0.30]],
+            }],
+            None,
+        )
+        .expect("generate synthetic inpaint patch");
+        retouch_recipe.retouch.inpaint_patches.push(generated_patch.patch);
+
+        let mut parse_rgba = vec![0u8; 32 * 32 * 4];
+        for py in 0..32 {
+            for px in 0..32 {
+                let i = (py * 32 + px) * 4;
+                let in_face = (8..24).contains(&px) && (6..26).contains(&py);
+                let in_eye = ((11..15).contains(&px) || (17..21).contains(&px)) && (12..14).contains(&py);
+                let in_teeth = (13..19).contains(&px) && py == 20;
+                let in_lip = (12..20).contains(&px) && (py == 19 || py == 21);
+                parse_rgba[i] = if in_face && !in_eye && !in_teeth && !in_lip { 240 } else { 0 };
+                parse_rgba[i + 1] = if in_eye { 230 } else { 0 };
+                parse_rgba[i + 2] = if in_teeth { 220 } else { 0 };
+                parse_rgba[i + 3] = if in_lip { 225 } else { 0 };
+            }
+        }
+        let face_parse = FaceParseMap {
+            width: 32,
+            height: 32,
+            rgba: parse_rgba,
+        };
+
+        let (gpu_p3, _) = gpu
+            .process_buffer_with_alpha_and_retouch_f32(
+                &portrait_buf,
+                &retouch_recipe,
+                None,
+                &[guide],
+                Some(&face_parse),
+            )
+            .expect("gpu phase 3 retouch");
+        let (cpu_p3, _) = cpu
+            .process_buffer_with_alpha_cpu_with_retouch_f32(
+                &portrait_buf,
+                &retouch_recipe,
+                &[guide],
+                Some(&face_parse),
+            )
+            .expect("cpu phase 3 retouch");
+        assert_images_match(
+            "phase 3 inpaint patch + BiSeNet face parse map",
+            &gpu_p3,
+            &cpu_p3,
+            tolerance,
+        );
     }
 }

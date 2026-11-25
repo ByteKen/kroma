@@ -33,6 +33,7 @@ import type {
   ModelDownloadProgress,
   ModelInspectionResult,
   ModelManifestStatus,
+  OptionalRetouchModelId,
   RuntimeInfo,
   ScanProgressUpdate,
   StorageCacheSummary,
@@ -57,6 +58,7 @@ import {
   type RelativeDevelopDelta,
 } from '../domain/develop';
 import type {
+  DevelopBufferLoadPriority,
   DevelopWorkingBuffer,
   WorkingBufferPrecision,
 } from '../domain/developWorkingBuffer';
@@ -69,6 +71,9 @@ import {
   type PhotoRecipeDiff,
 } from '../domain/developHistory';
 import {
+  compareNaturalAlphabetical,
+  comparePhotosAlphabetically,
+  compareSubjectClustersAlphabetically,
   countClusterReviewWarnings,
   needsVisualMatchReview,
   type SubjectCluster,
@@ -76,6 +81,12 @@ import {
 import type { AiMaskKind, GeneratedAiMaskResult } from '../domain/masking';
 import type { OutputNamingRule } from '../domain/organization';
 import type { PhotoAsset } from '../domain/photo';
+import {
+  decodeFaceParseMapDto,
+  type FaceParseMapData,
+  type GeneratedInpaintPatchResult,
+  type InpaintStrokeInput,
+} from '../domain/retouch';
 import {
   mergeSlateOcrResults,
   type ClusterSlateOcrResult,
@@ -117,7 +128,7 @@ export type StartupBootPhase =
   | 'update_prompt'
   | 'ready';
 export type GridDisplayMode = 'grid' | 'split' | 'loupe';
-export type AnchorSortMode = 'capture_time' | 'confidence' | 'exposures';
+export type AnchorSortMode = 'alphabetical' | 'capture_time' | 'confidence' | 'exposures';
 export type SyncTargetScope = 'selected_in_cluster' | 'entire_cluster' | 'entire_shoot';
 export type DevelopSourceMode = 'folders' | 'subjects';
 
@@ -158,6 +169,8 @@ interface StudioContextValue {
   modelManifestStatus: ModelManifestStatus | null;
   modelDownloadProgress: ModelDownloadProgress | null;
   modelDownloadError: string | null;
+  downloadingOptionalModelId: OptionalRetouchModelId | null;
+  faceParseMapsByPhotoId: Readonly<Record<string, FaceParseMapData>>;
   startupUpdate: AppUpdateCheckResult | null;
   isScanningFolder: boolean;
   isScanningOcr: boolean;
@@ -214,6 +227,8 @@ interface StudioContextValue {
 
   // Commands
   retryModelDownload: () => Promise<void>;
+  downloadOptionalModel: (modelId: OptionalRetouchModelId) => Promise<boolean>;
+  cancelOptionalModelDownload: () => Promise<void>;
   continueWithoutModels: () => Promise<void>;
   dismissStartupUpdate: () => void;
   setActiveWorkspace: (view: WorkspaceView) => void;
@@ -227,7 +242,7 @@ interface StudioContextValue {
   inspectOnnxModel: (modelPath: string, role: AiModelRole) => Promise<ModelInspectionResult | null>;
   applyCustomAiModel: (role: AiModelRole, modelPath: string | null) => Promise<boolean>;
   setDevelopSourceMode: (mode: DevelopSourceMode) => void;
-  selectDevelopFolder: (folderId: string | null) => void;
+  selectDevelopFolder: (folderId: string | null, initialPhotoId?: string) => void;
   openShootFolder: () => Promise<void>;
   openPhotoFiles: () => Promise<void>;
   openParentFolder: () => Promise<void>;
@@ -286,10 +301,17 @@ interface StudioContextValue {
     photoId: string,
     maxDim?: number,
     precision?: WorkingBufferPrecision,
+    priority?: DevelopBufferLoadPriority,
   ) => Promise<DevelopWorkingBuffer | null>;
   getPhotoNativeDimensions: (
     photoId: string,
   ) => Promise<{ readonly width: number; readonly height: number } | null>;
+  detectPhotoFaceOverlay: (photoId: string) => Promise<PhotoAsset['faceOverlay']>;
+  parsePhotoFaceRetouchMap: (photoId: string) => Promise<FaceParseMapData | null>;
+  inpaintPhotoRegion: (
+    photoId: string,
+    strokes: readonly InpaintStrokeInput[],
+  ) => Promise<GeneratedInpaintPatchResult | null>;
   generateAiMask: (photoId: string, kind: AiMaskKind) => Promise<GeneratedAiMaskResult | null>;
   updatePhotoRecipe: (
     photoId: string,
@@ -356,6 +378,11 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     null,
   );
   const [modelDownloadError, setModelDownloadError] = useState<string | null>(null);
+  const [downloadingOptionalModelId, setDownloadingOptionalModelId] =
+    useState<OptionalRetouchModelId | null>(null);
+  const [faceParseMapsByPhotoId, setFaceParseMapsByPhotoId] = useState<
+    Readonly<Record<string, FaceParseMapData>>
+  >({});
   const [startupUpdate, setStartupUpdate] = useState<AppUpdateCheckResult | null>(null);
   const mountedRef = useRef(true);
   const initialSessionPromiseRef = useRef<Promise<void>>(Promise.resolve());
@@ -398,7 +425,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
   const setActiveWorkspace = useCallback((next: WorkspaceView) => {
     const resolvedNext: WorkspaceView =
       sessionModeRef.current === 'single' &&
-      (next === 'culling' || next === 'slate_ocr' || next === 'review_queue')
+        (next === 'culling' || next === 'slate_ocr' || next === 'review_queue')
         ? 'develop'
         : next;
     if (resolvedNext !== 'develop') {
@@ -476,7 +503,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     Map<string, { timerId: number; recipe: DevelopRecipe }>
   >(new Map());
   const pendingDraftCommitTimerRef = useRef<number | null>(null);
-  const commitPendingLiveDraftRef = useRef<() => void>(() => {});
+  const commitPendingLiveDraftRef = useRef<() => void>(() => { });
   const activeFolderPathRef = useRef<string | null>(null);
   const lastSelectedPhotoIdRef = useRef<string | null>(null);
   const sessionRef = useRef<StudioSessionSnapshot | null>(null);
@@ -620,7 +647,11 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       const modelsChanged =
         next.customDetectorModelPath !== preferences.customDetectorModelPath ||
         next.customRecognizerModelPath !== preferences.customRecognizerModelPath ||
-        next.customSegmenterModelPath !== preferences.customSegmenterModelPath;
+        next.customSegmenterModelPath !== preferences.customSegmenterModelPath ||
+        next.customFaceParserModelPath !== preferences.customFaceParserModelPath ||
+        next.customLamaModelPath !== preferences.customLamaModelPath;
+      const faceParserChanged =
+        next.customFaceParserModelPath !== preferences.customFaceParserModelPath;
       const gpuChanged = next.enableGpuAcceleration !== preferences.enableGpuAcceleration;
       const cacheDirChanged = next.customCacheDir !== preferences.customCacheDir;
       const thumbnailModeChanged =
@@ -632,9 +663,14 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
             next.customDetectorModelPath,
             next.customRecognizerModelPath,
             next.customSegmenterModelPath,
+            next.customFaceParserModelPath,
+            next.customLamaModelPath,
           );
           if (updatedInfo) {
             setRuntimeInfo(updatedInfo);
+          }
+          if (faceParserChanged) {
+            setFaceParseMapsByPhotoId({});
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -685,6 +721,8 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       preferences.customDetectorModelPath,
       preferences.customRecognizerModelPath,
       preferences.customSegmenterModelPath,
+      preferences.customFaceParserModelPath,
+      preferences.customLamaModelPath,
       preferences.enableGpuAcceleration,
       preferences.customCacheDir,
       preferences.thumbnailPreviewMode,
@@ -703,7 +741,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
     saveStudioPreferencesToStorage(defaults);
     if (isDesktopRuntime && gateway.setCustomAiModels) {
       void gateway
-        .setCustomAiModels(null, null, null)
+        .setCustomAiModels(null, null, null, null, null)
         .then((info) => {
           if (info) setRuntimeInfo(info);
         })
@@ -757,6 +795,10 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
         role === 'recognizer' ? modelPath : preferences.customRecognizerModelPath;
       const nextSegmenter =
         role === 'segmenter' ? modelPath : preferences.customSegmenterModelPath;
+      const nextFaceParser =
+        role === 'face_parser' ? modelPath : preferences.customFaceParserModelPath;
+      const nextLama =
+        role === 'inpainter' ? modelPath : preferences.customLamaModelPath;
 
       if (isDesktopRuntime && gateway.setCustomAiModels) {
         try {
@@ -764,9 +806,14 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
             nextDetector,
             nextRecognizer,
             nextSegmenter,
+            nextFaceParser,
+            nextLama,
           );
           if (updatedInfo) {
             setRuntimeInfo(updatedInfo);
+          }
+          if (role === 'face_parser') {
+            setFaceParseMapsByPhotoId({});
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -780,7 +827,11 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
           ? { customDetectorModelPath: modelPath }
           : role === 'recognizer'
             ? { customRecognizerModelPath: modelPath }
-            : { customSegmenterModelPath: modelPath },
+            : role === 'segmenter'
+              ? { customSegmenterModelPath: modelPath }
+              : role === 'face_parser'
+                ? { customFaceParserModelPath: modelPath }
+                : { customLamaModelPath: modelPath },
       );
 
       const roleLabel =
@@ -788,7 +839,11 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
           ? 'face detector'
           : role === 'recognizer'
             ? 'face recognition'
-            : 'subject masking';
+            : role === 'segmenter'
+              ? 'subject masking'
+              : role === 'face_parser'
+                ? 'face parsing'
+                : 'object removal';
       if (modelPath) {
         const fileName = modelPath.split(/[\\/]/).pop() ?? modelPath;
         notifyAction(`Activated custom ${roleLabel} model: ${fileName}`);
@@ -803,6 +858,8 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       preferences.customDetectorModelPath,
       preferences.customRecognizerModelPath,
       preferences.customSegmenterModelPath,
+      preferences.customFaceParserModelPath,
+      preferences.customLamaModelPath,
       updatePreferences,
       notifyAction,
     ],
@@ -968,6 +1025,7 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
         activeFolderPathRef.current !== loaded.folderPath
       ) {
         clearDevelopBitmapCache();
+        setFaceParseMapsByPhotoId({});
       }
       sessionModeRef.current = loaded.sessionMode ?? 'folder';
       setSession(loaded);
@@ -1070,6 +1128,64 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       await runStartupUpdateCheckPhase();
     }
   }, [downloadModelsForStartup, runStartupUpdateCheckPhase]);
+
+  const downloadOptionalModel = useCallback(
+    async (modelId: OptionalRetouchModelId): Promise<boolean> => {
+      if (!isDesktopRuntime || !gateway.downloadOptionalModel) {
+        notifyAction('Installing optional AI model packs requires Kroma Desktop');
+        return false;
+      }
+      if (downloadingOptionalModelId !== null) {
+        notifyAction('Another AI model pack download is already in progress');
+        return false;
+      }
+      const friendlyName =
+        modelId === 'bisenet-face-parsing'
+          ? 'BiSeNet Face Parsing'
+          : 'LaMa Generative Object Removal';
+      setDownloadingOptionalModelId(modelId);
+      setModelDownloadProgress(null);
+      notifyAction(`Downloading ${friendlyName}…`);
+      try {
+        const outcome = await gateway.downloadOptionalModel(modelId);
+        if (!mountedRef.current) return false;
+        if (outcome) {
+          setModelManifestStatus(outcome.manifest);
+          setRuntimeInfo(outcome.runtime);
+        }
+        if (modelId === 'bisenet-face-parsing') {
+          setFaceParseMapsByPhotoId({});
+        }
+        setModelDownloadProgress(null);
+        notifyAction(`${friendlyName} installed and ready`);
+        return true;
+      } catch (err) {
+        if (!mountedRef.current) return false;
+        const msg = err instanceof Error ? err.message : String(err);
+        setModelDownloadProgress(null);
+        if (msg.toLowerCase().includes('cancel')) {
+          notifyAction(`Cancelled ${friendlyName} download`);
+        } else {
+          notifyAction(`Download failed: ${msg}`);
+        }
+        return false;
+      } finally {
+        if (mountedRef.current) {
+          setDownloadingOptionalModelId(null);
+        }
+      }
+    },
+    [isDesktopRuntime, gateway, downloadingOptionalModelId, notifyAction],
+  );
+
+  const cancelOptionalModelDownload = useCallback(async () => {
+    if (!gateway.cancelModelDownloads) return;
+    try {
+      await gateway.cancelModelDownloads();
+    } catch {
+      // Ignore cancel errors cleanly
+    }
+  }, [gateway]);
 
   const continueWithoutModels = useCallback(async () => {
     if (gateway.cancelModelDownloads) {
@@ -1204,13 +1320,17 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
         gateway.setCustomAiModels &&
         (initialPrefs.customDetectorModelPath ||
           initialPrefs.customRecognizerModelPath ||
-          initialPrefs.customSegmenterModelPath)
+          initialPrefs.customSegmenterModelPath ||
+          initialPrefs.customFaceParserModelPath ||
+          initialPrefs.customLamaModelPath)
       ) {
         try {
           const info = await gateway.setCustomAiModels(
             initialPrefs.customDetectorModelPath,
             initialPrefs.customRecognizerModelPath,
             initialPrefs.customSegmenterModelPath,
+            initialPrefs.customFaceParserModelPath,
+            initialPrefs.customLamaModelPath,
           );
           if (active && info) {
             setRuntimeInfo(info);
@@ -1225,6 +1345,8 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
             customDetectorModelPath: null,
             customRecognizerModelPath: null,
             customSegmenterModelPath: null,
+            customFaceParserModelPath: null,
+            customLamaModelPath: null,
           });
         }
       }
@@ -1362,18 +1484,33 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       };
     });
 
-    if (anchorSortMode === 'confidence') {
+    if (anchorSortMode === 'alphabetical') {
+      enriched.sort(compareSubjectClustersAlphabetically);
+    } else if (anchorSortMode === 'confidence') {
       enriched.sort((a, b) => {
         if (b.anchor.ambiguousCount !== a.anchor.ambiguousCount) {
           return b.anchor.ambiguousCount - a.anchor.ambiguousCount;
         }
-        return a.anchor.ocrConfidencePct - b.anchor.ocrConfidencePct;
+        if (a.anchor.ocrConfidencePct !== b.anchor.ocrConfidencePct) {
+          return a.anchor.ocrConfidencePct - b.anchor.ocrConfidencePct;
+        }
+        return compareSubjectClustersAlphabetically(a, b);
       });
     } else if (anchorSortMode === 'exposures') {
-      enriched.sort((a, b) => b.photos.length - a.photos.length);
+      enriched.sort(
+        (a, b) =>
+          b.photos.length - a.photos.length || compareSubjectClustersAlphabetically(a, b),
+      );
     }
     return enriched;
   }, [session, anchorSortMode, reviewWarningThreshold, resolvedAmbiguousIds]);
+
+  const sortedDirectories = useMemo(() => {
+    if (!session) return [];
+    return [...session.directories].sort((a, b) =>
+      compareNaturalAlphabetical(a.name, b.name),
+    );
+  }, [session]);
 
   const activeCluster = useMemo(() => {
     if (!session) return null;
@@ -1388,11 +1525,13 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
   const developPhotos = useMemo<readonly PhotoAsset[]>(() => {
     if (!session) return [];
     if (effectiveDevelopSourceMode === 'subjects' && activeCluster) {
-      return activeCluster.photos;
+      return [...activeCluster.photos].sort(comparePhotosAlphabetically);
     }
     const all = session.clusters.flatMap((c) => c.photos);
-    if (!activeDevelopFolderId) return all;
-    return all.filter((p) => p.directoryId === activeDevelopFolderId);
+    const scoped = activeDevelopFolderId
+      ? all.filter((p) => p.directoryId === activeDevelopFolderId)
+      : all;
+    return [...scoped].sort(comparePhotosAlphabetically);
   }, [session, effectiveDevelopSourceMode, activeCluster, activeDevelopFolderId]);
 
   const activeDevelopScopeLabel = useMemo(() => {
@@ -1426,15 +1565,17 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
 
   const visibleClusterPhotos = useMemo(() => {
     if (!activeCluster) return [];
-    return filterClusterPhotos(activeCluster.photos, {
-      sfaceThreshold,
-      reviewWarningThreshold,
-      activeDirectoryId,
-      activeVirtualFolderId,
-      allowedVirtualFolderIds: activeVirtualFolderAllowedIds,
-      smartBin,
-      searchQuery,
-    });
+    return [
+      ...filterClusterPhotos(activeCluster.photos, {
+        sfaceThreshold,
+        reviewWarningThreshold,
+        activeDirectoryId,
+        activeVirtualFolderId,
+        allowedVirtualFolderIds: activeVirtualFolderAllowedIds,
+        smartBin,
+        searchQuery,
+      }),
+    ].sort(comparePhotosAlphabetically);
   }, [
     activeCluster,
     sfaceThreshold,
@@ -1490,7 +1631,13 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       }
     }
 
-    return items;
+    return items.sort(
+      (a, b) =>
+        compareNaturalAlphabetical(
+          a.candidateCluster.anchor.subjectName,
+          b.candidateCluster.anchor.subjectName,
+        ) || comparePhotosAlphabetically(a.photo, b.photo),
+    );
   }, [session, reviewWarningThreshold, resolvedAmbiguousIds]);
 
   const openShootFolder = useCallback(async () => {
@@ -1771,14 +1918,15 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       setDevelopSourceModeState(mode);
       setLiveHistogram(null);
       if (!session) return;
-      const pool =
-        mode === 'subjects' && activeCluster
+      const pool = [
+        ...(mode === 'subjects' && activeCluster
           ? activeCluster.photos
           : activeDevelopFolderId
             ? session.clusters
               .flatMap((c) => c.photos)
               .filter((p) => p.directoryId === activeDevelopFolderId)
-            : session.clusters.flatMap((c) => c.photos);
+            : session.clusters.flatMap((c) => c.photos)),
+      ].sort(comparePhotosAlphabetically);
       const nonSlates = pool.filter((p) => !p.isSlateAnchor);
       setSelectedPhotoIds(new Set());
       setActiveDevelopPhotoId(nonSlates[0]?.id ?? pool[0]?.id ?? null);
@@ -1787,16 +1935,22 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
   );
 
   const selectDevelopFolder = useCallback(
-    (folderId: string | null) => {
+    (folderId: string | null, initialPhotoId?: string) => {
       commitPendingLiveDraftRef.current();
       setDevelopSourceModeState('folders');
       setActiveDevelopFolderId(folderId);
       setLiveHistogram(null);
       if (!session) return;
       const all = session.clusters.flatMap((c) => c.photos);
-      const filtered = folderId ? all.filter((p) => p.directoryId === folderId) : all;
-      const nonSlates = filtered.filter((p) => !p.isSlateAnchor);
+      const filtered = [...(folderId ? all.filter((p) => p.directoryId === folderId) : all)].sort(
+        comparePhotosAlphabetically,
+      );
       setSelectedPhotoIds(new Set());
+      if (initialPhotoId && filtered.some((p) => p.id === initialPhotoId)) {
+        setActiveDevelopPhotoId(initialPhotoId);
+        return;
+      }
+      const nonSlates = filtered.filter((p) => !p.isSlateAnchor);
       setActiveDevelopPhotoId(nonSlates[0]?.id ?? filtered[0]?.id ?? null);
     },
     [session],
@@ -1809,9 +1963,10 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       setLiveHistogram(null);
       const next = session?.clusters.find((c) => c.anchor.id === clusterId);
       if (next) {
-        const nonSlates = next.photos.filter((p) => !p.isSlateAnchor);
+        const ordered = [...next.photos].sort(comparePhotosAlphabetically);
+        const nonSlates = ordered.filter((p) => !p.isSlateAnchor);
         setSelectedPhotoIds(new Set());
-        setActiveDevelopPhotoId(nonSlates[0]?.id ?? next.photos[0]?.id ?? null);
+        setActiveDevelopPhotoId(nonSlates[0]?.id ?? ordered[0]?.id ?? null);
       }
     },
     [session],
@@ -2125,9 +2280,10 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       photoId: string,
       maxDim = 1600,
       precision: WorkingBufferPrecision = 'f16',
+      priority: DevelopBufferLoadPriority = 'active',
     ): Promise<DevelopWorkingBuffer | null> => {
       if (!gateway.loadDevelopWorkingBuffer) return null;
-      return gateway.loadDevelopWorkingBuffer(photoId, maxDim, precision);
+      return gateway.loadDevelopWorkingBuffer(photoId, maxDim, precision, priority);
     },
     [gateway],
   );
@@ -2140,6 +2296,69 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       return gateway.getPhotoNativeDimensions(photoId);
     },
     [gateway],
+  );
+
+  const detectPhotoFaceOverlay = useCallback(
+    async (photoId: string): Promise<PhotoAsset['faceOverlay']> => {
+      if (!gateway.detectPhotoFaceOverlay) return null;
+      try {
+        const overlay = await gateway.detectPhotoFaceOverlay(photoId);
+        if (overlay) {
+          setSession((prev) => {
+            if (!prev) return prev;
+            let touched = false;
+            const nextClusters = prev.clusters.map((cluster) => {
+              const idx = cluster.photos.findIndex((photo) => photo.id === photoId);
+              if (idx === -1) return cluster;
+              touched = true;
+              const nextPhotos = cluster.photos.slice();
+              nextPhotos[idx] = { ...nextPhotos[idx], faceOverlay: overlay };
+              return { ...cluster, photos: nextPhotos };
+            });
+            return touched ? { ...prev, clusters: nextClusters } : prev;
+          });
+        }
+        return overlay;
+      } catch (err) {
+        notifyAction(`Face detect error: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      }
+    },
+    [gateway, notifyAction],
+  );
+
+  const parsePhotoFaceRetouchMap = useCallback(
+    async (photoId: string): Promise<FaceParseMapData | null> => {
+      if (!gateway.parsePhotoFaceRetouchMap) return null;
+      try {
+        const dto = await gateway.parsePhotoFaceRetouchMap(photoId);
+        const decoded = decodeFaceParseMapDto(dto);
+        if (decoded) {
+          setFaceParseMapsByPhotoId((prev) => ({ ...prev, [photoId]: decoded }));
+        }
+        return decoded;
+      } catch (err) {
+        notifyAction(`Face parsing error: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      }
+    },
+    [gateway, notifyAction],
+  );
+
+  const inpaintPhotoRegion = useCallback(
+    async (
+      photoId: string,
+      strokes: readonly InpaintStrokeInput[],
+    ): Promise<GeneratedInpaintPatchResult | null> => {
+      if (!gateway.inpaintPhotoRegion) return null;
+      try {
+        return await gateway.inpaintPhotoRegion(photoId, strokes);
+      } catch (err) {
+        notifyAction(`AI Remove error: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      }
+    },
+    [gateway, notifyAction],
   );
 
   const generateAiMask = useCallback(
@@ -3153,8 +3372,8 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
 
   const sessionWithSortedClusters = useMemo(() => {
     if (!session) return null;
-    return { ...session, clusters: sortedClusters };
-  }, [session, sortedClusters]);
+    return { ...session, clusters: sortedClusters, directories: sortedDirectories };
+  }, [session, sortedClusters, sortedDirectories]);
 
   const value = useMemo<StudioContextValue>(
     () => ({
@@ -3164,6 +3383,8 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       modelManifestStatus,
       modelDownloadProgress,
       modelDownloadError,
+      downloadingOptionalModelId,
+      faceParseMapsByPhotoId,
       startupUpdate,
       isScanningFolder,
       isScanningOcr,
@@ -3218,6 +3439,8 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       isWindowMaximized,
       settingsOpen,
       retryModelDownload,
+      downloadOptionalModel,
+      cancelOptionalModelDownload,
       continueWithoutModels,
       dismissStartupUpdate,
       setActiveWorkspace,
@@ -3278,6 +3501,9 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       peekDevelopWorkingBuffer,
       loadDevelopWorkingBuffer,
       getPhotoNativeDimensions,
+      detectPhotoFaceOverlay,
+      parsePhotoFaceRetouchMap,
+      inpaintPhotoRegion,
       generateAiMask,
       updatePhotoRecipe,
       syncRecipeFromPhoto,
@@ -3315,6 +3541,8 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       modelManifestStatus,
       modelDownloadProgress,
       modelDownloadError,
+      downloadingOptionalModelId,
+      faceParseMapsByPhotoId,
       startupUpdate,
       isScanningFolder,
       isScanningOcr,
@@ -3369,6 +3597,8 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       isWindowMaximized,
       settingsOpen,
       retryModelDownload,
+      downloadOptionalModel,
+      cancelOptionalModelDownload,
       continueWithoutModels,
       dismissStartupUpdate,
       setActiveWorkspace,
@@ -3429,6 +3659,9 @@ export function StudioProvider({ gateway, children }: StudioProviderProps) {
       peekDevelopWorkingBuffer,
       loadDevelopWorkingBuffer,
       getPhotoNativeDimensions,
+      detectPhotoFaceOverlay,
+      parsePhotoFaceRetouchMap,
+      inpaintPhotoRegion,
       generateAiMask,
       updatePhotoRecipe,
       syncRecipeFromPhoto,

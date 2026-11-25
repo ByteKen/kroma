@@ -533,6 +533,140 @@ pub fn decode_kr16_downscaled_rgb32f(kr16_bytes: &[u8], max_dim: u32) -> Option<
     })
 }
 
+/// Decodes either a `KR16` (RGBA16F) or `KR32` (RGBA32F) cached Studio working buffer into a
+/// `DecodedDevelopBuffer` (optionally box-downscaled to `max_dim`), preserving scene-linear
+/// Rec.2020 RAW flags so features like AI Remove grade identically to Studio's 32-bit canvas
+/// without re-demosaicing the original RAW file from disk.
+pub fn decode_working_wire_downscaled_rgb32f(
+    wire_bytes: &[u8],
+    max_dim: u32,
+) -> Option<DecodedDevelopBuffer> {
+    if wire_bytes.len() < 16 {
+        return None;
+    }
+    if &wire_bytes[0..4] == KR16_MAGIC {
+        return decode_kr16_downscaled_rgb32f(wire_bytes, max_dim);
+    }
+    if &wire_bytes[0..4] != KR32_MAGIC {
+        return None;
+    }
+
+    let sw = u32::from_le_bytes(wire_bytes[4..8].try_into().ok()?);
+    let sh = u32::from_le_bytes(wire_bytes[8..12].try_into().ok()?);
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    let flags = wire_bytes[12];
+    let bit_depth = wire_bytes[13];
+    let expected_len = 16usize.checked_add((sw as usize).checked_mul(sh as usize)?.checked_mul(16)?)?;
+    if wire_bytes.len() < expected_len {
+        return None;
+    }
+
+    let (dw, dh) = if max_dim == 0 || sw.max(sh) <= max_dim {
+        (sw, sh)
+    } else {
+        let scale = (max_dim as f32) / (sw.max(sh) as f32);
+        (
+            ((sw as f32) * scale).round().max(1.0) as u32,
+            ((sh as f32) * scale).round().max(1.0) as u32,
+        )
+    };
+
+    let sw_u = sw as usize;
+    let sh_u = sh as usize;
+    let dw_u = dw as usize;
+    let dh_u = dh as usize;
+    let payload = &wire_bytes[16..expected_len];
+    let rx = (sw as f32) / (dw as f32);
+    let ry = (sh as f32) / (dh as f32);
+
+    let mut out = vec![0.0_f32; dw_u * dh_u * 3];
+    if sw_u == dw_u && sh_u == dh_u {
+        out.par_chunks_exact_mut(dw_u * 3)
+            .enumerate()
+            .for_each(|(y, row)| {
+                let row_off = y * sw_u * 16;
+                for x in 0..dw_u {
+                    let o = row_off + x * 16;
+                    let dst = x * 3;
+                    row[dst] = f32::from_le_bytes([
+                        payload[o],
+                        payload[o + 1],
+                        payload[o + 2],
+                        payload[o + 3],
+                    ]);
+                    row[dst + 1] = f32::from_le_bytes([
+                        payload[o + 4],
+                        payload[o + 5],
+                        payload[o + 6],
+                        payload[o + 7],
+                    ]);
+                    row[dst + 2] = f32::from_le_bytes([
+                        payload[o + 8],
+                        payload[o + 9],
+                        payload[o + 10],
+                        payload[o + 11],
+                    ]);
+                }
+            });
+    } else {
+        out.par_chunks_exact_mut(dw_u * 3)
+            .enumerate()
+            .for_each(|(dy, row)| {
+                let sy0 = (((dy as f32) * ry).floor() as usize).min(sh_u - 1);
+                let sy1 = ((((dy + 1) as f32) * ry).ceil() as usize).clamp(sy0 + 1, sh_u);
+                for dx in 0..dw_u {
+                    let sx0 = (((dx as f32) * rx).floor() as usize).min(sw_u - 1);
+                    let sx1 = ((((dx + 1) as f32) * rx).ceil() as usize).clamp(sx0 + 1, sw_u);
+                    let mut sr = 0.0_f32;
+                    let mut sg = 0.0_f32;
+                    let mut sb = 0.0_f32;
+                    let mut count = 0_u32;
+                    for sy in sy0..sy1 {
+                        let row_off = sy * sw_u * 16;
+                        for sx in sx0..sx1 {
+                            let o = row_off + sx * 16;
+                            sr += f32::from_le_bytes([
+                                payload[o],
+                                payload[o + 1],
+                                payload[o + 2],
+                                payload[o + 3],
+                            ]);
+                            sg += f32::from_le_bytes([
+                                payload[o + 4],
+                                payload[o + 5],
+                                payload[o + 6],
+                                payload[o + 7],
+                            ]);
+                            sb += f32::from_le_bytes([
+                                payload[o + 8],
+                                payload[o + 9],
+                                payload[o + 10],
+                                payload[o + 11],
+                            ]);
+                            count += 1;
+                        }
+                    }
+                    let inv = 1.0 / (count.max(1) as f32);
+                    let dst = dx * 3;
+                    row[dst] = sr * inv;
+                    row[dst + 1] = sg * inv;
+                    row[dst + 2] = sb * inv;
+                }
+            });
+    }
+
+    let image = Rgb32FImage::from_raw(dw, dh, out)?;
+    Some(DecodedDevelopBuffer {
+        image,
+        is_linear: (flags & KR16_FLAG_LINEAR) != 0,
+        is_wide_gamut: (flags & KR_FLAG_WIDE_GAMUT_REC2020) != 0,
+        bit_depth,
+        is_raw_demosaic: (flags & KR16_FLAG_RAW_DEMOSAIC) != 0,
+    })
+}
+
 /// Encodes a `DecodedDevelopBuffer` into Kroma's zero-copy binary `KR16` wire format:
 /// - 16-byte aligned header (`"KR16"`, LE `width: u32`, LE `height: u32`, `flags: u8`, `bit_depth: u8`, `reserved: u16`)
 /// - Followed by `width * height * 4` little-endian IEEE 754 `f16` RGBA values (alpha = `1.0f16` = `0x3C00`),
@@ -1475,5 +1609,45 @@ mod tests {
         for px in down_checker.pixels() {
             assert_eq!(px.0, [100, 100, 100]);
         }
+    }
+
+    #[test]
+    fn working_wire_decoder_roundtrips_kr32_and_kr16_preserving_linear_hdr_flags() {
+        let mut hdr = Rgb32FImage::new(8, 4);
+        for px in hdr.pixels_mut() {
+            px.0 = [1.85, 0.42, 0.15];
+        }
+        let buf = DecodedDevelopBuffer {
+            image: hdr,
+            is_linear: true,
+            is_wide_gamut: true,
+            bit_depth: 32,
+            is_raw_demosaic: true,
+        };
+
+        let kr32 = encode_kr32_rgba32f(&buf);
+        let decoded_full =
+            decode_working_wire_downscaled_rgb32f(&kr32, 1600).expect("kr32 1:1 decode");
+        assert_eq!(decoded_full.image.dimensions(), (8, 4));
+        assert!(decoded_full.is_linear);
+        assert!(decoded_full.is_wide_gamut);
+        assert!(decoded_full.is_raw_demosaic);
+        let p = decoded_full.image.get_pixel(3, 2).0;
+        assert!((p[0] - 1.85).abs() < 1e-5);
+        assert!((p[1] - 0.42).abs() < 1e-5);
+        assert!((p[2] - 0.15).abs() < 1e-5);
+
+        let decoded_down =
+            decode_working_wire_downscaled_rgb32f(&kr32, 4).expect("kr32 downscaled decode");
+        assert_eq!(decoded_down.image.dimensions(), (4, 2));
+        assert!((decoded_down.image.get_pixel(1, 1).0[0] - 1.85).abs() < 1e-4);
+
+        let kr16 = encode_kr16_rgba16f(&buf);
+        let decoded_kr16 =
+            decode_working_wire_downscaled_rgb32f(&kr16, 1600).expect("kr16 wire decode");
+        assert_eq!(decoded_kr16.image.dimensions(), (8, 4));
+        assert!(decoded_kr16.is_linear);
+        assert!(decoded_kr16.is_wide_gamut);
+        assert!((decoded_kr16.image.get_pixel(0, 0).0[0] - 1.85).abs() < 0.01);
     }
 }

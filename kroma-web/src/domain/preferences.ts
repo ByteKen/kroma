@@ -5,7 +5,7 @@ import { DEFAULT_OUTPUT_NAMING_RULE } from './organization';
 export type DefaultOpenWorkspace = 'develop' | 'culling';
 export type StudioPreviewMaxDim = 1600 | 2048 | 2560;
 export type ThumbnailPreviewMode = 'fast' | 'edited_32bit' | 'all_32bit';
-export type DefaultSubjectSortMode = 'capture_time' | 'confidence' | 'exposures';
+export type DefaultSubjectSortMode = 'alphabetical' | 'capture_time' | 'confidence' | 'exposures';
 export type CanvasBackdropTone = 'obsidian' | 'charcoal' | 'neutral_gray';
 export type InterfaceScalePct = 90 | 100 | 110;
 
@@ -41,6 +41,8 @@ export interface StudioPreferences {
   readonly customDetectorModelPath: string | null;
   readonly customRecognizerModelPath: string | null;
   readonly customSegmenterModelPath: string | null;
+  readonly customFaceParserModelPath: string | null;
+  readonly customLamaModelPath: string | null;
   readonly defaultDeliveryMode: ExportDeliveryMode;
   readonly defaultRenderFormat: ExportRenderFormat;
   readonly defaultJpegQuality: number;
@@ -59,7 +61,7 @@ export const DEFAULT_STUDIO_PREFERENCES: StudioPreferences = {
   showLandmarksOverlay: true,
   openLastProjectOnStartup: false,
   defaultOpenWorkspace: 'develop',
-  defaultSubjectSortMode: 'capture_time',
+  defaultSubjectSortMode: 'alphabetical',
   canvasBackdropTone: 'charcoal',
   interfaceScale: 100,
   showThumbnailMetadata: true,
@@ -71,6 +73,8 @@ export const DEFAULT_STUDIO_PREFERENCES: StudioPreferences = {
   customDetectorModelPath: null,
   customRecognizerModelPath: null,
   customSegmenterModelPath: null,
+  customFaceParserModelPath: null,
+  customLamaModelPath: null,
   defaultDeliveryMode: 'develop',
   defaultRenderFormat: 'jpeg',
   defaultJpegQuality: 94,
@@ -148,6 +152,18 @@ export function normalizeStudioPreferences(raw: unknown): StudioPreferences {
       ? obj.customSegmenterModelPath.trim()
       : null;
 
+  const customFaceParserModelPath =
+    typeof obj.customFaceParserModelPath === 'string' &&
+      obj.customFaceParserModelPath.trim().length > 0
+      ? obj.customFaceParserModelPath.trim()
+      : null;
+
+  const customLamaModelPath =
+    typeof obj.customLamaModelPath === 'string' &&
+      obj.customLamaModelPath.trim().length > 0
+      ? obj.customLamaModelPath.trim()
+      : null;
+
   const rawNamingPattern =
     typeof obj.defaultNamingPattern === 'string' ? obj.defaultNamingPattern.trim() : '';
   const defaultNamingPattern =
@@ -190,15 +206,16 @@ export function normalizeStudioPreferences(raw: unknown): StudioPreferences {
         ? obj.defaultOpenWorkspace
         : DEFAULT_STUDIO_PREFERENCES.defaultOpenWorkspace,
     defaultSubjectSortMode:
-      obj.defaultSubjectSortMode === 'capture_time' ||
-      obj.defaultSubjectSortMode === 'confidence' ||
-      obj.defaultSubjectSortMode === 'exposures'
+      obj.defaultSubjectSortMode === 'alphabetical' ||
+        obj.defaultSubjectSortMode === 'capture_time' ||
+        obj.defaultSubjectSortMode === 'confidence' ||
+        obj.defaultSubjectSortMode === 'exposures'
         ? obj.defaultSubjectSortMode
         : DEFAULT_STUDIO_PREFERENCES.defaultSubjectSortMode,
     canvasBackdropTone:
       obj.canvasBackdropTone === 'obsidian' ||
-      obj.canvasBackdropTone === 'charcoal' ||
-      obj.canvasBackdropTone === 'neutral_gray'
+        obj.canvasBackdropTone === 'charcoal' ||
+        obj.canvasBackdropTone === 'neutral_gray'
         ? obj.canvasBackdropTone
         : DEFAULT_STUDIO_PREFERENCES.canvasBackdropTone,
     interfaceScale:
@@ -216,20 +233,22 @@ export function normalizeStudioPreferences(raw: unknown): StudioPreferences {
     ),
     studioPreviewMaxDim:
       obj.studioPreviewMaxDim === 1600 ||
-      obj.studioPreviewMaxDim === 2048 ||
-      obj.studioPreviewMaxDim === 2560
+        obj.studioPreviewMaxDim === 2048 ||
+        obj.studioPreviewMaxDim === 2560
         ? obj.studioPreviewMaxDim
         : DEFAULT_STUDIO_PREFERENCES.studioPreviewMaxDim,
     thumbnailPreviewMode:
       obj.thumbnailPreviewMode === 'fast' ||
-      obj.thumbnailPreviewMode === 'edited_32bit' ||
-      obj.thumbnailPreviewMode === 'all_32bit'
+        obj.thumbnailPreviewMode === 'edited_32bit' ||
+        obj.thumbnailPreviewMode === 'all_32bit'
         ? obj.thumbnailPreviewMode
         : DEFAULT_STUDIO_PREFERENCES.thumbnailPreviewMode,
     customCacheDir,
     customDetectorModelPath,
     customRecognizerModelPath,
     customSegmenterModelPath,
+    customFaceParserModelPath,
+    customLamaModelPath,
     defaultDeliveryMode: deliveryMode,
     defaultRenderFormat: renderFormat,
     defaultJpegQuality: Math.round(
@@ -277,6 +296,8 @@ const PREFERENCE_KEYS: readonly (keyof StudioPreferences)[] = [
   'customDetectorModelPath',
   'customRecognizerModelPath',
   'customSegmenterModelPath',
+  'customFaceParserModelPath',
+  'customLamaModelPath',
   'defaultDeliveryMode',
   'defaultRenderFormat',
   'defaultJpegQuality',

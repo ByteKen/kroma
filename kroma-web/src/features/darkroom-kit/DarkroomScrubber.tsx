@@ -126,17 +126,17 @@ export function DarkroomScrubber({
 
   const valueBoxClass =
     layout === 'inline'
-      ? 'tabular-nums-mono text-[11px] text-amber-soft font-semibold min-w-[40px] px-1 py-0.5 rounded bg-surface-low/60 border border-transparent hover:border-hairline-strong text-right cursor-text transition-colors'
-      : `tabular-nums-mono text-[11px] px-1.5 py-0.5 rounded bg-canvas border min-w-[52px] text-right cursor-text transition-colors ${
+      ? 'tabular-nums-mono text-[11px] text-amber-soft font-medium min-w-[40px] px-1.5 py-0.5 rounded bg-transparent border border-transparent hover:bg-surface-elevated hover:border-hairline text-right cursor-text transition-colors'
+      : `tabular-nums-mono text-[11px] px-1.5 py-0.5 rounded min-w-[48px] text-right cursor-text transition-colors border ${
           canReset
-            ? 'text-amber-soft border-amber-core/35 hover:border-amber-core/70'
-            : 'text-ink-secondary border-hairline hover:border-hairline-strong hover:text-ink-primary'
+            ? 'text-amber-soft font-medium bg-transparent border-transparent hover:bg-surface-elevated hover:border-amber-core/40'
+            : 'text-ink-telemetry bg-transparent border-transparent hover:bg-surface-elevated hover:border-hairline hover:text-ink-primary'
         }`;
 
   const valueInputClass =
     layout === 'inline'
-      ? 'tabular-nums-mono text-[11px] text-amber-soft font-semibold w-[48px] px-1 py-0.5 rounded bg-canvas border border-amber-core text-right focus:outline-none'
-      : 'tabular-nums-mono text-[11px] text-ink-primary w-[66px] px-1.5 py-0.5 rounded bg-surface-lowest border border-amber-core text-right focus:outline-none';
+      ? 'tabular-nums-mono text-[11px] text-amber-soft font-semibold w-[48px] px-1.5 py-0.5 rounded bg-surface-lowest border border-amber-core/70 text-right focus:outline-none'
+      : 'tabular-nums-mono text-[11px] text-ink-primary w-[64px] px-1.5 py-0.5 rounded bg-surface-lowest border border-amber-core/70 text-right focus:outline-none';
 
   const valueControl = editing ? (
     <input
@@ -194,13 +194,17 @@ export function DarkroomScrubber({
   }
 
   return (
-    <div className={`flex flex-col gap-1 ${className}`}>
-      <div className="flex items-center justify-between text-[11px]">
+    <div className={`flex flex-col gap-1.5 py-0.5 ${className}`}>
+      <div className="flex items-center justify-between text-[11.5px]">
         <DarkroomTooltip content={defaultValue !== undefined ? 'Double-click to reset' : undefined}>
           <button
             type="button"
             onDoubleClick={handleReset}
-            className="text-ink-secondary hover:text-ink-primary transition-colors text-left cursor-default"
+            className={`transition-colors text-left cursor-default ${
+              canReset
+                ? 'text-ink-primary font-medium'
+                : 'text-ink-secondary hover:text-ink-primary'
+            }`}
           >
             {label}
           </button>

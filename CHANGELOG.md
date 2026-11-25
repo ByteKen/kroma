@@ -4,6 +4,26 @@ All notable changes to **Kroma** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-25
+
+### Added
+- **Non-Destructive Retouch Suite (`Retouch` Tab in Studio):**
+  - **Portrait Retouching (Frequency Separation):** GPU-accelerated skin smoothing with texture preservation, skin tone evenness, shine removal, under-eye brightening, eye enhancement, teeth whitening, and lip enhancement—powered by an optional **BiSeNet Face Parsing** model (`parsing_resnet18.onnx`) with automatic built-in YuNet 5-point fallback, running across WebGPU, WebGL2, and `wgpu` batch export.
+  - **Spot Heal & Clone Brush:** Non-destructive blemish and stray-hair healing with interactive pin overlays (`H`), draggable sample sources, adjustable radius/feather/opacity, and `[` / `]` brush resizing.
+  - **AI Object Removal (`Remove` Brush):** Local generative object removal powered by an optional **LaMa Inpainting** model (`lama_fp32.onnx`) operating directly on Studio's 32-bit graded RAW working buffer, with mirror-padded square context crops, sub-pixel Catmull-Rom patch alignment, perimeter tone adaptation, and variance-matched micro-grain.
+  - **On-Demand Optional Retouch Models (`Settings → Models`):** Download, verify (SHA-256), or swap custom `.onnx` weights for BiSeNet Face Parsing and LaMa Inpainting directly inside Settings without bloating initial startup downloads.
+  - **Batch Sync Integration:** Selectively copy Portrait Retouching (auto-adapting to each subject's face) and Spot Heal patches across selected frames via `Ctrl+Shift+S`.
+- **Studio Folders Search & Expandable Photo Dropdown:** Added a `Ctrl+K` search bar to the Studio `Folders` sidebar that filters by both folder path and contained photo filenames (auto-expanding matching folders), plus per-folder dropdown chevrons showing alphabetically ordered photo names with an ultra-light debounced hover preview.
+- **Alphabetical Sorting Across All Lists:** Made natural case-insensitive A–Z sorting the default across Studio `Folders`, `Subjects`, and filmstrip, Face Organizer (`A–Z` added as the default sort option in the sidebar and Settings), Virtual Folders, Slate OCR, Batch Export, Review Queue, and Merge Subject dialogs.
+
+### Changed
+- **Latest-Wins RAW Decode Scheduler & Priority Preemption:** Bounded heavy RAW Bayer demosaics to a single latest-wins slot with active-over-prefetch priority and a 45 ms uncached settle debounce so rapidly clicking across subjects or scrubbing with arrow keys never launches competing demosaics or drops UI FPS—while preserving instant RAM LRU (~0.1 ms) and SSD `.kr16` (~8–10 ms) cache hits.
+- **Minimalist Studio Workspace Redesign:** Enlarged the bottom filmstrip (`96×116 px` cards with hover-reveal sync checkboxes and wider scroll track), refined Develop sliders and hover-to-edit numeric scrubbers, decluttered top/bottom viewport controls and inspector tabs, and removed the redundant `Open Photo(s)` toolbar button from the Home screen.
+
+### Fixed
+- **AI Object Removal Color & Brush Accuracy:** Fixed RAW vs. 8-bit preview exposure/color drift when generating LaMa inpaint patches, tightened mask feathering, and aligned the Remove brush cursor to match the exact painted mask area.
+- **32-Bit RAW Loading & Thumbnail Progress Reliability:** Fixed a Vite HMR gateway reset that could interrupt 32-bit RAW decoding during dev sessions, guarded 4K 1:1 loupe upgrades from preempting Fit-view decodes on the same photo, and eliminated stale `0/1` thumbnail rendering progress pills across overlapping edits and cancellations.
+
 ## [0.2.0] - 2026-11-24
 
 ### Added

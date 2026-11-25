@@ -42,7 +42,9 @@ export function buildVirtualFolderTree(
   }
 
   for (const list of childrenByParent.values()) {
-    list.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    list.sort((a, b) =>
+      a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }),
+    );
   }
 
   const visited = new Set<string>();
